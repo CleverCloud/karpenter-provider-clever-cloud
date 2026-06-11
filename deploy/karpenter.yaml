@@ -153,7 +153,7 @@ spec:
         clever-cloud.com/cluster-node-role: control-plane
       containers:
         - name: controller
-          image: clevercloud/karpenter-provider-clever-cloud:dev
+          image: ghcr.io/diodonfrost/karpenter-provider-clever-cloud:v0.9.1
           imagePullPolicy: IfNotPresent
           env:
             - name: CLEVER_CLOUD_REGION

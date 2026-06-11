@@ -1,6 +1,6 @@
 # Karpenter provider for Clever Cloud
 
-[![Continuous integration](https://github.com/CleverCloud/karpenter-provider-clever-cloud/actions/workflows/ci.yaml/badge.svg?branch=master)](https://github.com/CleverCloud/karpenter-provider-clever-cloud/actions/workflows/ci.yaml)
+[![Continuous integration](https://github.com/diodonfrost/karpenter-provider-clever-cloud/actions/workflows/ci.yaml/badge.svg?branch=master)](https://github.com/diodonfrost/karpenter-provider-clever-cloud/actions/workflows/ci.yaml)
 
 > A [Karpenter](https://karpenter.sh) cloud provider that autoscales [Clever Kubernetes Engine (CKE)](https://www.clever.cloud/developers/doc/kubernetes/) clusters through Clever Cloud's NodeGroup custom resources
 
@@ -32,17 +32,17 @@ cluster-admin access and `helm`. The step-by-step
 ### From the published charts
 
 Each release publishes the [karpenter-crd](charts/karpenter-crd/README.md) and [karpenter](charts/karpenter/README.md)
-charts to ghcr.io as OCI artifacts, versioned on the release tag without the `v` prefix (release `v0.1.0` → chart
-version `0.1.0`). Install the CRDs first, then the controller — no image settings are needed, the chart pulls the
+charts to ghcr.io as OCI artifacts, versioned on the release tag without the `v` prefix (release `v0.9.1` → chart
+version `0.9.1`). Install the CRDs first, then the controller — no image settings are needed, the chart pulls the
 matching published image by default:
 
 ```
 $ helm upgrade --install karpenter-crd \
-    oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/charts/karpenter-crd \
+    oci://ghcr.io/diodonfrost/karpenter-provider-clever-cloud/charts/karpenter-crd \
     --version <version> --namespace karpenter --create-namespace
 
 $ helm upgrade --install karpenter \
-    oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/charts/karpenter \
+    oci://ghcr.io/diodonfrost/karpenter-provider-clever-cloud/charts/karpenter \
     --version <version> --namespace karpenter --create-namespace --wait
 ```
 
@@ -52,15 +52,15 @@ Finally, create a NodePool and a CleverNodeClass to start provisioning nodes —
 ### From source
 
 You will need some tools on your computer to build the provider, at least the `git`, `go` and `docker` commands. So,
-firstly, retrieve the source from [GitHub](https://github.com/CleverCloud/karpenter-provider-clever-cloud) using the
+firstly, retrieve the source from [GitHub](https://github.com/diodonfrost/karpenter-provider-clever-cloud) using the
 following command.
 
 ```
-$ git clone https://github.com/CleverCloud/karpenter-provider-clever-cloud.git
+$ git clone https://github.com/diodonfrost/karpenter-provider-clever-cloud.git
 ```
 or
 ```
-$ gh repo clone CleverCloud/karpenter-provider-clever-cloud
+$ gh repo clone diodonfrost/karpenter-provider-clever-cloud
 ```
 
 Then, go into the newly created folder where the source code is located.
@@ -92,8 +92,8 @@ $ make run
 To build the docker image and push it to your registry, you can use the following commands:
 
 ```
-$ make image IMAGE=<your-registry>/karpenter-clevercloud TAG=v0.1.0
-$ docker push <your-registry>/karpenter-clevercloud:v0.1.0
+$ make image IMAGE=<your-registry>/karpenter-clevercloud TAG=v0.9.1
+$ docker push <your-registry>/karpenter-clevercloud:v0.9.1
 ```
 
 #### From the helm charts
@@ -110,7 +110,7 @@ $ helm upgrade --install karpenter-crd charts/karpenter-crd \
 $ helm upgrade --install karpenter charts/karpenter \
     --namespace karpenter --create-namespace \
     --set image.repository=<your-registry>/karpenter-clevercloud \
-    --set image.tag=v0.1.0 \
+    --set image.tag=v0.9.1 \
     --wait
 ```
 
@@ -205,4 +205,4 @@ See the [license](LICENSE).
 
 ## Getting in touch
 
-- Open an [issue](https://github.com/CleverCloud/karpenter-provider-clever-cloud/issues) for bugs or feature requests
+- Open an [issue](https://github.com/diodonfrost/karpenter-provider-clever-cloud/issues) for bugs or feature requests

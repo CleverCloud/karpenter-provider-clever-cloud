@@ -3,12 +3,12 @@ name: karpenter
 description: Karpenter node autoscaling for Clever Kubernetes Engine (CKE)
 type: application
 # Placeholder — the release workflow overrides version/appVersion at package time from the git tag.
-version: 0.1.0
-appVersion: v0.1.0
+version: 0.9.1
+appVersion: v0.9.1
 keywords:
   - karpenter
   - autoscaling
   - clever-cloud
-home: https://github.com/CleverCloud/karpenter-provider-clever-cloud
+home: https://github.com/diodonfrost/karpenter-provider-clever-cloud
 sources:
-  - https://github.com/CleverCloud/karpenter-provider-clever-cloud
+  - https://github.com/diodonfrost/karpenter-provider-clever-cloud

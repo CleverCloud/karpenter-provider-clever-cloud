@@ -2,7 +2,7 @@
 
 Helm chart that installs and **upgrades** the CustomResourceDefinitions used
 by the [Karpenter provider for Clever Kubernetes
-Engine](https://github.com/CleverCloud/karpenter-provider-clever-cloud) as
+Engine](https://github.com/diodonfrost/karpenter-provider-clever-cloud) as
 regular, Helm-managed resources:
 
 - `nodepools.karpenter.sh`
@@ -25,12 +25,12 @@ sync-chart-crds` regenerates both charts from them.
 ## Install
 
 Each release publishes the chart to ghcr.io as an OCI artifact, versioned on
-the release tag without the `v` prefix (release `v0.1.0` → chart version
-`0.1.0`):
+the release tag without the `v` prefix (release `v0.9.1` → chart version
+`0.9.1`):
 
 ```sh
 helm upgrade --install karpenter-crd \
-  oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/charts/karpenter-crd \
+  oci://ghcr.io/diodonfrost/karpenter-provider-clever-cloud/charts/karpenter-crd \
   --version <version> --namespace karpenter --create-namespace
 ```
 

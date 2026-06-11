@@ -10,7 +10,7 @@ This guide walks you through deploying the Karpenter provider for Clever Cloud o
 
 > **Note:** No Clever Cloud API token or credentials are required. The provider drives the in-cluster NodeGroup API (`nodegroups.api.clever-cloud.com/v1`) that every CKE cluster serves; the Clever Cloud operator upstream turns NodeGroups into VMs.
 
-Each release publishes the controller image and both Helm charts to ghcr.io, so the default path below needs no local build. Chart versions follow the release tags without the `v` prefix: release `v0.1.0` publishes chart version `0.1.0` and image tag `v0.1.0`. To build and deploy your own image instead, see [Installing from source](#installing-from-source).
+Each release publishes the controller image and both Helm charts to ghcr.io, so the default path below needs no local build. Chart versions follow the release tags without the `v` prefix: release `v0.9.1` publishes chart version `0.9.1` and image tag `v0.9.1`. To build and deploy your own image instead, see [Installing from source](#installing-from-source).
 
 ## Step 1 — Install the CRDs
 
@@ -20,7 +20,7 @@ The recommended way is the dedicated [karpenter-crd](../../charts/karpenter-crd/
 
 ```sh
 helm upgrade --install karpenter-crd \
-  oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/charts/karpenter-crd \
+  oci://ghcr.io/diodonfrost/karpenter-provider-clever-cloud/charts/karpenter-crd \
   --version <version> --namespace karpenter --create-namespace
 ```
 
@@ -30,11 +30,11 @@ Alternatively you can skip this step: the main chart carries the same CRDs in it
 
 ```sh
 helm upgrade --install karpenter \
-  oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/charts/karpenter \
+  oci://ghcr.io/diodonfrost/karpenter-provider-clever-cloud/charts/karpenter \
   --version <version> --namespace karpenter --create-namespace --wait
 ```
 
-No image settings are needed: the chart's `appVersion` pins the matching published image (`ghcr.io/clevercloud/karpenter-provider-clever-cloud:v<version>`).
+No image settings are needed: the chart's `appVersion` pins the matching published image (`ghcr.io/diodonfrost/karpenter-provider-clever-cloud:v<version>`).
 
 The controller is pinned to control-plane nodes by default (`nodeSelector: clever-cloud.com/cluster-node-role: control-plane`) — Karpenter must never run on a node it can deprovision, and CKE control-plane nodes are schedulable. See [the chart values](../../charts/karpenter/README.md) for everything you can tune.
 
@@ -69,7 +69,7 @@ To run your own build instead of the published artifacts, you additionally need 
 
 ```sh
 export IMAGE=<registry>/karpenter-clevercloud
-export TAG=v0.1.0
+export TAG=v0.9.1
 
 make image IMAGE=$IMAGE TAG=$TAG
 docker push $IMAGE:$TAG
@@ -94,10 +94,10 @@ Upgrade the CRDs first, then the controller release:
 
 ```sh
 helm upgrade karpenter-crd \
-  oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/charts/karpenter-crd \
+  oci://ghcr.io/diodonfrost/karpenter-provider-clever-cloud/charts/karpenter-crd \
   --version <version> --namespace karpenter
 helm upgrade karpenter \
-  oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/charts/karpenter \
+  oci://ghcr.io/diodonfrost/karpenter-provider-clever-cloud/charts/karpenter \
   --version <version> --namespace karpenter --reuse-values
 ```
 

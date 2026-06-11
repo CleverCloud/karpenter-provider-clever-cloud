@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## 0.9.1 - 2026-06-11
+
+Patch release: point the published artifacts at their real home. The `v0.9.0` charts, docs and the chart's default `image.repository` all referenced `ghcr.io/clevercloud/...`, but the release workflow publishes to `ghcr.io/${GITHUB_REPOSITORY,,}` — i.e. `ghcr.io/diodonfrost/...`. A verbatim `helm install` from the documented OCI path therefore 404'd, and even a hand-supplied chart left the controller in `ImagePullBackOff` because the default image did not exist under `clevercloud`. This release makes the documented install path work as written, with no `--set image.repository` override.
+
+### 🐛 Fixed
+
+- **`fix(charts)`: default `image.repository` now matches the publishing registry** (`charts/karpenter/values.yaml`). The chart's `appVersion`-pinned image now resolves to `ghcr.io/diodonfrost/karpenter-provider-clever-cloud:v0.9.1`, so a default install pulls a real image.
+- **`fix(docs)`: every install/upgrade command and registry reference points at `ghcr.io/diodonfrost/...`** across `README.md`, `docs/getting-started/installation.md` and both chart READMEs, and the project/clone/issue/CI-badge URLs point at `github.com/diodonfrost/karpenter-provider-clever-cloud`. The Go module path (`github.com/CleverCloud/...`) is unchanged — it is the import identifier, not a fetch URL.
+- **`fix(deploy)`: the raw manifest references a published image** (`deploy/karpenter.yaml`) — `ghcr.io/diodonfrost/karpenter-provider-clever-cloud:v0.9.1` instead of the non-existent `clevercloud/...:dev` — and `make image`'s default `IMAGE` matches the same namespace.
+
 ## 0.9.0 - 2026-06-11
 
 Initial release: a [Karpenter](https://karpenter.sh) cloud provider for Clever Kubernetes Engine (CKE). Every operation goes through the cluster's own in-cluster NodeGroup API (`nodegroups.api.clever-cloud.com/v1`) — no Clever Cloud HTTP client, no API token to manage. Validated end-to-end against live CKE clusters ([docs/E2E-RESULTS.md](docs/E2E-RESULTS.md)): node registered in ~44 s end-to-end, consolidation, drift and organisation-quota behaviour all exercised on real hardware.
