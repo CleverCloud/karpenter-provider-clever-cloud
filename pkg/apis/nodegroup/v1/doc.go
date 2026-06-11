@@ -1,0 +1,42 @@
+/*
+Copyright 2026 The karpenter-provider-clever-cloud Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// +k8s:deepcopy-gen=package,register
+// +groupName=api.clever-cloud.com
+
+// Package v1 mirrors the Clever Cloud NodeGroup API
+// (nodegroups.api.clever-cloud.com/v1) served by every Clever Kubernetes
+// Engine cluster. The CRD itself is owned and installed by Clever Cloud;
+// these types only exist so the provider can read and write NodeGroups with
+// a typed client.
+package v1 // doc.go is discovered by codegen
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes/scheme"
+
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis"
+)
+
+func init() {
+	gv := schema.GroupVersion{Group: apis.CleverCloudGroup, Version: "v1"}
+	metav1.AddToGroupVersion(scheme.Scheme, gv)
+	scheme.Scheme.AddKnownTypes(gv,
+		&NodeGroup{},
+		&NodeGroupList{},
+	)
+}
