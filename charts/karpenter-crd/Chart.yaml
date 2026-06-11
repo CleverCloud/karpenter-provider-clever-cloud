@@ -1,0 +1,15 @@
+apiVersion: v2
+name: karpenter-crd
+description: CustomResourceDefinitions for the Karpenter Clever Cloud provider — installs and upgrades the CRDs independently of the controller chart
+type: application
+# Placeholder — the release workflow overrides version/appVersion at package time from the git tag.
+version: 0.1.0
+appVersion: v0.1.0
+keywords:
+  - karpenter
+  - autoscaling
+  - clever-cloud
+  - crd
+home: https://github.com/CleverCloud/karpenter-provider-clever-cloud
+sources:
+  - https://github.com/CleverCloud/karpenter-provider-clever-cloud

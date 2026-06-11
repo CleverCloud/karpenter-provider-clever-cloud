@@ -1,0 +1,84 @@
+# -- Overrides the chart name used in resource names.
+nameOverride: ""
+# -- Overrides the full resource name prefix.
+fullnameOverride: ""
+# -- Additional labels added to every chart resource.
+additionalLabels: {}
+
+image:
+  # -- Controller image repository. Official images are published to ghcr.io
+  # by the release workflow on every v* tag.
+  repository: ghcr.io/clevercloud/karpenter-provider-clever-cloud
+  # -- Image tag. Defaults to the chart appVersion.
+  tag: ""
+  # -- Image digest; takes precedence over tag when set.
+  digest: ""
+
+imagePullPolicy: IfNotPresent
+imagePullSecrets: []
+
+serviceAccount:
+  # -- Create the service account.
+  create: true
+  # -- Service account name (generated from the chart name when empty).
+  name: ""
+  annotations: {}
+
+# -- Number of controller replicas. Leader election keeps one active.
+replicas: 1
+revisionHistoryLimit: 10
+
+podLabels: {}
+podAnnotations: {}
+podSecurityContext:
+  fsGroup: 65532
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+priorityClassName: system-cluster-critical
+
+# -- The controller must run on nodes Karpenter does not manage; CKE
+# control-plane nodes are schedulable and fit that role.
+nodeSelector:
+  clever-cloud.com/cluster-node-role: control-plane
+
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+controller:
+  metrics:
+    port: 8080
+  healthProbe:
+    port: 8081
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  # -- Extra environment variables for the controller container.
+  env: []
+
+settings:
+  # -- Clever Cloud region/zone advertised on instance types (CKE is
+  # Paris-only today).
+  region: par
+  # -- Log verbosity: debug, info or error.
+  logLevel: info
+  # -- Disable leader election (useful for single-replica dev setups).
+  disableLeaderElection: false
+  # -- Maximum/idle batching windows for pod batching before provisioning.
+  batchMaxDuration: 10s
+  batchIdleDuration: 1s
+  featureGates:
+    # -- Enable Karpenter's node auto-repair (acts on the provider's
+    # RepairPolicies: NodeReady False/Unknown tolerated 10m).
+    nodeRepair: false
+
+service:
+  # -- Expose the metrics endpoint through a ClusterIP service.
+  enabled: true
+  annotations: {}
