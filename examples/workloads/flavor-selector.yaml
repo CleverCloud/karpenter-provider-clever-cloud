@@ -1,0 +1,27 @@
+# Targets a specific Clever Cloud flavor with a plain nodeSelector — the
+# provider exposes clever-cloud.com/flavor as a schedulable label, so
+# Karpenter provisions exactly that flavor for these pods.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flavor-selector
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: flavor-selector
+  template:
+    metadata:
+      labels:
+        app: flavor-selector
+    spec:
+      terminationGracePeriodSeconds: 0
+      nodeSelector:
+        clever-cloud.com/flavor: XS
+      containers:
+        - name: flavor-selector
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi

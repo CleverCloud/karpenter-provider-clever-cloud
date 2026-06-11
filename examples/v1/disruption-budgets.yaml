@@ -1,0 +1,38 @@
+# This example throttles voluntary disruptions (consolidation, drift,
+# expiration): at most one node at a time, and none at all during business
+# hours (Mon-Fri 8h-18h UTC). Karpenter still replaces nodes that fail.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: disruption-budgets
+  annotations:
+    kubernetes.io/description: "At most 1 voluntary disruption at a time, none during business hours"
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: disruption-budgets
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["2XS", "XS", "S"]
+  limits:
+    cpu: "12"
+    memory: 12Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+    budgets:
+      - nodes: "1"
+      - nodes: "0"
+        schedule: "0 8 * * mon-fri"
+        duration: 10h
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: disruption-budgets
+spec:
+  labels: {}

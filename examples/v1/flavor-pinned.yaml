@@ -1,0 +1,35 @@
+# This example pins the NodePool to a single flavor through the provider
+# label clever-cloud.com/flavor (equivalent to node.kubernetes.io/instance-type
+# on Clever Cloud, but matching the label CKE itself puts on nodes).
+# Workloads can also target a flavor directly with a nodeSelector on the
+# same label — see ../workloads/flavor-selector.yaml.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: flavor-pinned
+  annotations:
+    kubernetes.io/description: "NodePool pinned to the XS flavor via the clever-cloud.com/flavor label"
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: flavor-pinned
+      requirements:
+        - key: clever-cloud.com/flavor
+          operator: In
+          values: ["XS"]
+  limits:
+    cpu: "12"
+    memory: 16Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: flavor-pinned
+spec:
+  labels: {}

@@ -1,0 +1,36 @@
+# Prefers (but does not require) the cheapest flavor through a preferred
+# node affinity — the scheduler tries 2XS first and relaxes to other
+# flavors when the preference cannot be satisfied.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prefer-small
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: prefer-small
+  template:
+    metadata:
+      labels:
+        app: prefer-small
+    spec:
+      terminationGracePeriodSeconds: 0
+      nodeSelector:
+        clever-cloud.com/cluster-node-role: worker
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: clever-cloud.com/flavor
+                    operator: In
+                    values: ["2XS"]
+      containers:
+        - name: prefer-small
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi

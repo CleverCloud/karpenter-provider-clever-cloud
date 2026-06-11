@@ -1,0 +1,37 @@
+# Forces one replica per node with required pod anti-affinity: Karpenter
+# provisions one node per replica. Clever Cloud is single-zone (par) today,
+# so hostname is the only meaningful placement topology — a plain
+# topologySpreadConstraint on hostname would NOT do this (with a single
+# existing node the constraint is trivially satisfied and all replicas
+# land together).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: one-pod-per-node
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: one-pod-per-node
+  template:
+    metadata:
+      labels:
+        app: one-pod-per-node
+    spec:
+      terminationGracePeriodSeconds: 0
+      nodeSelector:
+        clever-cloud.com/cluster-node-role: worker
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: one-pod-per-node
+      containers:
+        - name: one-pod-per-node
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi

@@ -1,0 +1,38 @@
+# A PodDisruptionBudget bounds how Karpenter drains nodes during
+# consolidation/drift: evictions stop whenever fewer than minAvailable
+# replicas would remain, so node replacements roll through the fleet
+# without breaking availability.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pdb-workload
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: pdb-workload
+  template:
+    metadata:
+      labels:
+        app: pdb-workload
+    spec:
+      terminationGracePeriodSeconds: 0
+      nodeSelector:
+        clever-cloud.com/cluster-node-role: worker
+      containers:
+        - name: pdb-workload
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-workload
+spec:
+  minAvailable: "50%"
+  selector:
+    matchLabels:
+      app: pdb-workload

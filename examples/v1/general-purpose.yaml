@@ -1,0 +1,44 @@
+# This example NodePool will provision general purpose instances across the
+# whole Clever Cloud flavor catalog, always picking the cheapest flavor that
+# fits, and consolidating nodes as soon as they are empty or underutilized.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: general-purpose
+  annotations:
+    kubernetes.io/description: "General purpose NodePool for generic workloads"
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: general-purpose
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+      expireAfter: Never
+  # Keep well under the organisation quota (40 vCPU / 40 GB RAM, control
+  # plane included): a 3-node S control plane already consumes 24 GB of it.
+  limits:
+    cpu: "16"
+    memory: 16Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: general-purpose
+  annotations:
+    kubernetes.io/description: "Default CleverNodeClass"
+spec:
+  labels: {}

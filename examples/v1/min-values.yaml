@@ -1,0 +1,34 @@
+# This example requires flavor diversity: the scheduler must keep at least
+# two different instance types as candidates for every provisioning
+# decision. Useful to avoid concentrating the whole fleet on one flavor.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: min-values
+  annotations:
+    kubernetes.io/description: "NodePool requiring at least 2 candidate flavors"
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: min-values
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["2XS", "XS", "S", "M"]
+          minValues: 2
+  limits:
+    cpu: "12"
+    memory: 12Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: min-values
+spec:
+  labels: {}

@@ -1,0 +1,29 @@
+# Scale this deployment up and down to watch Karpenter provision and
+# consolidate Clever Cloud nodes:
+#   kubectl scale deployment inflate --replicas=3
+# The nodeSelector keeps the pods off the (schedulable) control-plane nodes
+# so they always exercise Karpenter.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inflate
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: inflate
+  template:
+    metadata:
+      labels:
+        app: inflate
+    spec:
+      terminationGracePeriodSeconds: 0
+      nodeSelector:
+        clever-cloud.com/cluster-node-role: worker
+      containers:
+        - name: inflate
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1500Mi

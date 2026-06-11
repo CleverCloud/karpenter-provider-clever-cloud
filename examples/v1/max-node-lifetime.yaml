@@ -1,0 +1,36 @@
+# This example caps node lifetime: nodes are replaced after expireAfter
+# (rolling refresh — Karpenter provisions the replacement, drains the old
+# node, then deletes it). terminationGracePeriod bounds how long a draining
+# node may linger when pods block eviction.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: max-node-lifetime
+  annotations:
+    kubernetes.io/description: "Nodes refreshed every 7 days"
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: max-node-lifetime
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["2XS", "XS", "S"]
+      expireAfter: 168h # 7 days
+      terminationGracePeriod: 1h
+  limits:
+    cpu: "12"
+    memory: 12Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: max-node-lifetime
+spec:
+  labels: {}

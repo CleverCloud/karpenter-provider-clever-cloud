@@ -1,0 +1,44 @@
+# This example dedicates a NodePool to one team: nodes carry a team label
+# (applied at the Clever Cloud NodeGroup level, so it is present the moment
+# the node joins) and a taint so only workloads that tolerate it can run
+# there — see ../workloads/team-workload.yaml.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: team-platform
+  annotations:
+    kubernetes.io/description: "Nodes dedicated to the platform team (tainted)"
+spec:
+  template:
+    metadata:
+      labels:
+        team: platform
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: team-platform
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["2XS", "XS", "S"]
+      taints:
+        - key: team
+          value: platform
+          effect: NoSchedule
+  limits:
+    cpu: "12"
+    memory: 12Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: team-platform
+spec:
+  # NodeClass labels are applied through the Clever Cloud NodeGroup and are
+  # visible on the node before Karpenter registration completes.
+  labels:
+    cost-center: platform-eng

@@ -1,0 +1,29 @@
+# The karpenter.sh/do-not-disrupt annotation opts a pod out of voluntary
+# disruption: Karpenter will not consolidate, drift or expire the node this
+# pod runs on while the pod is alive.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: do-not-disrupt
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: do-not-disrupt
+  template:
+    metadata:
+      labels:
+        app: do-not-disrupt
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      terminationGracePeriodSeconds: 0
+      nodeSelector:
+        clever-cloud.com/cluster-node-role: worker
+      containers:
+        - name: do-not-disrupt
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi

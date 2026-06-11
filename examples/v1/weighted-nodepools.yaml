@@ -1,0 +1,60 @@
+# This example uses two weighted NodePools over the same NodeClass:
+# Karpenter tries the highest-weight pool first (cheap 2XS capacity) and
+# falls back to the wider catalog only when the preferred pool cannot fit
+# the pods or hits its limits.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: preferred-small
+  annotations:
+    kubernetes.io/description: "Preferred pool: cheap 2XS capacity"
+spec:
+  weight: 100
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: weighted
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["2XS"]
+  limits:
+    cpu: "8"
+    memory: 8Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: fallback-any
+  annotations:
+    kubernetes.io/description: "Fallback pool: whole catalog, lower weight"
+spec:
+  weight: 10
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: weighted
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["2XS", "XS", "S", "M"]
+  limits:
+    cpu: "16"
+    memory: 16Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: weighted
+spec:
+  labels: {}

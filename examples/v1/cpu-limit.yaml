@@ -1,0 +1,35 @@
+# This example NodePool limits the total amount of CPU and memory it may
+# provision, sized to stay inside the default Clever Cloud organisation
+# quota. Once the limit is reached Karpenter stops creating nodes and
+# surplus pods stay Pending.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: cpu-limit
+  annotations:
+    kubernetes.io/description: "NodePool hard-capped at 8 vCPU / 8 GiB total"
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: cpu-limit
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["2XS"]
+  # 8 vCPU = at most two 2XS nodes.
+  limits:
+    cpu: "8"
+    memory: 8Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: cpu-limit
+spec:
+  labels: {}

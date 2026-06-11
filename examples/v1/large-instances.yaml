@@ -1,0 +1,37 @@
+# This example NodePool only provisions the larger Clever Cloud flavors
+# (M and up), excluding the small ones. Fewer, bigger nodes reduce the
+# per-node daemonset overhead for dense workloads.
+#
+# NOTE: with the default organisation quota (40 vCPU / 40 GB RAM including
+# the control plane), L (24 GB) and XL (32 GB) workers usually cannot fit —
+# ask Clever Cloud support for a quota raise before relying on them.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: large-instances
+  annotations:
+    kubernetes.io/description: "NodePool restricted to the larger flavors (M+)"
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: large-instances
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["M", "L", "XL"]
+  limits:
+    cpu: "16"
+    memory: 16Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: large-instances
+spec:
+  labels: {}

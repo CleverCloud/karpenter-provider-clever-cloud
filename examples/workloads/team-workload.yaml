@@ -1,0 +1,31 @@
+# Pairs with ../v1/team-dedicated.yaml: tolerates the team taint and
+# selects the team label, so it lands only on the platform team's dedicated
+# nodes (and nothing else can land there).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: team-workload
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: team-workload
+  template:
+    metadata:
+      labels:
+        app: team-workload
+    spec:
+      terminationGracePeriodSeconds: 0
+      nodeSelector:
+        team: platform
+      tolerations:
+        - key: team
+          value: platform
+          effect: NoSchedule
+      containers:
+        - name: team-workload
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi

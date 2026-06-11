@@ -1,0 +1,34 @@
+# This example NodePool only provisions the two smallest Clever Cloud
+# flavors (2XS: 4 vCPU/4 GB, XS: 6 vCPU/8 GB). Useful to keep node
+# granularity fine so consolidation has room to work, or to cap the blast
+# radius of a single node loss.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: small-flavors
+  annotations:
+    kubernetes.io/description: "NodePool restricted to the smallest flavors"
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: small-flavors
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["2XS", "XS"]
+  limits:
+    cpu: "12"
+    memory: 12Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: small-flavors
+spec:
+  labels: {}
