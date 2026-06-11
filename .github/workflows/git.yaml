@@ -1,0 +1,23 @@
+name: GIT
+on:
+  pull_request:
+jobs:
+  conventional-commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # actions/checkout
+      pull-requests: read # webiny/action-conventional-commits lists the PR commits via the API
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+    - uses: webiny/action-conventional-commits@7f91b1595ca1951cdb671ddc9f07a49081ec5b69 # v1.4.2
+      with:
+        # Without an explicit token the action calls the API unauthenticated and
+        # silently passes when rate-limited, enforcing nothing.
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  block-fixup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # actions/checkout + 13rac1/block-fixup-merge-action
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+    - uses: 13rac1/block-fixup-merge-action@bd5504fb9ca0253e109d98eb86b7debc01970cdc # v2.0.0

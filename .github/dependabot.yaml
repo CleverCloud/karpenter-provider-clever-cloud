@@ -1,0 +1,55 @@
+# See https://docs.github.com/en/github/administering-a-repository/configuration-options-for-dependency-updates#package-ecosystem
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      # "chore(deps): ..." — keeps Dependabot PRs green on the conventional-commit CI check.
+      prefix: "chore"
+      include: "scope"
+    ignore:
+      # Bumping sigs.k8s.io/karpenter must be done manually: the karpenter.sh
+      # CRDs vendored in deploy/crds/ have to be refreshed from the matching
+      # karpenter-core release at the same time.
+      - dependency-name: sigs.k8s.io/karpenter
+    groups:
+      # Group updates together, so that they are all applied in a single PR.
+      k8s-go-deps:
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+        exclude-patterns:
+          - "sigs.k8s.io/karpenter"
+      go-deps:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      actions-deps:
+        patterns:
+          - "*"
+  # Composite actions are not picked up by the root github-actions entry;
+  # each action directory needs its own entry.
+  # https://github.com/dependabot/dependabot-core/issues/6704
+  - package-ecosystem: "github-actions"
+    directory: ".github/actions/install-deps"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      action-deps:
+        patterns:
+          - "*"

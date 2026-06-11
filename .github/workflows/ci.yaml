@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+    branches:
+      - 'main'
+      - 'master'
+      - 'release-v*'
+  pull_request:
+  workflow_dispatch:
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+    - uses: ./.github/actions/install-deps
+    - run: make vet
+    - run: make build
+    - run: make chart-lint
+    - name: Verify generated files are up to date
+      run: |
+        make generate
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "::error::Generated files are out of date. Run 'make generate' and commit the result."
+          git diff
+          exit 1
+        fi

@@ -1,0 +1,21 @@
+name: CI-LINT
+on:
+  push:
+    branches:
+      - 'main'
+      - 'master'
+      - 'release-v*'
+  pull_request:
+  workflow_dispatch:
+jobs:
+  ci-lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # golangci/golangci-lint-action
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+    - uses: ./.github/actions/install-deps
+    - uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
+      with:
+        # Keep in sync with GOLANGCI_LINT_VERSION in the Makefile
+        version: v2.12.2
