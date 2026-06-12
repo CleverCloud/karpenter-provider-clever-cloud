@@ -8,7 +8,7 @@ additionalLabels: {}
 image:
   # -- Controller image repository. Official images are published to ghcr.io
   # by the release workflow on every v* tag.
-  repository: ghcr.io/diodonfrost/karpenter-provider-clever-cloud
+  repository: ghcr.io/clevercloud/karpenter
   # -- Image tag. Defaults to the chart appVersion.
   tag: ""
   # -- Image digest; takes precedence over tag when set.
