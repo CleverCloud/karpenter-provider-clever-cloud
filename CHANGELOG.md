@@ -2,11 +2,16 @@
 
 ## [Unreleased]
 
+## 0.9.2 - 2026-06-12
+
+The project moved to the [CleverCloud organization](https://github.com/CleverCloud/karpenter-provider-clever-cloud); this release is the first to publish under the organization's registry namespace. Functionally identical to 0.9.1 apart from dependency bumps — the changes are in where the artifacts live and what they are called.
+
 ### 🔄 Changed
 
-- **The project moved to the CleverCloud organization** (`github.com/CleverCloud/karpenter-provider-clever-cloud`); badges, clone instructions, issue links and chart `home`/`sources` now point there.
-- **`fix(image)`: the controller image is now `ghcr.io/clevercloud/karpenter`** — the image name no longer repeats the repository name. The previous `ghcr.io/diodonfrost/karpenter-provider-clever-cloud` packages remain available but frozen.
-- **`fix(ci)`: charts publish at `oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/karpenter[-crd]`** — the redundant `charts/` path segment is gone; install commands across the docs updated accordingly.
+- **The controller image is now `ghcr.io/clevercloud/karpenter`** — the image name no longer repeats the repository name, and the release workflow derives the owner from `GITHUB_REPOSITORY_OWNER` so forks publish under their own namespace. The previous `ghcr.io/diodonfrost/karpenter-provider-clever-cloud` packages remain available but frozen at v0.9.1.
+- **Charts publish at `oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/karpenter` and `.../karpenter-crd`** — the redundant `charts/` path segment is gone; install commands across the docs use direct OCI references (`helm repo add` does not support `oci://`).
+- **Badges, clone instructions, issue links and chart `home`/`sources`** point at `github.com/CleverCloud/karpenter-provider-clever-cloud`.
+- **`chore(deps)`: Kubernetes libraries bumped** — `k8s.io/*` 0.35.0 → 0.36.1, `sigs.k8s.io/controller-runtime` 0.22.4 → 0.24.1, plus grouped GitHub Actions updates.
 
 ## 0.9.1 - 2026-06-11
 
