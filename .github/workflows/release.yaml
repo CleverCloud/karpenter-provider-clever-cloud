@@ -19,7 +19,7 @@ jobs:
       - name: Build and push image
         run: |
           # ghcr.io requires a lowercase repository name
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/karpenter"
           TAG="${GITHUB_REF_NAME}"
           make image IMAGE="$IMAGE" TAG="$TAG"
           docker push "$IMAGE:$TAG"

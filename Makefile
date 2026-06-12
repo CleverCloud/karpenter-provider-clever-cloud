@@ -1,7 +1,7 @@
 CONTROLLER_GEN_VERSION ?= v0.20.1
 # Keep in sync with the version pinned in .github/workflows/ci-lint.yaml
 GOLANGCI_LINT_VERSION ?= v2.12.2
-IMAGE ?= ghcr.io/diodonfrost/karpenter-provider-clever-cloud
+IMAGE ?= ghcr.io/clevercloud/karpenter
 TAG ?= dev
 # Helm chart version derived from TAG (v0.2.0 -> 0.2.0)
 CHART_VERSION ?= $(TAG:v%=%)
