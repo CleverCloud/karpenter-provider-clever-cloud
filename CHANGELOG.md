@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### 🔄 Changed
+
+- **The project moved to the CleverCloud organization** (`github.com/CleverCloud/karpenter-provider-clever-cloud`); badges, clone instructions, issue links and chart `home`/`sources` now point there.
+- **`fix(image)`: the controller image is now `ghcr.io/clevercloud/karpenter`** — the image name no longer repeats the repository name. The previous `ghcr.io/diodonfrost/karpenter-provider-clever-cloud` packages remain available but frozen.
+- **`fix(ci)`: charts publish at `oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/karpenter[-crd]`** — the redundant `charts/` path segment is gone; install commands across the docs updated accordingly.
+
 ## 0.9.1 - 2026-06-11
 
 Patch release: point the published artifacts at their real home. The `v0.9.0` charts, docs and the chart's default `image.repository` all referenced `ghcr.io/clevercloud/...`, but the release workflow publishes to `ghcr.io/${GITHUB_REPOSITORY,,}` — i.e. `ghcr.io/diodonfrost/...`. A verbatim `helm install` from the documented OCI path therefore 404'd, and even a hand-supplied chart left the controller in `ImagePullBackOff` because the default image did not exist under `clevercloud`. This release makes the documented install path work as written, with no `--set image.repository` override.
