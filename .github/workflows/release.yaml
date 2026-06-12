@@ -35,9 +35,10 @@ jobs:
       - name: Package and push Helm charts
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          # ghcr.io requires a lowercase repository name
+          # ghcr.io requires a lowercase repository name; helm push appends
+          # the chart name, so charts land at <repo>/karpenter[-crd].
           REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
           TAG="${GITHUB_REF_NAME}"
           make chart-package TAG="$TAG"
-          helm push "dist/karpenter-crd-${TAG#v}.tgz" "oci://$REPO/charts"
-          helm push "dist/karpenter-${TAG#v}.tgz" "oci://$REPO/charts"
+          helm push "dist/karpenter-crd-${TAG#v}.tgz" "oci://$REPO"
+          helm push "dist/karpenter-${TAG#v}.tgz" "oci://$REPO"
