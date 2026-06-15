@@ -77,6 +77,20 @@ settings:
     # -- Enable Karpenter's node auto-repair (acts on the provider's
     # RepairPolicies: NodeReady False/Unknown tolerated 10m).
     nodeRepair: false
+  # -- Override the node flavor catalogue. Leave empty to use the controller's
+  # built-in catalogue (2XS…XL). A non-empty list replaces the catalogue
+  # ENTIRELY: only these flavors are offered to Karpenter. Each entry needs
+  # `name` (as accepted by the Clever Cloud NodeGroup API, uppercase),
+  # `cpu` (vCPUs), `memoryKi` (kernel-visible memory in KiB) and
+  # `priceHourly` (EUR/hour). CPU/memory self-correct at runtime from observed
+  # node capacity. Rendered into a ConfigMap mounted in the controller.
+  # Example:
+  #   flavors:
+  #     - name: M
+  #       cpu: 10
+  #       memoryKi: 15988992
+  #       priceHourly: 0.1167
+  flavors: []
 
 service:
   # -- Expose the metrics endpoint through a ClusterIP service.

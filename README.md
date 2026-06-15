@@ -143,6 +143,28 @@ The controller is configured through environment variables, all set by the helm 
 | `BATCH_MAX_DURATION`      | `Duration` | `10s`              | no       | Maximum pod batching window before provisioning              |
 | `BATCH_IDLE_DURATION`     | `Duration` | `1s`               | no       | Idle pod batching window before provisioning                 |
 | `FEATURE_GATES`           | `String`   | `NodeRepair=false` | no       | Karpenter feature gates                                      |
+| `FLAVORS_CONFIG_PATH`     | `String`   | _(unset)_          | no       | Path to a YAML flavor catalogue; set by the chart when `settings.flavors` is non-empty |
+
+### Flavor catalogue
+
+By default the controller ships a built-in catalogue (`2XS`…`XL`) with measured/estimated
+capacities and the documented public-beta prices. You can override it entirely through
+`settings.flavors` in the chart values — the chart renders it into a ConfigMap mounted at
+`/etc/karpenter/flavors/flavors.yaml` and points `FLAVORS_CONFIG_PATH` at it. A non-empty
+list **replaces** the built-in catalogue: only the flavors you list are offered to Karpenter.
+
+```yaml
+settings:
+  flavors:
+    - name: M            # as accepted by the Clever Cloud NodeGroup API (uppercase)
+      cpu: 10            # vCPUs
+      memoryKi: 15988992 # kernel-visible memory, KiB
+      priceHourly: 0.1167 # EUR/hour
+```
+
+`cpu`/`memoryKi` self-correct at runtime from observed node capacity, so they only need to be
+close enough for the scheduler to pick a flavor; prices are used as-is for cost-based
+consolidation. Leave `settings.flavors` empty to keep the built-in catalogue.
 
 ### NodePool
 
