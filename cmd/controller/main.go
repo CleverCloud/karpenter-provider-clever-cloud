@@ -17,6 +17,9 @@ limitations under the License.
 package main
 
 import (
+	"os"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/karpenter/pkg/utils/env"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/overlay"
@@ -35,7 +38,18 @@ func main() {
 
 	region := env.WithDefaultString("CLEVER_CLOUD_REGION", "par")
 
-	instanceTypeProvider := instancetype.NewProvider(region)
+	// FLAVORS_CONFIG_PATH points at a YAML flavor catalog (mounted from the
+	// chart's ConfigMap). When unset, the built-in DefaultFlavors are used.
+	var flavors []instancetype.Flavor
+	if flavorsPath := env.WithDefaultString("FLAVORS_CONFIG_PATH", ""); flavorsPath != "" {
+		var err error
+		if flavors, err = instancetype.LoadFlavorsFromFile(flavorsPath); err != nil {
+			log.FromContext(ctx).Error(err, "loading flavor catalog")
+			os.Exit(1)
+		}
+	}
+
+	instanceTypeProvider := instancetype.NewProvider(region, flavors)
 	nodeGroupProvider := nodegroup.NewProvider(op.GetClient())
 	cleverCloudProvider := cloudprovider.New(op.GetClient(), instanceTypeProvider, nodeGroupProvider)
 	decoratedCloudProvider := overlay.Decorate(cleverCloudProvider, op.GetClient(), op.InstanceTypeStore)

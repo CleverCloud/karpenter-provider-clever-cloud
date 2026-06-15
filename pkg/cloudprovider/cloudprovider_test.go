@@ -45,7 +45,7 @@ func newTestProvider(t *testing.T, objs ...client.Object) (*cloudprovider.CloudP
 		WithObjects(objs...).
 		WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
 		Build()
-	itp := instancetype.NewProvider("par")
+	itp := instancetype.NewProvider("par", nil)
 	ngp := nodegroup.NewProvider(kubeClient)
 	return cloudprovider.New(kubeClient, itp, ngp), kubeClient
 }
