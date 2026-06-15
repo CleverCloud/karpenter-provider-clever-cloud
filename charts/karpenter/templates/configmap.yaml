@@ -1,0 +1,12 @@
+{{- with .Values.settings.flavors }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "karpenter.fullname" $ }}-flavors
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "karpenter.labels" $ | nindent 4 }}
+data:
+  flavors.yaml: |
+    {{- toYaml . | nindent 4 }}
+{{- end }}
