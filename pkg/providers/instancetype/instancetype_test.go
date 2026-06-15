@@ -60,7 +60,7 @@ func observedL(t *testing.T) (corev1.ResourceList, corev1.ResourceList) {
 }
 
 func TestListReturnsFreshObjectsPerCall(t *testing.T) {
-	p := instancetype.NewProvider("par")
+	p := instancetype.NewProvider("par", nil)
 
 	first := p.List()
 	second := p.List()
@@ -85,7 +85,7 @@ func TestListReturnsFreshObjectsPerCall(t *testing.T) {
 }
 
 func TestListExposesExpectedRequirements(t *testing.T) {
-	p := instancetype.NewProvider("par")
+	p := instancetype.NewProvider("par", nil)
 
 	its := p.List()
 	if len(its) != 6 {
@@ -108,7 +108,7 @@ func TestListExposesExpectedRequirements(t *testing.T) {
 }
 
 func TestGetKnownFlavor(t *testing.T) {
-	p := instancetype.NewProvider("par")
+	p := instancetype.NewProvider("par", nil)
 
 	it, err := p.Get("M")
 	if err != nil {
@@ -127,7 +127,7 @@ func TestGetKnownFlavor(t *testing.T) {
 }
 
 func TestGetUnknownFlavorErrors(t *testing.T) {
-	p := instancetype.NewProvider("par")
+	p := instancetype.NewProvider("par", nil)
 
 	if _, err := p.Get("3XL"); err == nil {
 		t.Fatal("expected error for unknown flavor")
@@ -135,7 +135,7 @@ func TestGetUnknownFlavorErrors(t *testing.T) {
 }
 
 func TestRecordObservedCapacityOverridesEstimate(t *testing.T) {
-	p := instancetype.NewProvider("par")
+	p := instancetype.NewProvider("par", nil)
 	capacity, allocatable := observedL(t)
 
 	p.RecordObservedCapacity("L", capacity, allocatable)
@@ -167,7 +167,7 @@ func TestRecordObservedCapacityOverridesEstimate(t *testing.T) {
 }
 
 func TestRecordObservedCapacityIgnoresZero(t *testing.T) {
-	p := instancetype.NewProvider("par")
+	p := instancetype.NewProvider("par", nil)
 
 	zeroCPU := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("0"),
@@ -198,8 +198,81 @@ func TestRecordObservedCapacityIgnoresZero(t *testing.T) {
 	}
 }
 
+func TestNewProviderNilFlavorsUsesDefault(t *testing.T) {
+	p := instancetype.NewProvider("par", nil)
+	if got := len(p.List()); got != len(instancetype.DefaultFlavors) {
+		t.Fatalf("expected %d flavors from default catalog, got %d", len(instancetype.DefaultFlavors), got)
+	}
+}
+
+func TestNewProviderCustomFlavorsReplaceCatalog(t *testing.T) {
+	custom := []instancetype.Flavor{
+		{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.1167},
+		{Name: "CUSTOM", CPU: 2, MemoryKi: 2097152, PriceHourly: 0.01},
+	}
+	p := instancetype.NewProvider("par", custom)
+
+	its := p.List()
+	if len(its) != len(custom) {
+		t.Fatalf("expected %d flavors, got %d", len(custom), len(its))
+	}
+	// Only the supplied flavors are offered; a default-only flavor is gone.
+	if _, err := p.Get("2XS"); err == nil {
+		t.Error("expected 2XS to be absent from a custom catalog")
+	}
+	it := findInstanceType(t, its, "CUSTOM")
+	if got := it.Capacity.Cpu().Value(); got != 2 {
+		t.Errorf("expected custom flavor 2 vCPU, got %d", got)
+	}
+	if got := it.Offerings[0].Price; got != 0.01 {
+		t.Errorf("expected custom flavor price 0.01, got %v", got)
+	}
+}
+
+func TestParseFlavors(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		data := []byte(`
+- name: M
+  cpu: 10
+  memoryKi: 15988992
+  priceHourly: 0.1167
+- name: XS
+  cpu: 6
+  memoryKi: 7937580
+  priceHourly: 0.0611
+`)
+		flavors, err := instancetype.ParseFlavors(data)
+		if err != nil {
+			t.Fatalf("ParseFlavors: %v", err)
+		}
+		if len(flavors) != 2 {
+			t.Fatalf("expected 2 flavors, got %d", len(flavors))
+		}
+		if flavors[0].Name != "M" || flavors[0].CPU != 10 || flavors[0].MemoryKi != 15988992 || flavors[0].PriceHourly != 0.1167 {
+			t.Errorf("unexpected first flavor: %+v", flavors[0])
+		}
+	})
+
+	cases := map[string]string{
+		"empty":          `[]`,
+		"empty name":     "- name: \"\"\n  cpu: 4\n  memoryKi: 100\n  priceHourly: 0.1\n",
+		"zero cpu":       "- name: M\n  cpu: 0\n  memoryKi: 100\n  priceHourly: 0.1\n",
+		"zero memory":    "- name: M\n  cpu: 4\n  memoryKi: 0\n  priceHourly: 0.1\n",
+		"negative price": "- name: M\n  cpu: 4\n  memoryKi: 100\n  priceHourly: -1\n",
+		"duplicate name": "- name: M\n  cpu: 4\n  memoryKi: 100\n  priceHourly: 0.1\n- name: M\n  cpu: 8\n  memoryKi: 200\n  priceHourly: 0.2\n",
+		"malformed":      "not: a list",
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := instancetype.ParseFlavors([]byte(data)); err == nil {
+				t.Errorf("expected error for %s, got nil", name)
+			}
+		})
+	}
+}
+
 func TestRecordObservedCapacityDeepCopies(t *testing.T) {
-	p := instancetype.NewProvider("par")
+	p := instancetype.NewProvider("par", nil)
 	capacity, allocatable := observedL(t)
 
 	p.RecordObservedCapacity("L", capacity, allocatable)

@@ -18,9 +18,14 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.podAnnotations }}
+      {{- if or .Values.podAnnotations .Values.settings.flavors }}
       annotations:
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.settings.flavors }}
+        checksum/flavors: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum | quote }}
+        {{- end }}
       {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
@@ -96,6 +101,10 @@ spec:
             {{- end }}
             - name: FEATURE_GATES
               value: "NodeRepair={{ .Values.settings.featureGates.nodeRepair }}"
+            {{- if .Values.settings.flavors }}
+            - name: FLAVORS_CONFIG_PATH
+              value: /etc/karpenter/flavors/flavors.yaml
+            {{- end }}
             - name: MEMORY_LIMIT
               valueFrom:
                 resourceFieldRef:
@@ -128,3 +137,15 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- if .Values.settings.flavors }}
+          volumeMounts:
+            - name: flavors
+              mountPath: /etc/karpenter/flavors
+              readOnly: true
+          {{- end }}
+      {{- if .Values.settings.flavors }}
+      volumes:
+        - name: flavors
+          configMap:
+            name: {{ include "karpenter.fullname" . }}-flavors
+      {{- end }}

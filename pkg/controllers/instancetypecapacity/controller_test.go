@@ -40,7 +40,7 @@ func newTestController(t *testing.T, objs ...client.Object) (*instancetypecapaci
 		WithScheme(scheme.Scheme).
 		WithObjects(objs...).
 		Build()
-	itp := instancetype.NewProvider("par")
+	itp := instancetype.NewProvider("par", nil)
 	return instancetypecapacity.NewController(kubeClient, itp), itp
 }
 
