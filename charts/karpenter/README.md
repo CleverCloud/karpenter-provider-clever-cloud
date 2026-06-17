@@ -60,7 +60,10 @@ kubectl apply -f examples/v1/general-purpose.yaml
 | `settings.disableLeaderElection` | `false` | For single-replica dev setups |
 | `settings.batchMaxDuration` / `batchIdleDuration` | `10s` / `1s` | Pod batching windows |
 | `settings.featureGates.nodeRepair` | `false` | Enable node auto-repair |
-| `settings.flavors` | `[]` | Override the node flavor catalogue (name/cpu/memoryKi/priceHourly). Empty = built-in `2XS`…`XL`; a non-empty list replaces it entirely and is mounted via a ConfigMap |
+| `settings.flavors` | `[]` | Per-flavor overrides overlaid on the base catalogue (`name` required; `cpu`/`memoryKi`/`priceHourly` optional). Empty = base catalogue unchanged. Mounted via a ConfigMap; always win and re-applied after every dynamic refresh |
+| `settings.pricing.enabled` | `false` | Opt-in background refresher pulling CKE prices/flavors from Clever Cloud's public API. Requires egress to `apiURL` (TCP 443) |
+| `settings.pricing.refreshPeriod` / `apiURL` / `topology` | `12h` / `https://api.clever-cloud.com` / `DISTRIBUTED` | Refresh interval, API base URL (override for proxy/testing), and CKE topology whose flavor list is used |
+| `settings.pricing.kubernetesProductURL` / `priceSystemURL` | `""` / `""` | Optional full-URL override per endpoint (default: `apiURL` + standard path); set only if the two APIs live at different hosts/paths |
 | `controller.resources` | 200m/256Mi, limit 512Mi | Controller container resources |
 | `controller.env` | `[]` | Extra environment variables |
 | `service.enabled` | `true` | ClusterIP service exposing `/metrics` |
