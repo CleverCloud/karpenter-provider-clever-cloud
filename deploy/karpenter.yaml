@@ -166,6 +166,24 @@ spec:
               value: "8081"
             - name: LEADER_ELECTION_NAMESPACE
               value: karpenter
+            # Optional dynamic price/flavor refresher (disabled by default).
+            # Uncomment to enable; requires egress to PRICING_API_URL (TCP 443
+            # to api.clever-cloud.com). The public API needs no token. Any
+            # per-flavor overrides (FLAVORS_CONFIG_PATH) are re-applied on top.
+            # - name: PRICING_REFRESH_ENABLED
+            #   value: "true"
+            # - name: PRICING_REFRESH_PERIOD
+            #   value: "12h"
+            # - name: PRICING_API_URL
+            #   value: "https://api.clever-cloud.com"
+            # Optionally override each endpoint's full URL (default: PRICING_API_URL
+            # + standard path). Set only when the two APIs live at different places.
+            # - name: PRICING_PRODUCT_URL
+            #   value: "https://api.clever-cloud.com/v4/kubernetes-product"
+            # - name: PRICING_PRICE_SYSTEM_URL
+            #   value: "https://api.clever-cloud.com/v4/billing/price-system"
+            # - name: CLEVER_CLOUD_TOPOLOGY
+            #   value: "DISTRIBUTED"
           ports:
             - name: http-metrics
               containerPort: 8080
