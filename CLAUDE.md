@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A [Karpenter](https://karpenter.sh) cloud provider for Clever Kubernetes Engine (CKE), Clever Cloud's managed Kubernetes. It implements karpenter-core's `CloudProvider` interface on top of Clever Cloud's **in-cluster** NodeGroup API (`nodegroups.api.clever-cloud.com/v1`). There is no Clever Cloud HTTP API client and no API token — every operation goes through the cluster's own Kubernetes API; the Clever Cloud operator upstream reconciles NodeGroups into VMs.
+A [Karpenter](https://karpenter.sh) cloud provider for Clever Kubernetes Engine (CKE), Clever Cloud's managed Kubernetes. It implements karpenter-core's `CloudProvider` interface on top of Clever Cloud's **in-cluster** NodeGroup API (`nodegroups.api.clever-cloud.com/v1`). By default there is no Clever Cloud HTTP API client and no API token — every operation goes through the cluster's own Kubernetes API; the Clever Cloud operator upstream reconciles NodeGroups into VMs. The **sole** exception is the **optional** dynamic-pricing refresher (`PRICING_REFRESH_ENABLED`, off by default): when enabled it polls Clever Cloud's public, unauthenticated HTTP API (`PRICING_API_URL`, default `api.clever-cloud.com`) every `PRICING_REFRESH_PERIOD` for flavor prices and the available-flavor list. It still uses no token.
 
 ## Commands
 
@@ -41,7 +41,7 @@ NodeGroups created by this provider carry the marker label `karpenter.clever-clo
 
 ### Wiring (cmd/controller/main.go)
 
-Uses karpenter-core's `operator.NewOperator()`, registers the core controllers plus the provider's own (`pkg/controllers/controllers.go`). The CloudProvider is wrapped in `overlay.Decorate` for NodeOverlay support. Region comes from `CLEVER_CLOUD_REGION` (default `par` — CKE is single-zone today). Capacity type is always on-demand.
+Uses karpenter-core's `operator.NewOperator()`, registers the core controllers plus the provider's own (`pkg/controllers/controllers.go`). The CloudProvider is wrapped in `overlay.Decorate` for NodeOverlay support. Region comes from `CLEVER_CLOUD_REGION` (default `par` — CKE is single-zone today; doubles as the price-system `zone_id`). Capacity type is always on-demand. The pricing refresher is opt-in via `PRICING_REFRESH_ENABLED` (also reads `PRICING_REFRESH_PERIOD`/`PRICING_API_URL`/`CLEVER_CLOUD_TOPOLOGY` through the same `env.WithDefault*` pattern, plus `PRICING_PRODUCT_URL`/`PRICING_PRICE_SYSTEM_URL` to override either endpoint's full URL independently — both default to `PRICING_API_URL` + their standard path); when off, `NewControllers` is passed a nil pricing controller and skips it. The pricing env contract must be kept in sync across the three deployment artifacts (chart `values.yaml`, chart `deployment.yaml`, `deploy/karpenter.yaml`).
 
 ### Provider controllers (pkg/controllers/) — each exists for a CKE quirk
 
@@ -49,10 +49,15 @@ Uses karpenter-core's `operator.NewOperator()`, registers the core controllers p
 - **garbagecollection**: safety net (every 2 min) reaping managed NodeGroups whose NodeClaim is gone. Owner references handle the normal path; this catches force-deleted NodeClaims. NodeGroups younger than 2 min are skipped (informer lag).
 - **nodeclass**: CleverNodeClass validation/readiness conditions + a termination finalizer so a NodeClass can't disappear while NodeClaims reference it. `Create` refuses NodeClasses that aren't Ready.
 - **instancetypecapacity**: feeds live node `status.capacity`/`allocatable` back into the instance-type provider (`RecordObservedCapacity`) so estimated catalog entries self-correct.
+- **pricing** (opt-in, `pkg/controllers/pricing`): 12h singleton that calls `pricing.Provider.Resolve` and `instancetype.Provider.SetBaseFlavors`. Only registered when `PRICING_REFRESH_ENABLED`. A failed `Resolve` keeps the last-known-good catalog (it never clears it) and requeues sooner; it swallows the error so the chosen `RequeueAfter` isn't overridden by the rate limiter.
 
 ### Instance types (pkg/providers/instancetype)
 
-Static flavor catalog (2XS…XL) with EUR/hour prices. Capacities for 2XS/XS/S/M were **measured on live nodes**; L/XL are derived estimates that get corrected at runtime by the instancetypecapacity controller. `List()` builds fresh objects on every call because karpenter-core mutates them (lazy allocatable). `cloudprovider.resolveInstanceType` picks the cheapest flavor satisfying the NodeClaim's requirements and resource requests.
+Flavor catalog (2XS…XL) with EUR/hour prices. The catalog served by `List()` is `ApplyOverrides(base, overrides)`: a **base** layer (the built-in `DefaultFlavors` seed, or the dynamic refresher's result via `SetBaseFlavors`) plus a **per-flavor overlay** of optional-field `FlavorOverride`s loaded from `FLAVORS_CONFIG_PATH`. Overrides win per field and are re-applied on every `SetBaseFlavors`. `FlavorSizing`/`SizingByName` is the single source of truth for sizing (cpu, kernel-visible memoryKi, and nominal GB for the price formula); `DefaultFlavors` is pinned to it by `TestDefaultFlavorsMatchSeed`, and `ComputePrice(cpu, nominalGB, vcpuRate, ramRate)` (rounded to 4 decimals) is shared with the pricing provider. Capacities for 2XS/XS/S/M were **measured on live nodes**; L/XL are derived estimates corrected at runtime by the instancetypecapacity controller. `List()`/`Get()` snapshot `flavors` under a short RLock then build fresh objects (karpenter-core mutates them; the snapshot also avoids a nested-RLock deadlock against `SetBaseFlavors`). `cloudprovider.resolveInstanceType` picks the cheapest flavor satisfying the NodeClaim's requirements and resource requests.
+
+### Pricing (pkg/providers/pricing)
+
+Resolves the catalog from Clever Cloud's public, token-less API: `/v4/kubernetes-product` gives flavor **names** per topology (no sizing), `/v4/billing/price-system?zone_id=<region>` gives the per-vCPU and per-nominal-GB **rates**. `Resolve` combines live names ∩ `SizingByName` × live rates into `[]instancetype.Flavor` (a named flavor without a sizing seed is skipped — the API never exposes cpu/memory). Any fetch/parse error, missing rate, unknown topology, or empty result returns an error so the controller keeps the last-known-good catalog.
 
 ### NodeGroup lifecycle & quota (pkg/providers/nodegroup)
 
