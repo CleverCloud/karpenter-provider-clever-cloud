@@ -17,6 +17,7 @@ limitations under the License.
 package instancetype_test
 
 import (
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,8 @@ import (
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 )
+
+func ptr[T any](v T) *T { return &v }
 
 func findInstanceType(t *testing.T, its []*corecloudprovider.InstanceType, name string) *corecloudprovider.InstanceType {
 	t.Helper()
@@ -60,7 +63,7 @@ func observedL(t *testing.T) (corev1.ResourceList, corev1.ResourceList) {
 }
 
 func TestListReturnsFreshObjectsPerCall(t *testing.T) {
-	p := instancetype.NewProvider("par", nil)
+	p := instancetype.NewProvider("par", nil, nil)
 
 	first := p.List()
 	second := p.List()
@@ -85,7 +88,7 @@ func TestListReturnsFreshObjectsPerCall(t *testing.T) {
 }
 
 func TestListExposesExpectedRequirements(t *testing.T) {
-	p := instancetype.NewProvider("par", nil)
+	p := instancetype.NewProvider("par", nil, nil)
 
 	its := p.List()
 	if len(its) != 6 {
@@ -108,7 +111,7 @@ func TestListExposesExpectedRequirements(t *testing.T) {
 }
 
 func TestGetKnownFlavor(t *testing.T) {
-	p := instancetype.NewProvider("par", nil)
+	p := instancetype.NewProvider("par", nil, nil)
 
 	it, err := p.Get("M")
 	if err != nil {
@@ -127,7 +130,7 @@ func TestGetKnownFlavor(t *testing.T) {
 }
 
 func TestGetUnknownFlavorErrors(t *testing.T) {
-	p := instancetype.NewProvider("par", nil)
+	p := instancetype.NewProvider("par", nil, nil)
 
 	if _, err := p.Get("3XL"); err == nil {
 		t.Fatal("expected error for unknown flavor")
@@ -135,7 +138,7 @@ func TestGetUnknownFlavorErrors(t *testing.T) {
 }
 
 func TestRecordObservedCapacityOverridesEstimate(t *testing.T) {
-	p := instancetype.NewProvider("par", nil)
+	p := instancetype.NewProvider("par", nil, nil)
 	capacity, allocatable := observedL(t)
 
 	p.RecordObservedCapacity("L", capacity, allocatable)
@@ -167,7 +170,7 @@ func TestRecordObservedCapacityOverridesEstimate(t *testing.T) {
 }
 
 func TestRecordObservedCapacityIgnoresZero(t *testing.T) {
-	p := instancetype.NewProvider("par", nil)
+	p := instancetype.NewProvider("par", nil, nil)
 
 	zeroCPU := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("0"),
@@ -199,26 +202,27 @@ func TestRecordObservedCapacityIgnoresZero(t *testing.T) {
 }
 
 func TestNewProviderNilFlavorsUsesDefault(t *testing.T) {
-	p := instancetype.NewProvider("par", nil)
+	p := instancetype.NewProvider("par", nil, nil)
 	if got := len(p.List()); got != len(instancetype.DefaultFlavors) {
 		t.Fatalf("expected %d flavors from default catalog, got %d", len(instancetype.DefaultFlavors), got)
 	}
 }
 
-func TestNewProviderCustomFlavorsReplaceCatalog(t *testing.T) {
+func TestNewProviderCustomBaseReplacesCatalog(t *testing.T) {
 	custom := []instancetype.Flavor{
 		{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.1167},
 		{Name: "CUSTOM", CPU: 2, MemoryKi: 2097152, PriceHourly: 0.01},
 	}
-	p := instancetype.NewProvider("par", custom)
+	p := instancetype.NewProvider("par", custom, nil)
 
 	its := p.List()
 	if len(its) != len(custom) {
 		t.Fatalf("expected %d flavors, got %d", len(custom), len(its))
 	}
-	// Only the supplied flavors are offered; a default-only flavor is gone.
+	// With no overrides, the base entirely defines the catalog; a default-only
+	// flavor is gone.
 	if _, err := p.Get("2XS"); err == nil {
-		t.Error("expected 2XS to be absent from a custom catalog")
+		t.Error("expected 2XS to be absent from a custom base catalog")
 	}
 	it := findInstanceType(t, its, "CUSTOM")
 	if got := it.Capacity.Cpu().Value(); got != 2 {
@@ -229,8 +233,8 @@ func TestNewProviderCustomFlavorsReplaceCatalog(t *testing.T) {
 	}
 }
 
-func TestParseFlavors(t *testing.T) {
-	t.Run("valid", func(t *testing.T) {
+func TestParseFlavorOverrides(t *testing.T) {
+	t.Run("valid full", func(t *testing.T) {
 		data := []byte(`
 - name: M
   cpu: 10
@@ -241,38 +245,231 @@ func TestParseFlavors(t *testing.T) {
   memoryKi: 7937580
   priceHourly: 0.0611
 `)
-		flavors, err := instancetype.ParseFlavors(data)
+		overrides, err := instancetype.ParseFlavorOverrides(data)
 		if err != nil {
-			t.Fatalf("ParseFlavors: %v", err)
+			t.Fatalf("ParseFlavorOverrides: %v", err)
 		}
-		if len(flavors) != 2 {
-			t.Fatalf("expected 2 flavors, got %d", len(flavors))
+		if len(overrides) != 2 {
+			t.Fatalf("expected 2 overrides, got %d", len(overrides))
 		}
-		if flavors[0].Name != "M" || flavors[0].CPU != 10 || flavors[0].MemoryKi != 15988992 || flavors[0].PriceHourly != 0.1167 {
-			t.Errorf("unexpected first flavor: %+v", flavors[0])
+		o := overrides[0]
+		if o.Name != "M" || o.CPU == nil || *o.CPU != 10 || o.MemoryKi == nil || *o.MemoryKi != 15988992 || o.PriceHourly == nil || *o.PriceHourly != 0.1167 {
+			t.Errorf("unexpected first override: %+v", o)
+		}
+	})
+
+	t.Run("valid partial price only", func(t *testing.T) {
+		overrides, err := instancetype.ParseFlavorOverrides([]byte("- name: M\n  priceHourly: 0.1\n"))
+		if err != nil {
+			t.Fatalf("ParseFlavorOverrides: %v", err)
+		}
+		o := overrides[0]
+		if o.CPU != nil || o.MemoryKi != nil {
+			t.Errorf("expected cpu/memoryKi unset, got %+v", o)
+		}
+		if o.PriceHourly == nil || *o.PriceHourly != 0.1 {
+			t.Errorf("expected priceHourly 0.1, got %+v", o.PriceHourly)
 		}
 	})
 
 	cases := map[string]string{
 		"empty":          `[]`,
-		"empty name":     "- name: \"\"\n  cpu: 4\n  memoryKi: 100\n  priceHourly: 0.1\n",
-		"zero cpu":       "- name: M\n  cpu: 0\n  memoryKi: 100\n  priceHourly: 0.1\n",
-		"zero memory":    "- name: M\n  cpu: 4\n  memoryKi: 0\n  priceHourly: 0.1\n",
-		"negative price": "- name: M\n  cpu: 4\n  memoryKi: 100\n  priceHourly: -1\n",
-		"duplicate name": "- name: M\n  cpu: 4\n  memoryKi: 100\n  priceHourly: 0.1\n- name: M\n  cpu: 8\n  memoryKi: 200\n  priceHourly: 0.2\n",
+		"empty name":     "- name: \"\"\n  cpu: 4\n",
+		"zero cpu":       "- name: M\n  cpu: 0\n",
+		"zero memory":    "- name: M\n  memoryKi: 0\n",
+		"negative price": "- name: M\n  priceHourly: -1\n",
+		"duplicate name": "- name: M\n  cpu: 4\n- name: M\n  cpu: 8\n",
 		"malformed":      "not: a list",
 	}
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := instancetype.ParseFlavors([]byte(data)); err == nil {
+			if _, err := instancetype.ParseFlavorOverrides([]byte(data)); err == nil {
 				t.Errorf("expected error for %s, got nil", name)
 			}
 		})
 	}
 }
 
+func TestComputePriceReproducesDefaultRounding(t *testing.T) {
+	want := map[string]float64{"2XS": 0.0333, "XS": 0.0611, "S": 0.0889, "M": 0.1167, "L": 0.1667, "XL": 0.2222}
+	for name, s := range instancetype.SizingByName {
+		got := instancetype.ComputePrice(s.CPU, s.NominalGB, instancetype.DefaultVCPURate, instancetype.DefaultRAMRate)
+		if got != want[name] {
+			t.Errorf("flavor %s: ComputePrice = %v, want %v", name, got, want[name])
+		}
+	}
+}
+
+func TestDefaultFlavorsMatchSeed(t *testing.T) {
+	if len(instancetype.DefaultFlavors) != len(instancetype.FlavorSizing) {
+		t.Fatalf("DefaultFlavors (%d) and FlavorSizing (%d) length mismatch", len(instancetype.DefaultFlavors), len(instancetype.FlavorSizing))
+	}
+	for _, f := range instancetype.DefaultFlavors {
+		s, ok := instancetype.SizingByName[f.Name]
+		if !ok {
+			t.Errorf("flavor %s has no sizing seed", f.Name)
+			continue
+		}
+		if f.CPU != s.CPU || f.MemoryKi != s.MemoryKi {
+			t.Errorf("flavor %s: cpu/memory diverge from seed (%d/%d vs %d/%d)", f.Name, f.CPU, f.MemoryKi, s.CPU, s.MemoryKi)
+		}
+		want := instancetype.ComputePrice(s.CPU, s.NominalGB, instancetype.DefaultVCPURate, instancetype.DefaultRAMRate)
+		if f.PriceHourly != want {
+			t.Errorf("flavor %s: hardcoded price %v diverges from seed-derived %v", f.Name, f.PriceHourly, want)
+		}
+	}
+}
+
+func TestApplyOverrides(t *testing.T) {
+	base := instancetype.DefaultFlavors
+
+	t.Run("price only", func(t *testing.T) {
+		got, skipped := instancetype.ApplyOverrides(base, []instancetype.FlavorOverride{{Name: "M", PriceHourly: ptr(0.10)}})
+		if len(skipped) != 0 {
+			t.Fatalf("unexpected skipped: %v", skipped)
+		}
+		if len(got) != len(base) {
+			t.Fatalf("expected %d flavors, got %d", len(base), len(got))
+		}
+		m := findFlavor(t, got, "M")
+		if m.PriceHourly != 0.10 || m.CPU != 10 || m.MemoryKi != 15988992 {
+			t.Errorf("expected only price overridden, got %+v", m)
+		}
+	})
+
+	t.Run("dimension only", func(t *testing.T) {
+		got, _ := instancetype.ApplyOverrides(base, []instancetype.FlavorOverride{{Name: "M", CPU: ptr(int64(99))}})
+		m := findFlavor(t, got, "M")
+		if m.CPU != 99 || m.PriceHourly != 0.1167 {
+			t.Errorf("expected only cpu overridden, got %+v", m)
+		}
+	})
+
+	t.Run("seed-only flavor added from override with no fields", func(t *testing.T) {
+		// Base lacks L; an override naming L (no fields) seeds it from FlavorSizing.
+		smallBase := []instancetype.Flavor{{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.1167}}
+		got, skipped := instancetype.ApplyOverrides(smallBase, []instancetype.FlavorOverride{{Name: "L"}})
+		if len(skipped) != 0 {
+			t.Fatalf("unexpected skipped: %v", skipped)
+		}
+		l := findFlavor(t, got, "L")
+		if l.CPU != 12 || l.MemoryKi != 23983488 || l.PriceHourly != 0.1667 {
+			t.Errorf("expected L seeded from sizing table, got %+v", l)
+		}
+	})
+
+	t.Run("brand-new flavor fully specified", func(t *testing.T) {
+		got, skipped := instancetype.ApplyOverrides(base, []instancetype.FlavorOverride{
+			{Name: "CUSTOM", CPU: ptr(int64(2)), MemoryKi: ptr(int64(2097152)), PriceHourly: ptr(0.01)},
+		})
+		if len(skipped) != 0 {
+			t.Fatalf("unexpected skipped: %v", skipped)
+		}
+		c := findFlavor(t, got, "CUSTOM")
+		if c.CPU != 2 || c.MemoryKi != 2097152 || c.PriceHourly != 0.01 {
+			t.Errorf("unexpected custom flavor: %+v", c)
+		}
+	})
+
+	t.Run("non-constructible override skipped", func(t *testing.T) {
+		got, skipped := instancetype.ApplyOverrides(base, []instancetype.FlavorOverride{{Name: "GHOST", PriceHourly: ptr(0.05)}})
+		if len(skipped) != 1 || skipped[0] != "GHOST" {
+			t.Fatalf("expected GHOST skipped, got %v", skipped)
+		}
+		for _, f := range got {
+			if f.Name == "GHOST" {
+				t.Errorf("GHOST must not appear in the result")
+			}
+		}
+	})
+}
+
+func findFlavor(t *testing.T, flavors []instancetype.Flavor, name string) instancetype.Flavor {
+	t.Helper()
+	for _, f := range flavors {
+		if f.Name == name {
+			return f
+		}
+	}
+	t.Fatalf("flavor %q not found", name)
+	return instancetype.Flavor{}
+}
+
+func TestSetBaseFlavorsReappliesOverrides(t *testing.T) {
+	overrides := []instancetype.FlavorOverride{{Name: "M", PriceHourly: ptr(0.10)}}
+	p := instancetype.NewProvider("par", nil, overrides)
+
+	it, err := p.Get("M")
+	if err != nil {
+		t.Fatalf("Get(M): %v", err)
+	}
+	if it.Offerings[0].Price != 0.10 {
+		t.Errorf("expected pinned price 0.10 at startup, got %v", it.Offerings[0].Price)
+	}
+
+	// A dynamic refresh updates the base; the override must still win for M.
+	p.SetBaseFlavors([]instancetype.Flavor{
+		{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.20},
+		{Name: "XS", CPU: 6, MemoryKi: 7937580, PriceHourly: 0.07},
+	})
+
+	m, _ := p.Get("M")
+	if m.Offerings[0].Price != 0.10 {
+		t.Errorf("expected override to survive refresh (0.10), got %v", m.Offerings[0].Price)
+	}
+	xs, err := p.Get("XS")
+	if err != nil {
+		t.Fatalf("Get(XS): %v", err)
+	}
+	if xs.Offerings[0].Price != 0.07 {
+		t.Errorf("expected refreshed XS price 0.07, got %v", xs.Offerings[0].Price)
+	}
+	// The refresh narrowed the base to M+XS; the old default-only flavors are gone.
+	if _, err := p.Get("2XS"); err == nil {
+		t.Error("expected 2XS gone after a base refresh that omitted it")
+	}
+}
+
+func TestSetBaseFlavorsIgnoresEmpty(t *testing.T) {
+	p := instancetype.NewProvider("par", nil, nil)
+	before := len(p.List())
+
+	p.SetBaseFlavors(nil)
+	p.SetBaseFlavors([]instancetype.Flavor{})
+
+	if got := len(p.List()); got != before {
+		t.Errorf("empty SetBaseFlavors must keep the catalog: before %d, after %d", before, got)
+	}
+}
+
+func TestProviderConcurrentAccess(t *testing.T) {
+	p := instancetype.NewProvider("par", nil, []instancetype.FlavorOverride{{Name: "M", PriceHourly: ptr(0.10)}})
+	capacity, allocatable := observedL(t)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				if got := p.List(); len(got) == 0 {
+					t.Errorf("List returned empty catalog under concurrency")
+					return
+				}
+				_, _ = p.Get("M")
+				p.RecordObservedCapacity("L", capacity, allocatable)
+				p.SetBaseFlavors([]instancetype.Flavor{
+					{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.20},
+					{Name: "L", CPU: 12, MemoryKi: 23983488, PriceHourly: 0.1667},
+				})
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 func TestRecordObservedCapacityDeepCopies(t *testing.T) {
-	p := instancetype.NewProvider("par", nil)
+	p := instancetype.NewProvider("par", nil, nil)
 	capacity, allocatable := observedL(t)
 
 	p.RecordObservedCapacity("L", capacity, allocatable)
