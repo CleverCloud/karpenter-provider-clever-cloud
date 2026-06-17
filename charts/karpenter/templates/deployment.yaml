@@ -105,6 +105,24 @@ spec:
             - name: FLAVORS_CONFIG_PATH
               value: /etc/karpenter/flavors/flavors.yaml
             {{- end }}
+            {{- if .Values.settings.pricing.enabled }}
+            - name: PRICING_REFRESH_ENABLED
+              value: "true"
+            - name: PRICING_REFRESH_PERIOD
+              value: {{ .Values.settings.pricing.refreshPeriod | quote }}
+            - name: PRICING_API_URL
+              value: {{ .Values.settings.pricing.apiURL | quote }}
+            {{- with .Values.settings.pricing.kubernetesProductURL }}
+            - name: PRICING_PRODUCT_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.settings.pricing.priceSystemURL }}
+            - name: PRICING_PRICE_SYSTEM_URL
+              value: {{ . | quote }}
+            {{- end }}
+            - name: CLEVER_CLOUD_TOPOLOGY
+              value: {{ .Values.settings.pricing.topology | quote }}
+            {{- end }}
             - name: MEMORY_LIMIT
               valueFrom:
                 resourceFieldRef:

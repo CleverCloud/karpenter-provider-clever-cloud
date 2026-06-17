@@ -77,20 +77,45 @@ settings:
     # -- Enable Karpenter's node auto-repair (acts on the provider's
     # RepairPolicies: NodeReady False/Unknown tolerated 10m).
     nodeRepair: false
-  # -- Override the node flavor catalogue. Leave empty to use the controller's
-  # built-in catalogue (2XS…XL). A non-empty list replaces the catalogue
-  # ENTIRELY: only these flavors are offered to Karpenter. Each entry needs
-  # `name` (as accepted by the Clever Cloud NodeGroup API, uppercase),
-  # `cpu` (vCPUs), `memoryKi` (kernel-visible memory in KiB) and
-  # `priceHourly` (EUR/hour). CPU/memory self-correct at runtime from observed
-  # node capacity. Rendered into a ConfigMap mounted in the controller.
-  # Example:
+  # -- Per-flavor overrides overlaid on top of the base catalogue (the built-in
+  # 2XS…XL seed, or the dynamic refresher's result when `pricing.enabled`).
+  # Leave empty to use the base catalogue unchanged. Each entry needs a `name`
+  # (as accepted by the Clever Cloud NodeGroup API, uppercase); `cpu` (vCPUs),
+  # `memoryKi` (kernel-visible memory in KiB) and `priceHourly` (EUR/hour) are
+  # OPTIONAL — set only the fields you want to pin, the rest fall through to the
+  # base value. A name absent from the base/seed must supply all three fields.
+  # Overrides always win and are re-applied after every dynamic refresh.
+  # CPU/memory still self-correct at runtime from observed node capacity.
+  # Rendered into a ConfigMap mounted in the controller.
+  # Example (pin only M's price, leave everything else dynamic/default):
   #   flavors:
   #     - name: M
-  #       cpu: 10
-  #       memoryKi: 15988992
   #       priceHourly: 0.1167
   flavors: []
+  # -- Optional background refresher that pulls CKE flavor prices and the
+  # available-flavor list (for `topology`) from Clever Cloud's PUBLIC,
+  # unauthenticated HTTP API every `refreshPeriod`. DISABLED by default:
+  # enabling it opens outbound HTTPS (TCP 443) from the controller to `apiURL` —
+  # the ONLY case where the controller talks to a Clever Cloud HTTP endpoint;
+  # every other operation stays in-cluster. No API token is required. The
+  # `flavors` overrides above are re-applied on top of each refresh.
+  pricing:
+    # -- Enable the dynamic price/flavor refresher. Requires egress to `apiURL`.
+    enabled: false
+    # -- How often to refresh prices and the available-flavor list.
+    refreshPeriod: 12h
+    # -- Base URL of the Clever Cloud public API, used for both endpoints below.
+    # Override for an egress proxy or testing.
+    apiURL: https://api.clever-cloud.com
+    # -- Optionally override the FULL URL of an individual endpoint (each
+    # defaults to `apiURL` + its standard path). Use these only when the two
+    # public APIs must point at different hosts/paths (e.g. a proxy that exposes
+    # them separately); leave empty to derive both from `apiURL`.
+    kubernetesProductURL: ""
+    priceSystemURL: ""
+    # -- CKE topology whose available-flavor list is fetched (e.g. DISTRIBUTED,
+    # DEDICATED_COMPUTE, ALL_IN_ONE).
+    topology: DISTRIBUTED
 
 service:
   # -- Expose the metrics endpoint through a ClusterIP service.
