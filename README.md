@@ -11,9 +11,9 @@ This project implements Karpenter's [`CloudProvider` interface](https://karpente
 provisions exactly the nodes they need — one NodeGroup per node — then consolidates the cluster to keep costs down. The
 Clever Cloud operator upstream turns those NodeGroups into VMs.
 
-Everything goes through the cluster's own Kubernetes API: there is no Clever Cloud HTTP client in the provider by
-default. The only exception is the optional [dynamic-pricing refresher](#dynamic-pricing-optional)
-(`settings.pricing.enabled`), which reads prices from Clever Cloud's public, token-less API.
+Almost everything goes through the cluster's own Kubernetes API. The one exception is the
+[dynamic-pricing refresher](#dynamic-pricing), **enabled by default**, which reads prices from Clever Cloud's
+public, token-less API; disable it with `settings.pricing.enabled=false` to keep the controller fully in-cluster.
 
 ## Status
 
@@ -128,8 +128,9 @@ $ kubectl apply -f examples/v1/general-purpose.yaml
 No Clever Cloud API token or credentials are required. The provider drives the in-cluster NodeGroup API that every CKE
 cluster serves; the Clever Cloud operator upstream reconciles NodeGroups into VMs with its own credentials.
 
-The optional [dynamic-pricing refresher](#dynamic-pricing-optional) (`settings.pricing.enabled`) additionally requires
-outbound HTTPS to `api.clever-cloud.com`, but still uses no token — the endpoints it reads are public.
+The [dynamic-pricing refresher](#dynamic-pricing) (`settings.pricing.enabled`, **on by default**) additionally requires
+outbound HTTPS to `api.clever-cloud.com`, but still uses no token — the endpoints it reads are public. Disable it
+(`settings.pricing.enabled=false`) if your cluster forbids that egress.
 
 ## Configuration
 
@@ -149,7 +150,7 @@ The controller is configured through environment variables, all set by the helm 
 | `BATCH_IDLE_DURATION`     | `Duration` | `1s`               | no       | Idle pod batching window before provisioning                 |
 | `FEATURE_GATES`           | `String`   | `NodeRepair=false` | no       | Karpenter feature gates                                      |
 | `FLAVORS_CONFIG_PATH`     | `String`   | _(unset)_          | no       | Path to a YAML list of per-flavor overrides; set by the chart when `settings.flavors` is non-empty |
-| `PRICING_REFRESH_ENABLED` | `Boolean`  | `false`            | no       | Enable the dynamic price/flavor refresher; set by the chart only when `settings.pricing.enabled` |
+| `PRICING_REFRESH_ENABLED` | `Boolean`  | `false`            | no       | Enable the dynamic price/flavor refresher. The binary defaults off; the shipped chart and manifest set it `true` (`settings.pricing.enabled`, on by default) |
 | `PRICING_REFRESH_PERIOD`  | `Duration` | `12h`              | no       | How often prices and the available-flavor list are refreshed |
 | `PRICING_API_URL`         | `String`   | `https://api.clever-cloud.com` | no | Base URL of the Clever Cloud public API, used for both endpoints (override for a proxy or testing) |
 | `PRICING_PRODUCT_URL`     | `String`   | _(derived from `PRICING_API_URL`)_ | no | Full URL of the `kubernetes-product` endpoint; overrides the base for this endpoint only |
@@ -181,11 +182,10 @@ close enough for the scheduler to pick a flavor; prices are used as-is for cost-
 consolidation. Overrides always win and are re-applied after every dynamic refresh. Leave
 `settings.flavors` empty to use the base catalogue unchanged.
 
-### Dynamic pricing (optional)
+### Dynamic pricing
 
-By default prices and the flavor list are static (the built-in seed, possibly overlaid by
-`settings.flavors`). Enabling `settings.pricing.enabled` starts a background refresher that,
-every `PRICING_REFRESH_PERIOD` (default `12h`), queries Clever Cloud's **public, unauthenticated**
+**Enabled by default** (`settings.pricing.enabled: true`). A background refresher, every
+`PRICING_REFRESH_PERIOD` (default `12h`), queries Clever Cloud's **public, unauthenticated**
 API at `PRICING_API_URL` for:
 
 - the per-resource rates (`/v4/billing/price-system`, keyed by `zone_id = CLEVER_CLOUD_REGION`),
@@ -202,15 +202,17 @@ self-corrects at runtime as above). A flavor the API offers but the seed does no
 with a log line. If a refresh fails (API unreachable, malformed response…), the last-known-good
 catalogue is kept and the refresher retries sooner.
 
+Disable it to keep the controller fully in-cluster (it then uses the built-in static catalogue):
+
 ```sh
 helm upgrade --install karpenter oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/charts/karpenter \
-  --set settings.pricing.enabled=true
+  --set settings.pricing.enabled=false
 ```
 
 **Precedence:** any `settings.flavors` overrides are re-applied on top of every refresh, so they
-always win. **Egress:** the controller runs on control-plane nodes; enabling the refresher
-requires it to reach `api.clever-cloud.com` on TCP 443. If your cluster restricts egress with
-NetworkPolicies, allow that destination from the controller pod (the chart ships no NetworkPolicy).
+always win. **Egress:** the controller runs on control-plane nodes; the refresher needs to reach
+`api.clever-cloud.com` on TCP 443. If your cluster restricts egress with NetworkPolicies, allow that
+destination from the controller pod (the chart ships no NetworkPolicy) or disable the refresher.
 No token is required.
 
 ### NodePool

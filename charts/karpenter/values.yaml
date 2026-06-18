@@ -92,16 +92,18 @@ settings:
   #     - name: M
   #       priceHourly: 0.1167
   flavors: []
-  # -- Optional background refresher that pulls CKE flavor prices and the
-  # available-flavor list (for `topology`) from Clever Cloud's PUBLIC,
-  # unauthenticated HTTP API every `refreshPeriod`. DISABLED by default:
-  # enabling it opens outbound HTTPS (TCP 443) from the controller to `apiURL` —
-  # the ONLY case where the controller talks to a Clever Cloud HTTP endpoint;
-  # every other operation stays in-cluster. No API token is required. The
-  # `flavors` overrides above are re-applied on top of each refresh.
+  # -- Background refresher that pulls CKE flavor prices and the available-flavor
+  # list (for `topology`) from Clever Cloud's PUBLIC, unauthenticated HTTP API
+  # every `refreshPeriod`. ENABLED by default: it opens outbound HTTPS (TCP 443)
+  # from the controller to `apiURL` — the ONLY case where the controller talks
+  # to a Clever Cloud HTTP endpoint; every other operation stays in-cluster. No
+  # API token is required. Set `enabled: false` to disable it (the controller
+  # then uses the built-in static catalogue). The `flavors` overrides above are
+  # re-applied on top of each refresh.
   pricing:
     # -- Enable the dynamic price/flavor refresher. Requires egress to `apiURL`.
-    enabled: false
+    # Set to false to keep the controller fully in-cluster (no outbound calls).
+    enabled: true
     # -- How often to refresh prices and the available-flavor list.
     refreshPeriod: 12h
     # -- Base URL of the Clever Cloud public API, used for both endpoints below.
