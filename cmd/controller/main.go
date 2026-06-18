@@ -54,9 +54,11 @@ func main() {
 
 	instanceTypeProvider := instancetype.NewProvider(region, nil, overrides)
 
-	// Optional dynamic price/flavor refresher: opt-in via PRICING_REFRESH_ENABLED.
-	// It updates the base catalog every PRICING_REFRESH_PERIOD from Clever Cloud's
-	// public API; the overrides above are re-applied on top of every refresh.
+	// Dynamic price/flavor refresher, gated by PRICING_REFRESH_ENABLED. The
+	// binary defaults to off (safe fallback); the shipped chart and manifest
+	// enable it by default. It updates the base catalog every
+	// PRICING_REFRESH_PERIOD from Clever Cloud's public API; the overrides above
+	// are re-applied on top of every refresh.
 	var pricingCtrl *pricingcontroller.Controller
 	if env.WithDefaultBool("PRICING_REFRESH_ENABLED", false) {
 		resolver := pricingprovider.NewProvider(pricingprovider.Options{

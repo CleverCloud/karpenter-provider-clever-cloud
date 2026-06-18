@@ -166,12 +166,13 @@ spec:
               value: "8081"
             - name: LEADER_ELECTION_NAMESPACE
               value: karpenter
-            # Optional dynamic price/flavor refresher (disabled by default).
-            # Uncomment to enable; requires egress to PRICING_API_URL (TCP 443
-            # to api.clever-cloud.com). The public API needs no token. Any
-            # per-flavor overrides (FLAVORS_CONFIG_PATH) are re-applied on top.
-            # - name: PRICING_REFRESH_ENABLED
-            #   value: "true"
+            # Dynamic price/flavor refresher (enabled by default). It requires
+            # egress to PRICING_API_URL (TCP 443 to api.clever-cloud.com); the
+            # public API needs no token. Any per-flavor overrides
+            # (FLAVORS_CONFIG_PATH) are re-applied on top. Set to "false" (or
+            # remove this var) to keep the controller fully in-cluster.
+            - name: PRICING_REFRESH_ENABLED
+              value: "true"
             # - name: PRICING_REFRESH_PERIOD
             #   value: "12h"
             # - name: PRICING_API_URL
