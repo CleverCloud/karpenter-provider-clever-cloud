@@ -20,6 +20,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
@@ -48,8 +49,8 @@ const priceSystemJSON = `{
   "zone_id": "par",
   "currency": "EUR",
   "countable": [
-    {"service": "kubernetes.node.vcpu", "data_unit": "vcpu", "price_plans": [{"price": 0.00277777777}]},
-    {"service": "kubernetes.node.ram", "data_unit": "B", "price_plans": [{"price": 0.00555555555}]},
+    {"service": "kubernetes.node.vcpu", "data_unit": "vcpu", "data_quantity_for_price": {"quantity": 1}, "price_plans": [{"price": 0.00277777777}]},
+    {"service": "kubernetes.node.ram", "data_unit": "B", "data_quantity_for_price": {"quantity": 1000000000}, "price_plans": [{"price": 0.00555555555}]},
     {"service": "kubernetes.controlPlane.distributed.vcpu", "price_plans": [{"price": 0.01}]}
   ]
 }`
@@ -167,6 +168,14 @@ func TestResolveUsesConfiguredTopology(t *testing.T) {
 	}
 }
 
+// vcpuPlan is the vcpu countable's price_plans fragment in priceSystemJSON;
+// priceSystemVariant swaps it for a variant to exercise one validation rule.
+const vcpuPlan = `"price_plans": [{"price": 0.00277777777}]`
+
+func priceSystemVariant(replacement, original string) string {
+	return strings.Replace(priceSystemJSON, original, replacement, 1)
+}
+
 func TestResolveErrors(t *testing.T) {
 	cases := map[string]handlerConfig{
 		"product 500":        {productStatus: http.StatusInternalServerError, productBody: "", priceBody: priceSystemJSON},
@@ -175,6 +184,17 @@ func TestResolveErrors(t *testing.T) {
 		"rates missing":      {productBody: productJSON(""), priceBody: `{"zone_id":"par","currency":"EUR","countable":[]}`},
 		"empty availability": {productBody: `{"topologies":[{"topology":"DISTRIBUTED","availableFlavors":[]}]}`, priceBody: priceSystemJSON},
 		"unknown topology":   {productBody: `{"topologies":[{"topology":"ALL_IN_ONE","availableFlavors":["S"]}]}`, priceBody: priceSystemJSON},
+		// Validation of bad-but-parseable payloads: every rejection keeps the
+		// last-known-good catalogue via the same error path.
+		"zero rate":          {productBody: productJSON(""), priceBody: priceSystemVariant(`"price_plans": [{"price": 0}]`, vcpuPlan)},
+		"negative rate":      {productBody: productJSON(""), priceBody: priceSystemVariant(`"price_plans": [{"price": -0.002}]`, vcpuPlan)},
+		"absurdly high rate": {productBody: productJSON(""), priceBody: priceSystemVariant(`"price_plans": [{"price": 2.77}]`, vcpuPlan)},
+		"absurdly low rate":  {productBody: productJSON(""), priceBody: priceSystemVariant(`"price_plans": [{"price": 0.0000027}]`, vcpuPlan)},
+		"tiered price plans": {productBody: productJSON(""), priceBody: priceSystemVariant(`"price_plans": [{"price": 0}, {"price": 0.00277777777}]`, vcpuPlan)},
+		"wrong currency":     {productBody: productJSON(""), priceBody: strings.Replace(priceSystemJSON, `"currency": "EUR"`, `"currency": "USD"`, 1)},
+		"wrong ram unit":     {productBody: productJSON(""), priceBody: strings.Replace(priceSystemJSON, `"data_unit": "B"`, `"data_unit": "MiB"`, 1)},
+		"wrong ram quantity": {productBody: productJSON(""), priceBody: strings.Replace(priceSystemJSON, `{"quantity": 1000000000}`, `{"quantity": 1000000}`, 1)},
+		"oversized body":     {productBody: productJSON(""), priceBody: `{"padding": "` + strings.Repeat("x", 2<<20) + `"}`},
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
