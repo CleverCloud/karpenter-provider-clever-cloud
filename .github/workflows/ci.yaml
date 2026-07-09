@@ -18,9 +18,9 @@ jobs:
     - run: make chart-lint
     - name: Verify generated files are up to date
       run: |
-        make generate
+        make generate raw-manifest
         if [ -n "$(git status --porcelain)" ]; then
-          echo "::error::Generated files are out of date. Run 'make generate' and commit the result."
+          echo "::error::Generated files are out of date. Run 'make generate raw-manifest' and commit the result."
           git diff
           exit 1
         fi
