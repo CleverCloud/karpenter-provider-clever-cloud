@@ -73,7 +73,7 @@ lint: ## Run golangci-lint (built from source on first run, then cached)
 
 .PHONY: image
 image: ## Build the container image
-	docker build -t $(IMAGE):$(TAG) .
+	docker build --build-arg VERSION=$(TAG) -t $(IMAGE):$(TAG) .
 
 .PHONY: chart-lint
 chart-lint: ## Lint and render both Helm charts

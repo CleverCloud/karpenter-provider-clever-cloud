@@ -23,6 +23,7 @@ package pricing
 
 import (
 	"context"
+	"math/rand/v2"
 	"time"
 
 	"github.com/awslabs/operatorpkg/reconciler"
@@ -80,15 +81,24 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	c.instanceTypeProvider.SetBaseFlavors(flavors)
 	metrics.PricingLastSuccessfulRefresh.Set(float64(time.Now().Unix()), nil)
 	log.FromContext(ctx).Info("refreshed flavor catalog from clever cloud api", "flavors", len(flavors))
-	return reconciler.Result{RequeueAfter: c.period}, nil
+	return reconciler.Result{RequeueAfter: jitter(c.period)}, nil
 }
 
-// failureRequeue never retries slower than the success cadence.
+// failureRequeue retries at roughly the failure cadence, never markedly
+// slower than the success cadence (both ends carry the ±10% jitter).
 func (c *Controller) failureRequeue() time.Duration {
 	if c.period < failureRequeue {
-		return c.period
+		return jitter(c.period)
 	}
-	return failureRequeue
+	return jitter(failureRequeue)
+}
+
+// jitter spreads a requeue by ±10%. Every CKE cluster runs this controller
+// against the same public API, and platform events that restart many
+// controllers at once (control-plane rollouts, image upgrades) would
+// otherwise synchronize the whole fleet's refreshes indefinitely.
+func jitter(d time.Duration) time.Duration {
+	return d + time.Duration((rand.Float64()*0.2-0.1)*float64(d))
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
