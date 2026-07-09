@@ -57,6 +57,12 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if !ok || node.Labels[v1alpha1.NodeRoleLabelKey] != v1alpha1.NodeRoleWorker {
 		return reconcile.Result{}, nil
 	}
+	// Deliberately trusts any worker node, karpenter-managed or not: the
+	// flavor/role labels are stamped by the platform (reserved prefix, not
+	// settable through NodeGroup spec.labels), and a fixed nodegroup's S node
+	// reports the same kernel-visible capacity as a karpenter-created one.
+	// Anyone with node-update RBAC is trusted too — an admin mislabeling a
+	// node skews that flavor's estimate until a real node overwrites it.
 	c.instanceTypeProvider.RecordObservedCapacity(flavor, node.Status.Capacity, node.Status.Allocatable)
 	return reconcile.Result{}, nil
 }

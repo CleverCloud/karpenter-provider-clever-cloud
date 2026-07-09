@@ -253,6 +253,9 @@ func TestCreateReusesExistingManagedNodeGroup(t *testing.T) {
 				v1alpha1.ManagedLabelKey:   "true",
 				v1alpha1.NodeClaimLabelKey: "default-reuse",
 			},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: "default-reuse"},
+			},
 		},
 		Spec: ngv1.NodeGroupSpec{Flavor: "M", NodeCount: 1},
 		Status: ngv1.NodeGroupStatus{
@@ -297,6 +300,25 @@ func TestCreateRejectsForeignNodeGroup(t *testing.T) {
 		}
 		provider, _ := newTestProvider(t, existing)
 		_, err := provider.Create(context.Background(), testNodeClaim("default-other"), testNodeClass("default"), "2XS")
+		if err == nil || !strings.Contains(err.Error(), "not managed") {
+			t.Fatalf("expected 'not managed' error, got %v", err)
+		}
+	})
+	t.Run("labeled nodegroup without the nodeclaim owner reference", func(t *testing.T) {
+		// Matching labels but no ownership proof — a hand-copied manifest
+		// must not be adopted (it would later be destroyed at deprovisioning).
+		existing := &ngv1.NodeGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "default-copied",
+				Labels: map[string]string{
+					v1alpha1.ManagedLabelKey:   "true",
+					v1alpha1.NodeClaimLabelKey: "default-copied",
+				},
+			},
+			Spec: ngv1.NodeGroupSpec{Flavor: "M", NodeCount: 1},
+		}
+		provider, _ := newTestProvider(t, existing)
+		_, err := provider.Create(context.Background(), testNodeClaim("default-copied"), testNodeClass("default"), "2XS")
 		if err == nil || !strings.Contains(err.Error(), "not managed") {
 			t.Fatalf("expected 'not managed' error, got %v", err)
 		}

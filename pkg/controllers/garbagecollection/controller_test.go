@@ -44,11 +44,26 @@ func newTestController(t *testing.T, objs ...client.Object) (*garbagecollection.
 	return garbagecollection.NewController(kubeClient, nodegroup.NewProvider(kubeClient)), kubeClient
 }
 
-// managedNodeGroup builds a karpenter-managed NodeGroup backdated by age.
+// managedNodeGroup builds a karpenter-managed NodeGroup backdated by age,
+// carrying the NodeClaim owner reference exactly as Create stamps it.
 // An empty claimLabel omits the nodeclaim label so the controller falls back
 // to the NodeGroup name. The fake client requires a finalizer alongside a
 // DeletionTimestamp, hence the test finalizer on deleting groups.
 func managedNodeGroup(name, claimLabel string, age time.Duration, deleting bool) *ngv1.NodeGroup {
+	ng := labeledNodeGroup(name, claimLabel, age, deleting)
+	claimName := claimLabel
+	if claimName == "" {
+		claimName = name
+	}
+	ng.OwnerReferences = []metav1.OwnerReference{
+		{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: claimName, UID: types.UID("uid-" + claimName)},
+	}
+	return ng
+}
+
+// labeledNodeGroup builds a NodeGroup carrying the managed label but no owner
+// reference — what a user gets by copying a karpenter-created manifest.
+func labeledNodeGroup(name, claimLabel string, age time.Duration, deleting bool) *ngv1.NodeGroup {
 	labels := map[string]string{v1alpha1.ManagedLabelKey: "true"}
 	if claimLabel != "" {
 		labels[v1alpha1.NodeClaimLabelKey] = claimLabel
@@ -157,6 +172,80 @@ func TestReconcileIgnoresUnmanagedNodeGroups(t *testing.T) {
 	}
 	if !nodeGroupExists(t, kubeClient, "user-pool") {
 		t.Error("expected unmanaged nodegroup to be retained")
+	}
+}
+
+func TestReconcileKeepsNodeGroupWhoseOwnerIsAlive(t *testing.T) {
+	// The nodeclaim label is mutable; the owner reference is the identity.
+	// A group whose label points at nothing but whose recorded owner lives
+	// must never be reaped — kubernetes GC semantics would keep it too.
+	ng := labeledNodeGroup("ng-mislabeled", "claim-gone", 10*time.Minute, false)
+	ng.OwnerReferences = []metav1.OwnerReference{
+		{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: "claim-alive", UID: types.UID("uid-claim-alive")},
+	}
+	ctrl, kubeClient := newTestController(t, ng, testNodeClaim("claim-alive"))
+
+	if _, err := ctrl.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !nodeGroupExists(t, kubeClient, "ng-mislabeled") {
+		t.Error("expected nodegroup with a living NodeClaim owner to be retained despite its stale label")
+	}
+}
+
+func TestReconcileTreatsForeignOwnerReferencesAsUnowned(t *testing.T) {
+	// Only karpenter.sh NodeClaim references prove this provider created the
+	// group; a NodePool ref or a NodeClaim kind from another API group must
+	// not unlock reaping.
+	nodePoolRef := labeledNodeGroup("ng-nodepool-ref", "claim-gone", 10*time.Minute, false)
+	nodePoolRef.OwnerReferences = []metav1.OwnerReference{
+		{APIVersion: "karpenter.sh/v1", Kind: "NodePool", Name: "pool-a", UID: types.UID("uid-pool-a")},
+	}
+	foreignGroup := labeledNodeGroup("ng-foreign-group", "claim-gone", 10*time.Minute, false)
+	foreignGroup.OwnerReferences = []metav1.OwnerReference{
+		{APIVersion: "karpenter.sh.example.com/v1", Kind: "NodeClaim", Name: "claim-gone", UID: types.UID("uid-x")},
+	}
+	ctrl, kubeClient := newTestController(t, nodePoolRef, foreignGroup)
+
+	if _, err := ctrl.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !nodeGroupExists(t, kubeClient, "ng-nodepool-ref") {
+		t.Error("expected nodegroup with only a NodePool owner reference to be retained")
+	}
+	if !nodeGroupExists(t, kubeClient, "ng-foreign-group") {
+		t.Error("expected nodegroup with a foreign-group NodeClaim reference to be retained")
+	}
+}
+
+func TestReconcileReapsAcrossKarpenterAPIVersions(t *testing.T) {
+	// The karpenter.sh/ prefix match is deliberate future-proofing: a group
+	// stamped by a version using karpenter.sh/v1beta1 still counts as owned.
+	ng := labeledNodeGroup("ng-beta-ref", "claim-gone", 10*time.Minute, false)
+	ng.OwnerReferences = []metav1.OwnerReference{
+		{APIVersion: "karpenter.sh/v1beta1", Kind: "NodeClaim", Name: "claim-gone", UID: types.UID("uid-claim-gone")},
+	}
+	ctrl, kubeClient := newTestController(t, ng)
+
+	if _, err := ctrl.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if nodeGroupExists(t, kubeClient, "ng-beta-ref") {
+		t.Error("expected orphaned nodegroup with a v1beta1 NodeClaim reference to be reaped")
+	}
+}
+
+func TestReconcileKeepsLabeledNodeGroupWithoutOwnerReference(t *testing.T) {
+	// A user who copies a karpenter-created NodeGroup manifest keeps the
+	// managed label but not the owner reference (or strips it). Reaping on
+	// the label alone would destroy nodes this provider never created.
+	ctrl, kubeClient := newTestController(t, labeledNodeGroup("copied-pool", "", 10*time.Minute, false))
+
+	if _, err := ctrl.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !nodeGroupExists(t, kubeClient, "copied-pool") {
+		t.Error("expected labeled nodegroup without a NodeClaim owner reference to be retained")
 	}
 }
 
