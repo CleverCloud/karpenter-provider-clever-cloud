@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### 🔄 Changed
+
+- **`fix(cloudprovider)`: a flavor leaving the catalogue no longer degrades the whole cluster** — `Get`/`List` now serve NodeGroups whose flavor left the served catalogue (upstream removal, topology change, removed override) with a synthesized instance type instead of erroring, so karpenter-core's NodeClaim garbage collection and node termination keep working. The synthesized type never enters the provisioning catalogue; the affected nodes are replaced through karpenter-core's `InstanceTypeNotFound` drift path, paced by the NodePool's disruption budgets. Semantics documented in `docs/observability.md`.
+- **`fix(instancetype)`: an override introducing a flavor outside the built-in catalogue must now set `cpu`, `memoryKi` and `priceHourly`** — previously an unpriced new flavor was silently accepted at 0 EUR/h and captured every cheapest-first provisioning decision. ⚠️ Upgrade note: a `settings.flavors` entry that relied on this (new-name flavor without `priceHourly`) now fails validation at startup — add the missing price before upgrading. An override resurrecting a seed flavor absent from the live catalogue is still accepted, but logged loudly.
+
 ## 0.10.0 - 2026-06-18
 
 CKE flavor prices and the available-flavor list can now refresh automatically from Clever Cloud's public, token-less pricing API — **enabled by default**. The built-in static catalogue stays as the fallback, and `settings.flavors` becomes a per-flavor overlay that coexists with the refresher and always wins.

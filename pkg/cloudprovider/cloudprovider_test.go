@@ -40,6 +40,11 @@ import (
 )
 
 func newTestProvider(t *testing.T, objs ...client.Object) (*cloudprovider.CloudProvider, client.Client) {
+	cp, kubeClient, _ := newTestProviderWithCatalog(t, objs...)
+	return cp, kubeClient
+}
+
+func newTestProviderWithCatalog(t *testing.T, objs ...client.Object) (*cloudprovider.CloudProvider, client.Client, *instancetype.Provider) {
 	t.Helper()
 	kubeClient := fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
@@ -48,7 +53,18 @@ func newTestProvider(t *testing.T, objs ...client.Object) (*cloudprovider.CloudP
 		Build()
 	itp := instancetype.NewProvider("par", nil, nil)
 	ngp := nodegroup.NewProvider(kubeClient, noopRecorder{})
-	return cloudprovider.New(kubeClient, itp, ngp), kubeClient
+	return cloudprovider.New(kubeClient, itp, ngp), kubeClient, itp
+}
+
+// managedNodeGroup seeds a NodeGroup as this provider would have created it.
+func managedNodeGroup(name, flavor string) *ngv1.NodeGroup {
+	return &ngv1.NodeGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: map[string]string{v1alpha1.ManagedLabelKey: "true"},
+		},
+		Spec: ngv1.NodeGroupSpec{Flavor: flavor, NodeCount: 1},
+	}
 }
 
 // noopRecorder discards events; these tests assert on errors, not events.
@@ -400,5 +416,125 @@ func TestGetInstanceTypesCatalog(t *testing.T) {
 		if allocatable.Memory().Value() >= it.Capacity.Memory().Value() {
 			t.Errorf("flavor %s: allocatable not reduced by overhead", it.Name)
 		}
+	}
+}
+
+// The tests below pin the unknown-flavor degradation contract: a running
+// NodeGroup whose flavor left the served catalogue — refresher shrink or
+// removed override — must keep Get and List working (core GC and node
+// termination depend on them), while the synthesized type never reaches the
+// provisioning catalog.
+
+func TestGetSynthesizesWhenFlavorLeftTheCatalogue(t *testing.T) {
+	cp, _, itp := newTestProviderWithCatalog(t, managedNodeGroup("default-old2xs", "2XS"))
+	// The refresher shrinks the catalogue to M only (upstream removal or a
+	// topology misread) while a 2XS node still runs.
+	itp.SetBaseFlavors([]instancetype.Flavor{{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.2}})
+
+	claim, err := cp.Get(context.Background(), "clevercloud://default-old2xs")
+	if err != nil {
+		t.Fatalf("Get must degrade, not fail: %v", err)
+	}
+	if claim.Status.ProviderID != "clevercloud://default-old2xs" {
+		t.Errorf("provider id = %q", claim.Status.ProviderID)
+	}
+	if got := claim.Labels[corev1.LabelInstanceTypeStable]; got != "2XS" {
+		t.Errorf("instance-type label = %q, want 2XS", got)
+	}
+	// Seed sizing survives for seed-known flavors.
+	if cpu := claim.Status.Capacity[corev1.ResourceCPU]; cpu.Value() != 4 {
+		t.Errorf("capacity cpu = %v, want the 2XS seed value 4", cpu.Value())
+	}
+}
+
+func TestListIncludesNodeGroupWithUnknownFlavor(t *testing.T) {
+	cp, _, itp := newTestProviderWithCatalog(t,
+		managedNodeGroup("default-known", "M"),
+		managedNodeGroup("default-old2xs", "2XS"),
+		managedNodeGroup("default-custom", "CUSTOM"),
+	)
+	// The refresher shrinks the catalogue (topology misread is the likeliest
+	// trigger): 2XS leaves while its node runs, CUSTOM was never in it.
+	itp.SetBaseFlavors([]instancetype.Flavor{{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.2}})
+
+	claims, err := cp.List(context.Background())
+	if err != nil {
+		t.Fatalf("List must degrade per entry, not fail: %v", err)
+	}
+	if len(claims) != 3 {
+		t.Fatalf("expected all nodegroups listed, got %d", len(claims))
+	}
+	// Skipping instead of synthesizing would make karpenter-core's GC read
+	// the missing provider ID as an orphaned claim and delete it as soon as
+	// its node is NotReady (a kubelet restart suffices).
+	ids := map[string]struct{}{}
+	for _, claim := range claims {
+		ids[claim.Status.ProviderID] = struct{}{}
+	}
+	for _, id := range []string{"clevercloud://default-old2xs", "clevercloud://default-custom"} {
+		if _, ok := ids[id]; !ok {
+			t.Errorf("degraded nodegroup %s missing from List, got %v", id, ids)
+		}
+	}
+}
+
+func TestGetEnrichesSynthesizedTypeWithObservedCapacity(t *testing.T) {
+	cp, _, itp := newTestProviderWithCatalog(t, managedNodeGroup("default-cust1", "CUSTOM"))
+
+	// Name-only floor: nothing is known about CUSTOM yet.
+	claim, err := cp.Get(context.Background(), "clevercloud://default-cust1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if cpu := claim.Status.Capacity[corev1.ResourceCPU]; !cpu.IsZero() {
+		t.Errorf("expected zero cpu before any observation, got %v", cpu.Value())
+	}
+
+	// A live node reports real capacity; the synthesized type picks it up.
+	itp.RecordObservedCapacity("CUSTOM",
+		corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6"), corev1.ResourceMemory: resource.MustParse("8Gi")},
+		corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6"), corev1.ResourceMemory: resource.MustParse("7Gi")},
+	)
+	claim, err = cp.Get(context.Background(), "clevercloud://default-cust1")
+	if err != nil {
+		t.Fatalf("Get after observation: %v", err)
+	}
+	if cpu := claim.Status.Capacity[corev1.ResourceCPU]; cpu.Value() != 6 {
+		t.Errorf("capacity cpu = %v, want observed 6", cpu.Value())
+	}
+}
+
+func TestSynthesizedFlavorStaysOutOfTheProvisioningCatalog(t *testing.T) {
+	cp, _, _ := newTestProviderWithCatalog(t, managedNodeGroup("default-cust2", "CUSTOM"))
+
+	if _, err := cp.Get(context.Background(), "clevercloud://default-cust2"); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	// Serving CUSTOM for provisioning would let a zero-priced synthetic win
+	// every cheapest-first decision and create NodeGroups the platform
+	// rejects.
+	its, err := cp.GetInstanceTypes(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("GetInstanceTypes: %v", err)
+	}
+	for _, it := range its {
+		if it.Name == "CUSTOM" {
+			t.Fatal("synthesized flavor leaked into the provisioning catalog")
+		}
+	}
+}
+
+func TestDeleteWorksWhenFlavorUnknown(t *testing.T) {
+	cp, kubeClient, _ := newTestProviderWithCatalog(t, managedNodeGroup("default-cust3", "CUSTOM"))
+	claim := testNodeClaim("default-cust3")
+	claim.Status.ProviderID = "clevercloud://default-cust3"
+
+	// Delete must never depend on an instance-type lookup: it is the path
+	// that releases the actual VM.
+	if err := cp.Delete(context.Background(), claim); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: "default-cust3"}, &ngv1.NodeGroup{}); err == nil {
+		t.Error("expected the nodegroup to be deleted")
 	}
 }

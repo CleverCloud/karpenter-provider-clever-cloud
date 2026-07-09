@@ -27,6 +27,7 @@ limitations under the License.
 package instancetype
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -182,10 +183,26 @@ func NewProvider(region string, base []Flavor, overrides []FlavorOverride) *Prov
 }
 
 // compose overlays the configured overrides on base (defaulting to
-// DefaultFlavors) and logs any override that had to be skipped.
+// DefaultFlavors), logs any override that had to be skipped, and warns when
+// an override resurrects a seed flavor the live catalogue no longer offers —
+// nodes provisioned with it may be rejected by the platform at create time.
 func (p *Provider) compose(base []Flavor) []Flavor {
 	if len(base) == 0 {
 		base = DefaultFlavors
+	}
+	baseNames := make(map[string]struct{}, len(base))
+	for _, f := range base {
+		baseNames[f.Name] = struct{}{}
+	}
+	for _, o := range p.overrides {
+		if _, inBase := baseNames[o.Name]; inBase {
+			continue
+		}
+		if _, seeded := SizingByName[o.Name]; seeded {
+			log.Log.WithName("instancetype").Info(
+				"flavor override resurrects a flavor absent from the live catalogue; the platform may reject NodeGroups using it",
+				"flavor", o.Name)
+		}
 	}
 	flavors, skipped := ApplyOverrides(base, p.overrides)
 	for _, name := range skipped {
@@ -228,7 +245,10 @@ func LoadFlavorsFromFile(path string) ([]FlavorOverride, error) {
 
 // ParseFlavorOverrides unmarshals a YAML list of partial flavor overrides and
 // validates it. Each entry must have a non-empty, unique name; any field that
-// is set must satisfy its bound (cpu > 0, memoryKi > 0, priceHourly >= 0). The
+// is set must satisfy its bound (cpu > 0, memoryKi > 0, priceHourly >= 0). A
+// name outside the static sizing seed introduces a new flavor and must set
+// all three fields — without the price bound an unpriced new flavor would
+// enter the catalogue at 0 EUR/h and win every cheapest-first decision. The
 // list must not be empty.
 func ParseFlavorOverrides(data []byte) ([]FlavorOverride, error) {
 	var overrides []FlavorOverride
@@ -255,6 +275,11 @@ func ParseFlavorOverrides(data []byte) ([]FlavorOverride, error) {
 		}
 		if o.PriceHourly != nil && *o.PriceHourly < 0 {
 			return nil, fmt.Errorf("flavor %q: priceHourly must be >= 0", o.Name)
+		}
+		if _, seeded := SizingByName[o.Name]; !seeded {
+			if o.CPU == nil || o.MemoryKi == nil || o.PriceHourly == nil {
+				return nil, fmt.Errorf("flavor %q is not in the built-in catalogue: a new flavor must set cpu, memoryKi and priceHourly", o.Name)
+			}
 		}
 	}
 	return overrides, nil
@@ -290,6 +315,7 @@ func ApplyOverrides(base []Flavor, overrides []FlavorOverride) ([]Flavor, []stri
 	result := make([]Flavor, 0, len(order))
 	for _, name := range order {
 		f, ok := byName[name]
+		fromScratch := false
 		if !ok {
 			// No base entry: seed from the static sizing table if known,
 			// otherwise rely entirely on the override fields below.
@@ -302,9 +328,11 @@ func ApplyOverrides(base []Flavor, overrides []FlavorOverride) ([]Flavor, []stri
 				}
 			} else {
 				f = Flavor{Name: name}
+				fromScratch = true
 			}
 		}
-		if o, hasOverride := overrideByName[name]; hasOverride {
+		o, hasOverride := overrideByName[name]
+		if hasOverride {
 			if o.CPU != nil {
 				f.CPU = *o.CPU
 			}
@@ -314,6 +342,13 @@ func ApplyOverrides(base []Flavor, overrides []FlavorOverride) ([]Flavor, []stri
 			if o.PriceHourly != nil {
 				f.PriceHourly = *o.PriceHourly
 			}
+		}
+		// A from-scratch flavor must get its price from the override: the
+		// zero value would otherwise pass the < 0 gate and enter the
+		// catalogue free of charge, capturing every cheapest-first decision.
+		if fromScratch && (!hasOverride || o.PriceHourly == nil) {
+			skipped = append(skipped, name)
+			continue
 		}
 		if f.CPU <= 0 || f.MemoryKi <= 0 || f.PriceHourly < 0 {
 			skipped = append(skipped, name)
@@ -360,6 +395,12 @@ func (p *Provider) List() []*cloudprovider.InstanceType {
 	return its
 }
 
+// ErrUnknownFlavor is returned by Get for a flavor absent from the served
+// catalogue. Callers that degrade on it (CloudProvider.Get/List) must match
+// with errors.Is so a future second failure class cannot be silently
+// swallowed by the degradation path.
+var ErrUnknownFlavor = errors.New("unknown flavor")
+
 // Get returns the instance type for a flavor name, or an error if unknown.
 func (p *Provider) Get(flavor string) (*cloudprovider.InstanceType, error) {
 	for _, f := range p.snapshotFlavors() {
@@ -368,10 +409,36 @@ func (p *Provider) Get(flavor string) (*cloudprovider.InstanceType, error) {
 		}
 	}
 	// A running NodeGroup referencing a flavor the catalogue no longer
-	// carries degrades cluster-wide GC — count it so the condition is
-	// visible without diffing logs.
+	// carries is served a synthesized type and rolled by drift — count the
+	// lookups so the condition is visible without diffing logs.
 	metrics.UnknownFlavorLookups.Inc(nil)
-	return nil, fmt.Errorf("unknown flavor %q", flavor)
+	return nil, fmt.Errorf("%w %q", ErrUnknownFlavor, flavor)
+}
+
+// Synthesize builds an instance type for a flavor absent from the served
+// catalogue, so CloudProvider.Get/List keep describing a running NodeGroup
+// whose flavor left it (upstream removal, topology change, removed
+// override). Sizing comes from the static seed when the name is known,
+// enriched with observed capacity when a live node reported it; a fully
+// unknown name yields a name-only instance type — sufficient for the
+// consumers of degraded claims (karpenter-core's garbage collection and
+// node termination read only the provider ID and existence). The result is
+// NOT added to the catalogue: List() never returns it, so nothing new is
+// ever provisioned or priced with it.
+func (p *Provider) Synthesize(flavor string) *cloudprovider.InstanceType {
+	f := Flavor{Name: flavor}
+	if s, seeded := SizingByName[flavor]; seeded {
+		f.CPU = s.CPU
+		f.MemoryKi = s.MemoryKi
+		f.PriceHourly = ComputePrice(s.CPU, s.NominalGB, DefaultVCPURate, DefaultRAMRate)
+	}
+	it := p.newInstanceType(f)
+	if it.Capacity.Memory().IsZero() {
+		// Name-only floor: subtracting the standard 100Mi overhead from zero
+		// capacity would advertise a negative allocatable.
+		it.Overhead = &cloudprovider.InstanceTypeOverhead{}
+	}
+	return it
 }
 
 func (p *Provider) newInstanceType(f Flavor) *cloudprovider.InstanceType {

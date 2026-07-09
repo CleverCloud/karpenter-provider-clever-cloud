@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
@@ -56,6 +57,9 @@ type CloudProvider struct {
 	kubeClient           client.Client
 	instanceTypeProvider *instancetype.Provider
 	nodeGroupProvider    *nodegroup.Provider
+	// warnedFlavors dedups the degradation log per flavor for this process
+	// lifetime; the condition persists across the GC's 2-minute List sweeps.
+	warnedFlavors sync.Map
 }
 
 func New(kubeClient client.Client, instanceTypeProvider *instancetype.Provider, nodeGroupProvider *nodegroup.Provider) *CloudProvider {
@@ -146,9 +150,9 @@ func (c *CloudProvider) Get(ctx context.Context, providerID string) (*karpv1.Nod
 		// Karpenter to release its node finalizer first.
 		return nil, cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("nodegroup %q is terminating", name))
 	}
-	instanceType, err := c.instanceTypeProvider.Get(ng.Spec.Flavor)
+	instanceType, err := c.resolveNodeGroupInstanceType(ctx, ng)
 	if err != nil {
-		return nil, fmt.Errorf("resolving instance type for nodegroup %q, %w", name, err)
+		return nil, err
 	}
 	return c.buildNodeClaim(ng, instanceType), nil
 }
@@ -160,13 +164,45 @@ func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
 	}
 	nodeClaims := make([]*karpv1.NodeClaim, 0, len(nodeGroups))
 	for i := range nodeGroups {
-		instanceType, err := c.instanceTypeProvider.Get(nodeGroups[i].Spec.Flavor)
+		instanceType, err := c.resolveNodeGroupInstanceType(ctx, &nodeGroups[i])
 		if err != nil {
-			return nil, fmt.Errorf("resolving instance type for nodegroup %q, %w", nodeGroups[i].Name, err)
+			return nil, err
 		}
 		nodeClaims = append(nodeClaims, c.buildNodeClaim(&nodeGroups[i], instanceType))
 	}
 	return nodeClaims, nil
+}
+
+// resolveNodeGroupInstanceType describes a running NodeGroup, degrading to a
+// synthesized instance type when its flavor left the catalogue (upstream
+// removal, topology change, removed override). Failing on that condition is
+// never an option: a List error stalls karpenter-core's nodeclaim garbage
+// collection cluster-wide and a Get error wedges node termination before
+// drain — while SKIPPING the entry instead would make core GC read the
+// missing provider ID as an orphaned claim and delete the node as soon as it
+// is NotReady (a kubelet restart suffices). The synthesized type never
+// enters GetInstanceTypes, so nothing new is provisioned or priced with it;
+// the running node itself is replaced by karpenter-core's
+// InstanceTypeNotFound drift path, paced by the NodePool's disruption
+// budgets. Only the unknown-flavor error degrades — anything else surfaces.
+func (c *CloudProvider) resolveNodeGroupInstanceType(ctx context.Context, ng *ngv1.NodeGroup) (*cloudprovider.InstanceType, error) {
+	instanceType, err := c.instanceTypeProvider.Get(ng.Spec.Flavor)
+	if err == nil {
+		// The flavor is (back) in the catalogue: rearm the degradation log so
+		// a later removal of the same flavor is named again.
+		c.warnedFlavors.Delete(ng.Spec.Flavor)
+		return instanceType, nil
+	}
+	if !errors.Is(err, instancetype.ErrUnknownFlavor) {
+		return nil, fmt.Errorf("resolving instance type for nodegroup %q, %w", ng.Name, err)
+	}
+	if _, warned := c.warnedFlavors.LoadOrStore(ng.Spec.Flavor, struct{}{}); !warned {
+		log.FromContext(ctx).WithValues("flavor", ng.Spec.Flavor, "NodeGroup", ng.Name).Info(
+			"flavor is missing from the served catalogue; serving a synthesized instance type " +
+				"(existing nodes are replaced through drift under disruption budgets, new nodes never use it — " +
+				"restore the flavor via settings.flavors or check CLEVER_CLOUD_TOPOLOGY)")
+	}
+	return c.instanceTypeProvider.Synthesize(ng.Spec.Flavor), nil
 }
 
 func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
