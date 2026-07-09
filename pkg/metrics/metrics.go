@@ -121,6 +121,22 @@ var (
 		nil,
 	)
 
+	// FlavorsConfigInvalid is 1 while the FLAVORS_CONFIG_PATH file failed to
+	// load and the controller runs WITHOUT the configured overrides. The
+	// chart rolls the pod on every settings.flavors change, so a typo used to
+	// crashloop the platform's autoscaler; it now degrades — this gauge is
+	// what keeps the degradation from being silent.
+	FlavorsConfigInvalid = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: "instancetype",
+			Name:      "flavors_config_invalid",
+			Help:      "1 while the flavors overrides file failed to load and the controller runs without the configured overrides.",
+		},
+		nil,
+	)
+
 	// PricingRefreshFailures counts failed catalogue refreshes; each failure
 	// keeps the last-known-good catalogue in use.
 	PricingRefreshFailures = opmetrics.NewPrometheusCounter(
@@ -174,6 +190,7 @@ func init() {
 	NodeGroupQuotaRejections.Add(0, nil)
 	NodeGroupVanished.Add(0, nil)
 	NodeGroupExternalResizes.Set(0, nil)
+	FlavorsConfigInvalid.Set(0, nil)
 	GCReapedNodeGroups.Add(0, nil)
 	GCRefusedNodeGroups.Set(0, nil)
 	PricingRefreshFailures.Add(0, nil)
