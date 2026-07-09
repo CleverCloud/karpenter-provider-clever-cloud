@@ -1,18 +1,55 @@
+# GENERATED FILE — do not edit. Regenerate with 'make raw-manifest'.
+# Rendered from charts/karpenter with default values; the image tag comes from
+# the chart's appVersion. To customize anything, install the chart instead.
+---
 apiVersion: v1
 kind: Namespace
 metadata:
   name: karpenter
 ---
+# Source: karpenter/templates/poddisruptionbudget.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: karpenter
+  namespace: karpenter
+  labels:
+    helm.sh/chart: karpenter-0.10.0
+    app.kubernetes.io/name: karpenter
+    app.kubernetes.io/instance: karpenter
+    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: karpenter
+      app.kubernetes.io/instance: karpenter
+---
+# Source: karpenter/templates/serviceaccount.yaml
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: karpenter
   namespace: karpenter
+  labels:
+    helm.sh/chart: karpenter-0.10.0
+    app.kubernetes.io/name: karpenter
+    app.kubernetes.io/instance: karpenter
+    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/managed-by: Helm
 ---
+# Source: karpenter/templates/clusterrole.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: karpenter
+  labels:
+    helm.sh/chart: karpenter-0.10.0
+    app.kubernetes.io/name: karpenter
+    app.kubernetes.io/instance: karpenter
+    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/managed-by: Helm
 rules:
   # karpenter-core: read
   - apiGroups: ["karpenter.sh"]
@@ -61,10 +98,17 @@ rules:
     resources: ["clevernodeclasses", "clevernodeclasses/status"]
     verbs: ["get", "list", "watch", "update", "patch"]
 ---
+# Source: karpenter/templates/clusterrole.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: karpenter
+  labels:
+    helm.sh/chart: karpenter-0.10.0
+    app.kubernetes.io/name: karpenter
+    app.kubernetes.io/instance: karpenter
+    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/managed-by: Helm
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -74,12 +118,20 @@ subjects:
     name: karpenter
     namespace: karpenter
 ---
+# Source: karpenter/templates/role.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: karpenter
   namespace: karpenter
+  labels:
+    helm.sh/chart: karpenter-0.10.0
+    app.kubernetes.io/name: karpenter
+    app.kubernetes.io/instance: karpenter
+    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/managed-by: Helm
 rules:
+  # Leader election.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "watch"]
@@ -91,35 +143,57 @@ rules:
     resources: ["leases"]
     verbs: ["create"]
 ---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: karpenter
-  namespace: karpenter
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: karpenter
-subjects:
-  - kind: ServiceAccount
-    name: karpenter
-    namespace: karpenter
----
+# Source: karpenter/templates/role.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: karpenter-lease
   namespace: kube-node-lease
+  labels:
+    helm.sh/chart: karpenter-0.10.0
+    app.kubernetes.io/name: karpenter
+    app.kubernetes.io/instance: karpenter
+    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/managed-by: Helm
 rules:
+  # Karpenter deletes node leases when finalizing terminated nodes.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "delete"]
 ---
+# Source: karpenter/templates/role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: karpenter
+  namespace: karpenter
+  labels:
+    helm.sh/chart: karpenter-0.10.0
+    app.kubernetes.io/name: karpenter
+    app.kubernetes.io/instance: karpenter
+    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/managed-by: Helm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: karpenter
+subjects:
+  - kind: ServiceAccount
+    name: karpenter
+    namespace: karpenter
+---
+# Source: karpenter/templates/role.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: karpenter-lease
   namespace: kube-node-lease
+  labels:
+    helm.sh/chart: karpenter-0.10.0
+    app.kubernetes.io/name: karpenter
+    app.kubernetes.io/instance: karpenter
+    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/managed-by: Helm
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -129,85 +203,133 @@ subjects:
     name: karpenter
     namespace: karpenter
 ---
+# Source: karpenter/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: karpenter
+  namespace: karpenter
+  labels:
+    helm.sh/chart: karpenter-0.10.0
+    app.kubernetes.io/name: karpenter
+    app.kubernetes.io/instance: karpenter
+    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  ports:
+    - name: http-metrics
+      port: 8080
+      targetPort: http-metrics
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: karpenter
+    app.kubernetes.io/instance: karpenter
+---
+# Source: karpenter/templates/deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: karpenter
   namespace: karpenter
   labels:
+    helm.sh/chart: karpenter-0.10.0
     app.kubernetes.io/name: karpenter
+    app.kubernetes.io/instance: karpenter
+    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/managed-by: Helm
 spec:
   replicas: 1
+  revisionHistoryLimit: 10
   selector:
     matchLabels:
       app.kubernetes.io/name: karpenter
+      app.kubernetes.io/instance: karpenter
   template:
     metadata:
       labels:
         app.kubernetes.io/name: karpenter
+        app.kubernetes.io/instance: karpenter
     spec:
       serviceAccountName: karpenter
-      priorityClassName: system-cluster-critical
-      # Karpenter must not run on nodes it can disrupt.
+      securityContext:
+        fsGroup: 65532
+      priorityClassName: "system-cluster-critical"
       nodeSelector:
         clever-cloud.com/cluster-node-role: control-plane
       containers:
         - name: controller
-          image: ghcr.io/clevercloud/karpenter:v0.9.2
+          image: ghcr.io/clevercloud/karpenter:v0.10.0
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           env:
             - name: CLEVER_CLOUD_REGION
-              value: par
+              value: "par"
             - name: LOG_LEVEL
-              value: info
+              value: "info"
             - name: METRICS_PORT
               value: "8080"
             - name: HEALTH_PROBE_PORT
               value: "8081"
+            - name: SYSTEM_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: LEADER_ELECTION_NAMESPACE
-              value: karpenter
-            # Dynamic price/flavor refresher (enabled by default). It requires
-            # egress to PRICING_API_URL (TCP 443 to api.clever-cloud.com); the
-            # public API needs no token. Any per-flavor overrides
-            # (FLAVORS_CONFIG_PATH) are re-applied on top. Set to "false" (or
-            # remove this var) to keep the controller fully in-cluster.
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: BATCH_MAX_DURATION
+              value: "10s"
+            - name: BATCH_IDLE_DURATION
+              value: "1s"
+            - name: FEATURE_GATES
+              value: "NodeRepair=false"
             - name: PRICING_REFRESH_ENABLED
               value: "true"
-            # - name: PRICING_REFRESH_PERIOD
-            #   value: "12h"
-            # - name: PRICING_API_URL
-            #   value: "https://api.clever-cloud.com"
-            # Optionally override each endpoint's full URL (default: PRICING_API_URL
-            # + standard path). Set only when the two APIs live at different places.
-            # - name: PRICING_PRODUCT_URL
-            #   value: "https://api.clever-cloud.com/v4/kubernetes-product"
-            # - name: PRICING_PRICE_SYSTEM_URL
-            #   value: "https://api.clever-cloud.com/v4/billing/price-system"
-            # - name: CLEVER_CLOUD_TOPOLOGY
-            #   value: "DISTRIBUTED"
+            - name: PRICING_REFRESH_PERIOD
+              value: "12h"
+            - name: PRICING_API_URL
+              value: "https://api.clever-cloud.com"
+            - name: CLEVER_CLOUD_TOPOLOGY
+              value: "DISTRIBUTED"
+            - name: MEMORY_LIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: controller
+                  divisor: "0"
+                  resource: limits.memory
           ports:
             - name: http-metrics
               containerPort: 8080
+              protocol: TCP
             - name: http
               containerPort: 8081
+              protocol: TCP
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
             initialDelaySeconds: 30
+            timeoutSeconds: 30
           readinessProbe:
             httpGet:
               path: /readyz
               port: http
+            initialDelaySeconds: 5
+            timeoutSeconds: 30
           resources:
+            limits:
+              memory: 512Mi
             requests:
               cpu: 200m
               memory: 256Mi
-            limits:
-              memory: 512Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            capabilities:
-              drop: ["ALL"]

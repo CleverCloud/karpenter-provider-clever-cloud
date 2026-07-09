@@ -27,6 +27,21 @@ generate: ## Generate deepcopy functions and the CleverNodeClass CRD
 	go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION) crd paths="./pkg/apis/v1alpha1/..." output:crd:artifacts:config=deploy/crds
 	$(MAKE) sync-chart-crds
 
+.PHONY: raw-manifest
+raw-manifest: ## Regenerate deploy/karpenter.yaml from the Helm chart (never edit it by hand)
+	{ \
+		echo "# GENERATED FILE — do not edit. Regenerate with 'make raw-manifest'."; \
+		echo "# Rendered from charts/karpenter with default values; the image tag comes from"; \
+		echo "# the chart's appVersion. To customize anything, install the chart instead."; \
+		echo "---"; \
+		echo "apiVersion: v1"; \
+		echo "kind: Namespace"; \
+		echo "metadata:"; \
+		echo "  name: karpenter"; \
+		helm template karpenter charts/karpenter --namespace karpenter \
+			| sed '/^[[:space:]]*$$/d'; \
+	} > deploy/karpenter.yaml
+
 .PHONY: sync-chart-crds
 sync-chart-crds: ## Sync deploy/crds into both Helm charts (crds/ dir + templated CRD chart)
 	cp deploy/crds/*.yaml charts/karpenter/crds/

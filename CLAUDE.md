@@ -16,13 +16,14 @@ make vet         # go vet ./...
 make lint        # golangci-lint v2 (config in .golangci.yml, runs via go run — no install needed)
 make chart-lint  # helm lint + template both charts
 make chart-package  # helm package both charts into dist/ (TAG=v<semver>; chart version = TAG without the v)
+make raw-manifest   # regenerate deploy/karpenter.yaml from charts/karpenter (never edit it by hand)
 make run         # build + run locally against current kubeconfig (DISABLE_LEADER_ELECTION=true)
 make image       # docker build (IMAGE=, TAG= overridable)
 ```
 
 Run a single test: `go test ./pkg/cloudprovider/ -run TestName`
 
-Run `make generate` after any change to `pkg/apis/` (deepcopy) or `pkg/apis/v1alpha1/` (CRD schema). Only the CleverNodeClass CRD is generated; the `karpenter.sh_*.yaml` CRDs in `deploy/crds/` are vendored from the karpenter-core release, and the NodeGroup CRD is owned by Clever Cloud and not in this repo at all.
+Run `make generate` after any change to `pkg/apis/` (deepcopy) or `pkg/apis/v1alpha1/` (CRD schema). Only the CleverNodeClass CRD is generated; the `karpenter.sh_*.yaml` CRDs in `deploy/crds/` are vendored from the karpenter-core release, and the NodeGroup CRD is owned by Clever Cloud and not in this repo at all. Run `make raw-manifest` after any change to `charts/karpenter` templates, values, or `Chart.yaml` — `deploy/karpenter.yaml` is generated from the chart and CI fails on drift.
 
 The chart CRD copies are generated too: `make generate` copies `deploy/crds/` verbatim into `charts/karpenter/crds/` and awk-templates them into `charts/karpenter-crd/templates/` (`sync-chart-crds`). Never edit those files by hand — CI fails if `make generate` produces a diff.
 
@@ -41,7 +42,7 @@ NodeGroups created by this provider carry the marker label `karpenter.clever-clo
 
 ### Wiring (cmd/controller/main.go)
 
-Uses karpenter-core's `operator.NewOperator()`, registers the core controllers plus the provider's own (`pkg/controllers/controllers.go`). The CloudProvider is wrapped in `overlay.Decorate` for NodeOverlay support. Region comes from `CLEVER_CLOUD_REGION` (default `par` — CKE is single-zone today; doubles as the price-system `zone_id`). Capacity type is always on-demand. The pricing refresher is gated by `PRICING_REFRESH_ENABLED` (also reads `PRICING_REFRESH_PERIOD`/`PRICING_API_URL`/`CLEVER_CLOUD_TOPOLOGY` through the same `env.WithDefault*` pattern, plus `PRICING_PRODUCT_URL`/`PRICING_PRICE_SYSTEM_URL` to override either endpoint's full URL independently — both default to `PRICING_API_URL` + their standard path); when off, `NewControllers` is passed a nil pricing controller and skips it. The **binary defaults the gate to `false`** (safe fallback), but the chart (`settings.pricing.enabled: true`) and `deploy/karpenter.yaml` set it on by default — note the chart only renders `PRICING_REFRESH_ENABLED` when `enabled` is true, so the binary default must stay `false` or `enabled: false` could not disable it. The pricing env contract must be kept in sync across the three deployment artifacts (chart `values.yaml`, chart `deployment.yaml`, `deploy/karpenter.yaml`).
+Uses karpenter-core's `operator.NewOperator()`, registers the core controllers plus the provider's own (`pkg/controllers/controllers.go`). The CloudProvider is wrapped in `overlay.Decorate` for NodeOverlay support. Region comes from `CLEVER_CLOUD_REGION` (default `par` — CKE is single-zone today; doubles as the price-system `zone_id`). Capacity type is always on-demand. The pricing refresher is gated by `PRICING_REFRESH_ENABLED` (also reads `PRICING_REFRESH_PERIOD`/`PRICING_API_URL`/`CLEVER_CLOUD_TOPOLOGY` through the same `env.WithDefault*` pattern, plus `PRICING_PRODUCT_URL`/`PRICING_PRICE_SYSTEM_URL` to override either endpoint's full URL independently — both default to `PRICING_API_URL` + their standard path); when off, `NewControllers` is passed a nil pricing controller and skips it. The **binary defaults the gate to `false`** (safe fallback), but the chart (`settings.pricing.enabled: true`) and `deploy/karpenter.yaml` set it on by default — note the chart only renders `PRICING_REFRESH_ENABLED` when `enabled` is true, so the binary default must stay `false` or `enabled: false` could not disable it. The pricing env contract must be kept in sync between chart `values.yaml` and chart `deployment.yaml`; `deploy/karpenter.yaml` follows automatically (generated from the chart by `make raw-manifest`).
 
 ### Provider controllers (pkg/controllers/) — each exists for a CKE quirk
 
@@ -78,7 +79,7 @@ NodeGroups are created with the `karpenter.sh/unregistered:NoExecute` taint (clo
 
 ### Deployment artifacts (charts/, deploy/)
 
-Two Helm charts, deliberately overlapping: `charts/karpenter` installs the controller stack and carries the CRDs in its `crds/` directory (Helm installs those but never upgrades or deletes them), while `charts/karpenter-crd` manages the **same** CRDs as regular templates so upgrades flow through Helm — users install both. `deploy/karpenter.yaml` is the raw-manifest alternative. All CRD copies originate from `deploy/crds/` via `make generate`.
+Two Helm charts, deliberately overlapping: `charts/karpenter` installs the controller stack and carries the CRDs in its `crds/` directory (Helm installs those but never upgrades or deletes them), while `charts/karpenter-crd` manages the **same** CRDs as regular templates so upgrades flow through Helm — users install both. `deploy/karpenter.yaml` is the raw-manifest alternative, generated from `charts/karpenter` by `make raw-manifest` (namespace + `helm template` with default values; never edit it by hand — CI fails on drift). All CRD copies originate from `deploy/crds/` via `make generate`.
 
 ## Testing
 
@@ -86,7 +87,7 @@ Unit tests use the controller-runtime fake client (see `pkg/cloudprovider/cloudp
 
 ## CI
 
-PRs run `make vet`, `make build`, `make chart-lint`, a generated-files drift check (`make generate` must produce no diff), `make test`, `go test -race ./pkg/... ./cmd/...`, golangci-lint (`ci-lint.yaml` — same version as `make lint`), and a git-hygiene gate (`git.yaml`: every commit message must be a Conventional Commit, no `fixup!`/`squash!` commits). Pushing a `v*` tag builds the image, pushes it to ghcr.io, and publishes both Helm charts as OCI artifacts to `oci://ghcr.io/<owner>/<repo>/charts/{karpenter,karpenter-crd}` (chart version = tag without the `v` prefix, appVersion = tag — the in-repo `Chart.yaml` versions are placeholders overridden at package time). Commit conventions are documented in CONTRIBUTING.md.
+PRs run `make vet`, `make build`, `make chart-lint`, a generated-files drift check (`make generate raw-manifest` must produce no diff), `make test`, `go test -race ./pkg/... ./cmd/...`, golangci-lint (`ci-lint.yaml` — same version as `make lint`), and a git-hygiene gate (`git.yaml`: every commit message must be a Conventional Commit, no `fixup!`/`squash!` commits). Pushing a `v*` tag builds the image, pushes it to ghcr.io, and publishes both Helm charts as OCI artifacts to `oci://ghcr.io/<owner>/<repo>/charts/{karpenter,karpenter-crd}` (chart version = tag without the `v` prefix, appVersion = tag — the in-repo `Chart.yaml` versions are placeholders overridden at package time, but the release fails fast if they lag the tag: bump both files and run `make raw-manifest` in the release commit). Commit conventions are documented in CONTRIBUTING.md.
 
 ## Operational constraints that shape the code
 
