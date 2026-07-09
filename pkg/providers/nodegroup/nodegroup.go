@@ -23,6 +23,7 @@ package nodegroup
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -128,6 +129,21 @@ func IsManaged(ng *ngv1.NodeGroup) bool {
 	return ng.Labels[v1alpha1.ManagedLabelKey] == "true"
 }
 
+// NodeClaimOwners returns the names of the NodeClaim owner references stamped
+// by Create. The managed label alone is forgeable — copying a karpenter-created
+// manifest keeps it — so destructive paths that act on label-matched NodeGroups
+// must require this ownership proof, and must key their decision on the
+// referenced claim itself, never on the mutable labels.
+func NodeClaimOwners(ng *ngv1.NodeGroup) []string {
+	var names []string
+	for _, ref := range ng.OwnerReferences {
+		if ref.Kind == "NodeClaim" && strings.HasPrefix(ref.APIVersion, "karpenter.sh/") {
+			names = append(names, ref.Name)
+		}
+	}
+	return names
+}
+
 // Create creates the NodeGroup backing a NodeClaim and waits briefly for the
 // Clever Cloud operator to accept it. It returns ErrQuotaExceeded (after
 // cleaning up the NodeGroup) when the organisation quota rejects it.
@@ -183,7 +199,8 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 		if getErr := p.kubeClient.Get(ctx, types.NamespacedName{Name: ng.Name}, existing); getErr != nil {
 			return nil, fmt.Errorf("getting existing nodegroup, %w", getErr)
 		}
-		if !IsManaged(existing) || existing.Labels[v1alpha1.NodeClaimLabelKey] != nodeClaim.Name {
+		if !IsManaged(existing) || existing.Labels[v1alpha1.NodeClaimLabelKey] != nodeClaim.Name ||
+			!slices.Contains(NodeClaimOwners(existing), nodeClaim.Name) {
 			return nil, fmt.Errorf("nodegroup %q already exists and is not managed by this nodeclaim", ng.Name)
 		}
 		ng = existing

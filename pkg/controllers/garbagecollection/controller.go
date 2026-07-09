@@ -16,9 +16,17 @@ limitations under the License.
 
 // Package garbagecollection deletes Karpenter-managed NodeGroups whose
 // NodeClaim no longer exists. Owner references already cover most paths;
-// this controller is the safety net for NodeGroups that lost their owner
-// (e.g. a NodeClaim force-deleted with its finalizer stripped while the
-// kubernetes garbage collector missed the dependent).
+// this controller is the safety net for NodeClaims force-deleted with their
+// finalizer stripped while the kubernetes garbage collector missed the
+// dependent. Reaping requires the NodeClaim owner reference stamped at
+// creation, not just the managed label: the label survives copying a
+// karpenter-created manifest by hand, and deleting on the label alone would
+// destroy nodes this provider never created. The reference is also the
+// identity — a group is never reaped while any NodeClaim it references is
+// alive, whatever its labels claim. Deliberate trade-off: a group whose
+// owner reference was stripped (kubectl delete --cascade=orphan, restore
+// tooling) is never reaped and must be deleted manually — leaking a VM beats
+// destroying one that was never ours.
 package garbagecollection
 
 import (
@@ -48,10 +56,13 @@ const (
 type Controller struct {
 	kubeClient        client.Client
 	nodeGroupProvider *nodegroup.Provider
+	// warned dedups the refusal log per NodeGroup for this process lifetime;
+	// Reconcile is a singleton, no locking needed.
+	warned map[string]struct{}
 }
 
 func NewController(kubeClient client.Client, nodeGroupProvider *nodegroup.Provider) *Controller {
-	return &Controller{kubeClient: kubeClient, nodeGroupProvider: nodeGroupProvider}
+	return &Controller{kubeClient: kubeClient, nodeGroupProvider: nodeGroupProvider, warned: map[string]struct{}{}}
 }
 
 func (c *Controller) Name() string {
@@ -83,12 +94,44 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		if _, ok := claimNames[claimName]; ok {
 			continue
 		}
+		owners := nodegroup.NodeClaimOwners(ng)
+		if len(owners) == 0 {
+			c.warnOnce(ctx, ng.Name, "refusing to garbage collect nodegroup carrying the managed label without a NodeClaim owner reference; "+
+				"remove the label if it was copied from a karpenter-created manifest, or delete the nodegroup manually if its owner was deliberately orphaned")
+			continue
+		}
+		if ownerAlive(owners, claimNames) {
+			// The mutable nodeclaim label disagrees with a living owner —
+			// never reap a group whose recorded owner still exists.
+			c.warnOnce(ctx, ng.Name, "refusing to garbage collect nodegroup whose NodeClaim owner is alive but whose nodeclaim label matches nothing; fix the label")
+			continue
+		}
 		if err := c.nodeGroupProvider.Delete(ctx, ng.Name); client.IgnoreNotFound(err) != nil {
 			return reconciler.Result{}, err
 		}
 		log.FromContext(ctx).WithValues("NodeGroup", ng.Name).Info("garbage collected orphaned nodegroup")
 	}
 	return reconciler.Result{RequeueAfter: pollPeriod}, nil
+}
+
+// warnOnce logs the refusal reason once per NodeGroup per process lifetime —
+// the condition persists until an operator acts, and one line per 2-minute
+// sweep would drown the signal.
+func (c *Controller) warnOnce(ctx context.Context, name, msg string) {
+	if _, ok := c.warned[name]; ok {
+		return
+	}
+	c.warned[name] = struct{}{}
+	log.FromContext(ctx).WithValues("NodeGroup", name).Info(msg)
+}
+
+func ownerAlive(owners []string, claimNames map[string]struct{}) bool {
+	for _, owner := range owners {
+		if _, ok := claimNames[owner]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
