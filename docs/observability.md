@@ -17,7 +17,7 @@ All provider series are prefixed `karpenter_clevercloud_`.
 | `gc_refused_nodegroups` | gauge | NodeGroups the last GC sweep refused to reap: managed label present, but no verified dead NodeClaim owner. | **Non-zero needs attention** — each one is a VM billing hourly. A copied manifest: remove the `karpenter.clever-cloud.com/managed` label. A deliberately orphaned group: delete it manually. Details in the `GarbageCollectionRefused` event on the NodeGroup. |
 | `pricing_refresh_failures_total` | counter | A catalogue refresh from the public price API failed; the last-known-good catalogue stays in use. | Transient failures are harmless. Persistent failures mean prices/flavors drift from reality: check egress to `api.clever-cloud.com` and the error log, or pin the catalogue via `settings.flavors`. |
 | `pricing_last_successful_refresh_timestamp_seconds` | gauge | Unix time of the last successful catalogue refresh. **Absent until the first success, and exports no series when the refresher is disabled** (`settings.pricing.enabled=false`). | Alert on staleness only when > 0 (see below). |
-| `instancetype_unknown_flavor_lookups_total` | counter | An instance-type lookup referenced a flavor absent from the served catalogue. | A running NodeGroup uses a flavor the catalogue lost (upstream change, topology misconfig, removed override). Cluster-wide NodeClaim GC degrades while this persists: restore the flavor via `settings.flavors` or fix `CLEVER_CLOUD_TOPOLOGY`. |
+| `instancetype_unknown_flavor_lookups_total` | counter | An instance-type lookup referenced a flavor absent from the served catalogue. | A running NodeGroup uses a flavor the catalogue lost (upstream change, topology misconfig, removed override). GC and termination keep working on a synthesized type, and the affected nodes are **rolled by drift under disruption budgets** (see [Flavor removal semantics](#flavor-removal-semantics)); restore the flavor via `settings.flavors` or fix `CLEVER_CLOUD_TOPOLOGY` to stop the roll. |
 
 Suggested alert expressions:
 
@@ -42,6 +42,30 @@ increase(karpenter_clevercloud_instancetype_unknown_flavor_lookups_total[30m]) >
 All counters and the refused gauge are pre-seeded at startup so the series
 exist from the first scrape; only the pricing timestamp gauge is deliberately
 absent until its first success.
+
+## Flavor removal semantics
+
+When a flavor leaves the served catalogue (upstream removal, a topology
+change, a removed override) while nodes of that flavor still run, the
+degradation is deliberate and bounded:
+
+- `Get`/`List` keep describing the affected NodeGroups with a **synthesized
+  instance type** (seed sizing when the name is known, observed capacity when
+  a live node reported it) — garbage collection and node termination keep
+  working, and the claims never read as orphaned.
+- The flavor disappears from the provisioning catalog, so **nothing new is
+  created or priced with it**.
+- karpenter-core's drift controller marks the affected NodeClaims
+  `InstanceTypeNotFound` (for nodes older than 1 h, within ~35 min of the
+  catalogue change) and **replaces them under the NodePool's disruption
+  budgets** and PDBs — budgets are the pacing lever for the roll. Pods that
+  fit no remaining flavor leave the node parked with a `Blocked` disruption
+  event until capacity or budgets allow.
+- `instancetype_unknown_flavor_lookups_total` moves and a per-flavor log line
+  names it. Remediation: restore the flavor via `settings.flavors` (an
+  override resurrecting a flavor absent from the live catalogue is accepted
+  but logged loudly — the platform may reject new NodeGroups using it) or fix
+  `CLEVER_CLOUD_TOPOLOGY`.
 
 ## CloudProvider call metrics
 

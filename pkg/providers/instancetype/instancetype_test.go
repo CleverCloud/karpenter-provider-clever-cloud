@@ -501,3 +501,78 @@ func TestRecordObservedCapacityDeepCopies(t *testing.T) {
 		t.Errorf("caller mutation leaked into KubeReserved: got %s, want %s", gotReserved.String(), wantReserved.String())
 	}
 }
+
+func TestParseFlavorOverridesRequiresCompleteNewFlavor(t *testing.T) {
+	// A name outside the seed introduces a new flavor: without an explicit
+	// price it would enter the catalogue at 0 EUR/h and win every
+	// cheapest-first decision.
+	if _, err := instancetype.ParseFlavorOverrides([]byte("- name: CUSTOM\n  cpu: 2\n  memoryKi: 2097152\n")); err == nil {
+		t.Fatal("expected an error for a new flavor without priceHourly")
+	}
+	if _, err := instancetype.ParseFlavorOverrides([]byte("- name: CUSTOM\n  cpu: 2\n  memoryKi: 2097152\n  priceHourly: 0.01\n")); err != nil {
+		t.Fatalf("complete new flavor must parse: %v", err)
+	}
+}
+
+func TestApplyOverridesSkipsUnpricedNewFlavor(t *testing.T) {
+	// Defense in depth below the parse-time gate: a from-scratch flavor whose
+	// price was never set must not enter the catalogue free of charge.
+	base := []instancetype.Flavor{{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.1167}}
+	got, skipped := instancetype.ApplyOverrides(base, []instancetype.FlavorOverride{
+		{Name: "CUSTOM", CPU: ptr(int64(2)), MemoryKi: ptr(int64(2097152))},
+	})
+	if len(skipped) != 1 || skipped[0] != "CUSTOM" {
+		t.Fatalf("expected CUSTOM skipped, got %v", skipped)
+	}
+	for _, f := range got {
+		if f.Name == "CUSTOM" {
+			t.Error("unpriced new flavor must not appear in the result")
+		}
+	}
+}
+
+func TestSynthesizeServesDegradedTypesWithoutTouchingTheCatalog(t *testing.T) {
+	p := instancetype.NewProvider("par", nil, nil)
+
+	t.Run("seed-known flavor keeps seed sizing", func(t *testing.T) {
+		it := p.Synthesize("2XS")
+		if it.Name != "2XS" {
+			t.Fatalf("name = %q", it.Name)
+		}
+		if cpu := it.Capacity[corev1.ResourceCPU]; cpu.Value() != 4 {
+			t.Errorf("cpu = %v, want the 2XS seed value 4", cpu.Value())
+		}
+	})
+
+	t.Run("unknown flavor gets a name-only floor", func(t *testing.T) {
+		it := p.Synthesize("CUSTOM")
+		if it.Name != "CUSTOM" {
+			t.Fatalf("name = %q", it.Name)
+		}
+		if cpu := it.Capacity[corev1.ResourceCPU]; !cpu.IsZero() {
+			t.Errorf("expected zero cpu, got %v", cpu.Value())
+		}
+	})
+
+	t.Run("observed capacity enriches the synthesis", func(t *testing.T) {
+		p.RecordObservedCapacity("CUSTOM",
+			corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6"), corev1.ResourceMemory: resource.MustParse("8Gi")},
+			corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6"), corev1.ResourceMemory: resource.MustParse("7Gi")},
+		)
+		it := p.Synthesize("CUSTOM")
+		if cpu := it.Capacity[corev1.ResourceCPU]; cpu.Value() != 6 {
+			t.Errorf("cpu = %v, want observed 6", cpu.Value())
+		}
+	})
+
+	t.Run("the served catalogue is untouched", func(t *testing.T) {
+		if _, err := p.Get("CUSTOM"); err == nil {
+			t.Error("Get must stay strict for unknown flavors")
+		}
+		for _, it := range p.List() {
+			if it.Name == "CUSTOM" {
+				t.Error("Synthesize must not add the flavor to List()")
+			}
+		}
+	})
+}
