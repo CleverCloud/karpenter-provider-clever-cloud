@@ -46,6 +46,7 @@ import (
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
 
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis"
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics"
@@ -88,6 +89,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	claimNames := map[string]struct{}{}
 	for i := range nodeClaims.Items {
 		claimNames[nodeClaims.Items[i].Name] = struct{}{}
+	}
+	if err := c.reapVanishedNodeClaims(ctx, nodeClaims); err != nil {
+		return reconciler.Result{}, err
 	}
 	// Set through a defer so the gauge reflects this sweep's (possibly
 	// partial) count even when a Delete below errors out mid-loop; a stale
@@ -139,6 +143,66 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		log.FromContext(ctx).WithValues("NodeGroup", ng.Name).Info("garbage collected orphaned nodegroup")
 	}
 	return reconciler.Result{RequeueAfter: pollPeriod}, nil
+}
+
+// reapVanishedNodeClaims fast-fails NodeClaims whose NodeGroup disappeared
+// after launch while the claim never registered — the quota engine reclaiming
+// an accepted group is the documented cause (docs/E2E-RESULTS.md). Without
+// this, each such claim burns karpenter's 15-minute registration TTL on a
+// group that no longer exists: karpenter-core's own GC deliberately skips
+// unregistered claims, so this window is the provider's to cover. Claims
+// younger than minAge are skipped (informer lag), and existence is checked
+// against ALL NodeGroups — a label-stripped group must never read as
+// vanished. Deletion routes through karpenter's termination flow, which
+// resolves to NodeClaimNotFound once it sees the group is gone.
+func (c *Controller) reapVanishedNodeClaims(ctx context.Context, nodeClaims *karpv1.NodeClaimList) error {
+	allGroups := &ngv1.NodeGroupList{}
+	if err := c.kubeClient.List(ctx, allGroups); err != nil {
+		return err
+	}
+	groupNames := map[string]struct{}{}
+	for i := range allGroups.Items {
+		groupNames[allGroups.Items[i].Name] = struct{}{}
+	}
+	for i := range nodeClaims.Items {
+		claim := &nodeClaims.Items[i]
+		// Never touch claims that are not this provider's: a second karpenter
+		// provider's launched-but-unregistered claims would otherwise read as
+		// vanished (their provider IDs do not parse, their groups do not
+		// exist here) and get their machines destroyed mid-bootstrap.
+		if ref := claim.Spec.NodeClassRef; ref == nil || ref.Group != apis.Group || ref.Kind != "CleverNodeClass" {
+			continue
+		}
+		if !claim.DeletionTimestamp.IsZero() || time.Since(claim.CreationTimestamp.Time) < minAge {
+			continue
+		}
+		if !claim.StatusConditions().Get(karpv1.ConditionTypeLaunched).IsTrue() ||
+			claim.StatusConditions().Get(karpv1.ConditionTypeRegistered).IsTrue() {
+			continue
+		}
+		groupName, err := nodegroup.ParseProviderID(claim.Status.ProviderID)
+		if err != nil {
+			// No provider ID yet: the NodeGroup carries the NodeClaim's name.
+			groupName = claim.Name
+		}
+		if _, ok := groupNames[groupName]; ok {
+			continue
+		}
+		if err := c.kubeClient.Delete(ctx, claim); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+		metrics.NodeGroupVanished.Inc(nil)
+		c.recorder.Publish(events.Event{
+			InvolvedObject: claim,
+			Type:           corev1.EventTypeWarning,
+			Reason:         "NodeGroupVanished",
+			Message:        "NodeGroup disappeared after launch before the node registered (usually the quota engine reclaiming an accepted group); deleting the nodeclaim instead of waiting out the registration TTL",
+			DedupeValues:   []string{claim.Name},
+		})
+		log.FromContext(ctx).WithValues("NodeClaim", claim.Name, "NodeGroup", groupName).Info(
+			"deleted nodeclaim whose nodegroup vanished before registration")
+	}
+	return nil
 }
 
 // refuse surfaces a reap refusal: a gauge tick per sweep (done by the

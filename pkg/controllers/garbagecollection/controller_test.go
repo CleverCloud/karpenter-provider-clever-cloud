@@ -343,3 +343,83 @@ func TestReconcileSkipsAlreadyDeletingNodeGroup(t *testing.T) {
 		t.Error("expected already-deleting nodegroup to still be present")
 	}
 }
+
+// vanishedClaim builds a NodeClaim in the launched-but-never-registered
+// window, backdated by age, whose NodeGroup does not exist.
+func vanishedClaim(name string, age time.Duration) *karpv1.NodeClaim {
+	claim := &karpv1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-age)),
+		},
+		Spec: karpv1.NodeClaimSpec{
+			NodeClassRef: &karpv1.NodeClassReference{
+				Group: "karpenter.clever-cloud.com",
+				Kind:  "CleverNodeClass",
+				Name:  "default",
+			},
+		},
+		Status: karpv1.NodeClaimStatus{ProviderID: "clevercloud://" + name},
+	}
+	claim.StatusConditions().SetTrue(karpv1.ConditionTypeLaunched)
+	return claim
+}
+
+func nodeClaimExists(t *testing.T, kubeClient client.Client, name string) bool {
+	t.Helper()
+	err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, &karpv1.NodeClaim{})
+	if client.IgnoreNotFound(err) != nil {
+		t.Fatalf("getting nodeclaim %s: %v", name, err)
+	}
+	return err == nil
+}
+
+func TestReconcileFastFailsVanishedNodeClaims(t *testing.T) {
+	launchedGone := vanishedClaim("claim-vanished", 10*time.Minute)
+
+	young := vanishedClaim("claim-young", 0)
+	young.CreationTimestamp = metav1.NewTime(time.Now())
+
+	registered := vanishedClaim("claim-registered", 10*time.Minute)
+	registered.StatusConditions().SetTrue(karpv1.ConditionTypeRegistered)
+
+	neverLaunched := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:              "claim-unlaunched",
+		CreationTimestamp: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+	}}
+
+	// Another provider's claim: same vanished shape, foreign NodeClassRef —
+	// never ours to touch.
+	foreign := vanishedClaim("claim-foreign", 10*time.Minute)
+	foreign.Spec.NodeClassRef = &karpv1.NodeClassReference{Group: "karpenter.k8s.aws", Kind: "EC2NodeClass", Name: "default"}
+
+	// Launched, unregistered, old — but its NodeGroup exists (label-stripped
+	// by hand, so invisible to the managed List): must be kept.
+	groupAlive := vanishedClaim("claim-grouped", 10*time.Minute)
+	unmanagedGroup := &ngv1.NodeGroup{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim-grouped"},
+		Spec:       ngv1.NodeGroupSpec{Flavor: "2XS", NodeCount: 1},
+	}
+
+	ctrl, kubeClient, recorder := newTestControllerWithRecorder(t,
+		launchedGone, young, registered, neverLaunched, foreign, groupAlive, unmanagedGroup)
+	vanishedBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_vanished_total")
+
+	if _, err := ctrl.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if nodeClaimExists(t, kubeClient, "claim-vanished") {
+		t.Error("expected the launched-but-vanished nodeclaim to be deleted")
+	}
+	for _, kept := range []string{"claim-young", "claim-registered", "claim-unlaunched", "claim-foreign", "claim-grouped"} {
+		if !nodeClaimExists(t, kubeClient, kept) {
+			t.Errorf("expected nodeclaim %s to be retained", kept)
+		}
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_vanished_total") - vanishedBefore; delta != 1 {
+		t.Errorf("nodegroup_vanished_total delta = %v, want 1", delta)
+	}
+	if got := recorder.countReason("NodeGroupVanished"); got != 1 {
+		t.Errorf("NodeGroupVanished events = %d, want 1", got)
+	}
+}

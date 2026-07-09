@@ -88,10 +88,13 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	ng, err := c.nodeGroupProvider.Create(ctx, nodeClaim, nodeClass, instanceType.Name)
 	if err != nil {
 		quotaErr := &nodegroup.ErrQuotaExceeded{}
-		if errors.As(err, &quotaErr) {
+		if errors.As(err, &quotaErr) || errors.Is(err, nodegroup.ErrNodeGroupVanished) {
 			// Surfacing an InsufficientCapacityError lets the scheduler mark
 			// the offering unavailable and relax to other options instead of
-			// waiting out the 15min registration TTL.
+			// waiting out the 15min registration TTL. A vanish takes the same
+			// path: a plain error would make karpenter-core retry the SAME
+			// claim with the same flavor in a create→vanish loop that holds
+			// the creation mutex; ICE deletes the claim and re-plans.
 			return nil, cloudprovider.NewInsufficientCapacityError(err)
 		}
 		return nil, err

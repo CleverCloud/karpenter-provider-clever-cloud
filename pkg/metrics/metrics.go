@@ -60,6 +60,21 @@ var (
 		nil,
 	)
 
+	// NodeGroupVanished counts NodeGroups that disappeared after creation
+	// while their NodeClaim had not registered — the quota engine reclaiming
+	// an accepted group is the documented cause. Each tick is a fast-failed
+	// launch that would otherwise have burned the 15-minute registration TTL.
+	NodeGroupVanished = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "nodegroup",
+			Name:      "vanished_total",
+			Help:      "NodeGroups that disappeared after creation while their NodeClaim was still unregistered. Each tick is a fast-failed launch.",
+		},
+		nil,
+	)
+
 	// GCReapedNodeGroups counts orphaned NodeGroups deleted by the
 	// garbage-collection safety net (not deletions through the normal
 	// NodeClaim termination flow).
@@ -140,6 +155,7 @@ var (
 func init() {
 	NodeGroupAcceptanceTimeouts.Add(0, nil)
 	NodeGroupQuotaRejections.Add(0, nil)
+	NodeGroupVanished.Add(0, nil)
 	GCReapedNodeGroups.Add(0, nil)
 	GCRefusedNodeGroups.Set(0, nil)
 	PricingRefreshFailures.Add(0, nil)

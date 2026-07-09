@@ -529,3 +529,47 @@ func TestDeleteRemovesNodeGroup(t *testing.T) {
 		t.Errorf("expected NotFound on second delete, got %v", err)
 	}
 }
+
+func TestCreateFailsWhenNodeGroupVanishesDuringAcceptance(t *testing.T) {
+	prev := nodegroup.SetQuotaCheckTimeout(5 * time.Second)
+	t.Cleanup(func() { nodegroup.SetQuotaCheckTimeout(prev) })
+
+	provider, kubeClient, recorder := newTestProviderWithRecorder(t)
+	vanishedBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_vanished_total")
+
+	// Simulate the documented quota race: the group is created, observed by
+	// the poll, then reclaimed upstream before it ever syncs.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			ng := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: "default-vanish"}, ng); err != nil {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			// Give the poll a beat to observe the group before deleting it.
+			time.Sleep(1500 * time.Millisecond)
+			_ = kubeClient.Delete(context.Background(), ng)
+			return
+		}
+	}()
+	_, err := provider.Create(context.Background(), testNodeClaim("default-vanish"), testNodeClass("default"), "2XS")
+	<-done
+	if !errors.Is(err, nodegroup.ErrNodeGroupVanished) {
+		t.Fatalf("expected ErrNodeGroupVanished, got %v", err)
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_vanished_total") - vanishedBefore; delta != 1 {
+		t.Errorf("nodegroup_vanished_total delta = %v, want 1", delta)
+	}
+	if !slices.Contains(recorder.reasons(), "NodeGroupVanished") {
+		t.Errorf("expected a NodeGroupVanished event, got %v", recorder.reasons())
+	}
+
+	// A vanish arms the quota backoff (the documented cause is the quota
+	// engine reclaiming capacity): the next create fails fast.
+	var quotaErr *nodegroup.ErrQuotaExceeded
+	if _, err := provider.Create(context.Background(), testNodeClaim("default-after"), testNodeClass("default"), "2XS"); !errors.As(err, &quotaErr) {
+		t.Errorf("expected a fast quota-backoff failure after a vanish, got %v", err)
+	}
+}
