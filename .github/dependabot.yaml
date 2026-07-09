@@ -9,13 +9,19 @@ updates:
       # "chore(deps): ..." — keeps Dependabot PRs green on the conventional-commit CI check.
       prefix: "chore"
       include: "scope"
-    ignore:
-      # Bumping sigs.k8s.io/karpenter must be done manually: the karpenter.sh
-      # CRDs vendored in deploy/crds/ have to be refreshed from the matching
-      # karpenter-core release at the same time.
-      - dependency-name: sigs.k8s.io/karpenter
     groups:
       # Group updates together, so that they are all applied in a single PR.
+      # sigs.k8s.io/karpenter gets its own group: its bumps also move the
+      # vendored karpenter.sh CRDs (make generate syncs them from the module,
+      # and CI stays red until a maintainer pushes the fix-up), and its minor
+      # must match the published K8s compatibility matrix — see the upgrade
+      # playbook in CONTRIBUTING.md. operatorpkg rides along: it defines the
+      # status.Object contract karpenter's API types implement and must move
+      # in lockstep.
+      karpenter:
+        patterns:
+          - "sigs.k8s.io/karpenter"
+          - "github.com/awslabs/operatorpkg"
       k8s-go-deps:
         patterns:
           - "k8s.io/*"
@@ -28,6 +34,7 @@ updates:
         exclude-patterns:
           - "k8s.io/*"
           - "sigs.k8s.io/*"
+          - "github.com/awslabs/operatorpkg"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

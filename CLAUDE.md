@@ -23,7 +23,7 @@ make image       # docker build (IMAGE=, TAG= overridable)
 
 Run a single test: `go test ./pkg/cloudprovider/ -run TestName`
 
-Run `make generate` after any change to `pkg/apis/` (deepcopy) or `pkg/apis/v1alpha1/` (CRD schema). Only the CleverNodeClass CRD is generated; the `karpenter.sh_*.yaml` CRDs in `deploy/crds/` are vendored from the karpenter-core release, and the NodeGroup CRD is owned by Clever Cloud and not in this repo at all. Run `make raw-manifest` after any change to `charts/karpenter` templates, values, or `Chart.yaml` — `deploy/karpenter.yaml` is generated from the chart and CI fails on drift.
+Run `make generate` after any change to `pkg/apis/` (deepcopy), `pkg/apis/v1alpha1/` (CRD schema), or a `sigs.k8s.io/karpenter` bump. The CleverNodeClass CRD is generated; the `karpenter.sh_*.yaml` CRDs in `deploy/crds/` are synced from the pinned karpenter module (`sync-karpenter-crds` — upgrade playbook in CONTRIBUTING.md); the NodeGroup CRD is owned by Clever Cloud and not in this repo at all. Run `make raw-manifest` after any change to `charts/karpenter` templates, values, or `Chart.yaml` — `deploy/karpenter.yaml` is generated from the chart and CI fails on drift.
 
 The chart CRD copies are generated too: `make generate` copies `deploy/crds/` verbatim into `charts/karpenter/crds/` and awk-templates them into `charts/karpenter-crd/templates/` (`sync-chart-crds`). Never edit those files by hand — CI fails if `make generate` produces a diff.
 

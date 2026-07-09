@@ -33,8 +33,8 @@ type CleverNodeClassStatus struct {
 	Conditions []status.Condition `json:"conditions,omitempty"`
 }
 
-func (in *CleverNodeClass) StatusConditions() status.ConditionSet {
-	return status.NewReadyConditions(ConditionTypeValidationSucceeded).For(in)
+func (in *CleverNodeClass) StatusConditions(opts ...status.ForOption) status.ConditionSet {
+	return status.NewReadyConditions(ConditionTypeValidationSucceeded).For(in, opts...)
 }
 
 func (in *CleverNodeClass) GetConditions() []status.Condition {

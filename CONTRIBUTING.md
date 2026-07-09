@@ -54,13 +54,34 @@ validated against a live CKE cluster and recorded in
 
 ## Generated files
 
-Never hand-edit `zz_generated.deepcopy.go` files, the generated CleverNodeClass CRD in
-[deploy/crds/](deploy/crds/), or the chart CRD copies under
-[charts/karpenter/crds/](charts/karpenter/crds/) and
+Never hand-edit `zz_generated.deepcopy.go` files, the CRDs in [deploy/crds/](deploy/crds/), or the
+chart CRD copies under [charts/karpenter/crds/](charts/karpenter/crds/) and
 [charts/karpenter-crd/templates/](charts/karpenter-crd/templates/). Run `make generate` after any
 change to `pkg/apis/` and commit the result; CI rejects drift. The `karpenter.sh_*.yaml` CRDs are
-vendored from the matching karpenter-core release and only change when `sigs.k8s.io/karpenter` is
-bumped (a manual operation — Dependabot deliberately ignores it).
+synced by `make generate` from the pinned `sigs.k8s.io/karpenter` module, so they only change when
+the dependency is bumped.
+
+## Upgrading karpenter-core
+
+`sigs.k8s.io/karpenter` is deliberately in its own Dependabot group (together with
+`github.com/awslabs/operatorpkg`, which defines the `status.Object` contract karpenter's API types
+implement and must move in lockstep): these bumps carry more than Go code and follow this playbook
+(a Dependabot PR stays red on CI — compilation and/or the generated-files check — until step 2 is
+pushed to it):
+
+1. Check the [compatibility matrix](https://karpenter.sh/docs/upgrading/compatibility/): the
+   karpenter minor must support every Kubernetes version CKE offers (the public
+   `/v4/kubernetes-product` endpoint lists them). Never ship a karpenter minor whose matrix
+   excludes the CKE default version.
+2. Bump the module (`go get sigs.k8s.io/karpenter@vX.Y.Z && go mod tidy` — operatorpkg usually
+   moves with it), fix any API breakage, then run `make generate` — it refreshes the vendored
+   `karpenter.sh_*.yaml` CRDs from the module and syncs both chart copies. Review the CRD diff
+   for schema changes users would see.
+3. Build and fix API breakages, run the full validation chain including `go test -race ./pkg/...`.
+4. Skim the karpenter-core release notes for behavior changes in provisioning, disruption, or the
+   CloudProvider contract; call them out in the commit body.
+5. Remind users in the release notes that the `karpenter-crd` chart must be upgraded before the
+   controller chart (see [installation.md](docs/getting-started/installation.md)).
 
 ## Docs are code
 
