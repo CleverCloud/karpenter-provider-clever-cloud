@@ -24,6 +24,11 @@ const (
 	// ConditionTypeValidationSucceeded is true when the NodeClass spec passed
 	// provider-side validation.
 	ConditionTypeValidationSucceeded = "ValidationSucceeded"
+	// ConditionTypeNodeGroupAPIServed is true when the cluster actually
+	// serves the nodegroups.api.clever-cloud.com API this provider drives —
+	// on anything but a CKE cluster the NodeClass must not go Ready, so the
+	// failure surfaces here instead of at the first Create.
+	ConditionTypeNodeGroupAPIServed = "NodeGroupAPIServed"
 )
 
 // CleverNodeClassStatus contains the resolved state of the CleverNodeClass
@@ -34,7 +39,10 @@ type CleverNodeClassStatus struct {
 }
 
 func (in *CleverNodeClass) StatusConditions(opts ...status.ForOption) status.ConditionSet {
-	return status.NewReadyConditions(ConditionTypeValidationSucceeded).For(in, opts...)
+	return status.NewReadyConditions(
+		ConditionTypeValidationSucceeded,
+		ConditionTypeNodeGroupAPIServed,
+	).For(in, opts...)
 }
 
 func (in *CleverNodeClass) GetConditions() []status.Condition {

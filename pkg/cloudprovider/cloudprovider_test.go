@@ -77,6 +77,7 @@ func (noopRecorder) Publish(...events.Event) {
 func readyNodeClass(name string) *v1alpha1.CleverNodeClass {
 	nc := &v1alpha1.CleverNodeClass{ObjectMeta: metav1.ObjectMeta{Name: name}}
 	nc.StatusConditions().SetTrue(v1alpha1.ConditionTypeValidationSucceeded)
+	nc.StatusConditions().SetTrue(v1alpha1.ConditionTypeNodeGroupAPIServed)
 	return nc
 }
 
@@ -564,5 +565,21 @@ func TestCreateVanishedNodeGroupReturnsInsufficientCapacity(t *testing.T) {
 	<-done
 	if !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected InsufficientCapacityError on vanish, got %T: %v", err, err)
+	}
+}
+
+func TestCreateRefusesUnknownReadiness(t *testing.T) {
+	// A NodeClass whose readiness was never computed (no conditions) must not
+	// launch machines: Ready has to be affirmatively True, not merely
+	// not-False.
+	unknown := &v1alpha1.CleverNodeClass{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	cp, _ := newTestProvider(t, unknown)
+
+	_, err := cp.Create(context.Background(), testNodeClaim("default-unrdy"))
+	if err == nil {
+		t.Fatal("expected an error for a NodeClass with unknown readiness")
+	}
+	if !corecloudprovider.IsNodeClassNotReadyError(err) {
+		t.Fatalf("expected NodeClassNotReadyError, got %T: %v", err, err)
 	}
 }
