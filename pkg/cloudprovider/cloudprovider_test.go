@@ -19,6 +19,7 @@ package cloudprovider_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -536,5 +537,32 @@ func TestDeleteWorksWhenFlavorUnknown(t *testing.T) {
 	}
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: "default-cust3"}, &ngv1.NodeGroup{}); err == nil {
 		t.Error("expected the nodegroup to be deleted")
+	}
+}
+
+func TestCreateVanishedNodeGroupReturnsInsufficientCapacity(t *testing.T) {
+	// A vanish must reach karpenter-core as InsufficientCapacityError: a
+	// plain error would retry the SAME claim in a create→vanish loop holding
+	// the creation mutex; ICE deletes the claim and re-plans.
+	cp, kubeClient := newTestProvider(t, readyNodeClass("default"))
+	nodeClaim := testNodeClaim("default-vanish")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			ng := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: nodeClaim.Name}, ng); err == nil {
+				// Let the poll observe the group once, then reclaim it.
+				time.Sleep(1500 * time.Millisecond)
+				_ = kubeClient.Delete(context.Background(), ng)
+				return
+			}
+		}
+	}()
+	_, err := cp.Create(context.Background(), nodeClaim)
+	<-done
+	if !corecloudprovider.IsInsufficientCapacityError(err) {
+		t.Fatalf("expected InsufficientCapacityError on vanish, got %T: %v", err, err)
 	}
 }

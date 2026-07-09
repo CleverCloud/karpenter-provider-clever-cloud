@@ -221,6 +221,20 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 		if errors.As(err, &quotaErr) {
 			p.publishQuotaEvent(nodeClaim, err)
 		}
+		if errors.Is(err, ErrNodeGroupVanished) {
+			metrics.NodeGroupVanished.Inc(nil)
+			// The documented cause is the quota engine reclaiming an accepted
+			// group: arm the backoff so retries fail fast instead of looping
+			// create→vanish against the API. Any deletion clears it.
+			p.recordQuotaRejection("an accepted nodegroup was reclaimed upstream (vanish); capacity is likely exhausted")
+			p.recorder.Publish(events.Event{
+				InvolvedObject: nodeClaim,
+				Type:           corev1.EventTypeWarning,
+				Reason:         "NodeGroupVanished",
+				Message:        fmt.Sprintf("NodeGroup %s disappeared during the acceptance poll (usually the quota engine reclaiming an accepted group); failing the launch instead of waiting out the registration TTL", ng.Name),
+				DedupeValues:   []string{nodeClaim.Name},
+			})
+		}
 		return nil, err
 	}
 	if !synced {
@@ -252,6 +266,13 @@ func (p *Provider) publishQuotaEvent(nodeClaim *karpv1.NodeClaim, err error) {
 	})
 }
 
+// ErrNodeGroupVanished is returned by Create when the NodeGroup disappeared
+// during the acceptance poll after having been observed once — the quota
+// engine reclaiming an accepted group is the documented cause. Failing the
+// launch immediately beats returning optimistic success and burning the
+// registration TTL on a group that no longer exists.
+var ErrNodeGroupVanished = errors.New("nodegroup vanished during the acceptance poll")
+
 // waitForAcceptance polls the NodeGroup until the Clever Cloud operator
 // reports it Synced, rejects it on quota, or the timeout elapses. A timeout
 // returns (false, nil): the caller treats it as optimistic success but must
@@ -261,11 +282,22 @@ func (p *Provider) publishQuotaEvent(nodeClaim *karpv1.NodeClaim, err error) {
 func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bool, error) {
 	ctx, cancel := context.WithTimeout(parentCtx, quotaCheckTimeout)
 	defer cancel()
+	seen := false
 	err := wait.PollUntilContextCancel(ctx, quotaCheckInterval, true, func(ctx context.Context) (bool, error) {
 		ng := &ngv1.NodeGroup{}
 		if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: name}, ng); err != nil {
-			return false, client.IgnoreNotFound(err)
+			if apierrors.IsNotFound(err) {
+				// Not-seen-yet is informer lag right after Create; seen-then
+				// -gone is a vanish and must fail the launch, not proceed
+				// optimistically on a group that no longer exists.
+				if seen {
+					return false, fmt.Errorf("%w: %q", ErrNodeGroupVanished, name)
+				}
+				return false, nil
+			}
+			return false, err
 		}
+		seen = true
 		if ng.IsQuotaExceeded() {
 			msg := ""
 			if cond := ng.GetCondition(ngv1.ConditionTypeReconcileFailed); cond != nil {
