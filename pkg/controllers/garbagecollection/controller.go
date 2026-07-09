@@ -103,6 +103,10 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	// value from a previous sweep must not keep an alert firing or silent.
 	refused := 0
 	defer func() { metrics.GCRefusedNodeGroups.Set(float64(refused), nil) }()
+	// resized counts managed groups whose nodeCount is not 1: the invariant
+	// this provider is built on. Set through the same defer discipline.
+	resized := 0
+	defer func() { metrics.NodeGroupExternalResizes.Set(float64(resized), nil) }()
 	// One stuck object must not shield the others until the next sweep, and
 	// the two phases must not shield each other: failures are collected and
 	// everything else keeps running.
@@ -112,7 +116,18 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	}
 	for i := range nodeGroups {
 		ng := &nodeGroups[i]
-		if !ng.DeletionTimestamp.IsZero() || time.Since(ng.CreationTimestamp.Time) < minAge {
+		if !ng.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if ng.Spec.NodeCount != 1 {
+			// Something outside karpenter resizes this group — the platform's
+			// alert-driven scaler (inherited autoscalingEnabled), a human, or
+			// anything with nodegroups/scale RBAC. Karpenter neither tracks
+			// nor prices the extra nodes; surface it, never fight it here.
+			resized++
+			c.warnResize(ctx, ng)
+		}
+		if time.Since(ng.CreationTimestamp.Time) < minAge {
 			continue
 		}
 		claimName := ng.Labels[v1alpha1.NodeClaimLabelKey]
@@ -262,6 +277,26 @@ func (c *Controller) reapVanishedNodeClaims(ctx context.Context, nodeClaims *kar
 			"deleted nodeclaim whose nodegroup vanished before registration")
 	}
 	return errors.Join(errs...)
+}
+
+// warnResize surfaces an external resize with the same discipline as refuse:
+// the gauge is the persistent signal, the log fires once per NodeGroup per
+// process lifetime, the Event republishes hourly so it survives etcd's TTL.
+func (c *Controller) warnResize(ctx context.Context, ng *ngv1.NodeGroup) {
+	msg := fmt.Sprintf("managed nodegroup has nodeCount %d, expected 1: something outside karpenter resizes it "+
+		"(check the cluster's autoscalingEnabled feature and nodegroups/scale RBAC); the extra nodes are neither tracked nor priced by karpenter", ng.Spec.NodeCount)
+	if _, ok := c.warned["resized/"+ng.Name]; !ok {
+		c.warned["resized/"+ng.Name] = struct{}{}
+		log.FromContext(ctx).WithValues("NodeGroup", ng.Name, "nodeCount", ng.Spec.NodeCount).Info(msg)
+	}
+	c.recorder.Publish(events.Event{
+		InvolvedObject: ng,
+		Type:           corev1.EventTypeWarning,
+		Reason:         "NodeGroupExternallyResized",
+		Message:        msg,
+		DedupeValues:   []string{ng.Name},
+		DedupeTimeout:  time.Hour,
+	})
 }
 
 // refuse surfaces a reap refusal: a gauge tick per sweep (done by the

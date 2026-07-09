@@ -75,6 +75,23 @@ var (
 		nil,
 	)
 
+	// NodeGroupExternalResizes is the number of managed NodeGroups whose
+	// nodeCount is not 1 — something outside this provider resized them (the
+	// platform's alert-driven scaler through the inherited autoscalingEnabled
+	// flag, a human, or anything holding nodegroups/scale RBAC). The
+	// 1 NodeClaim = 1 NodeGroup invariant is broken while this is non-zero:
+	// karpenter neither tracks nor bills the extra nodes.
+	NodeGroupExternalResizes = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: "nodegroup",
+			Name:      "external_resizes",
+			Help:      "Managed NodeGroups whose nodeCount is not 1. Non-zero means something outside karpenter resizes its groups.",
+		},
+		nil,
+	)
+
 	// GCReapedNodeGroups counts orphaned NodeGroups deleted by the
 	// garbage-collection safety net (not deletions through the normal
 	// NodeClaim termination flow).
@@ -156,6 +173,7 @@ func init() {
 	NodeGroupAcceptanceTimeouts.Add(0, nil)
 	NodeGroupQuotaRejections.Add(0, nil)
 	NodeGroupVanished.Add(0, nil)
+	NodeGroupExternalResizes.Set(0, nil)
 	GCReapedNodeGroups.Add(0, nil)
 	GCRefusedNodeGroups.Set(0, nil)
 	PricingRefreshFailures.Add(0, nil)

@@ -505,3 +505,44 @@ func TestReconcileContinuesPastDeleteFailures(t *testing.T) {
 		t.Error("expected the stuck nodegroup to still exist")
 	}
 }
+
+func TestReconcileFlagsExternallyResizedNodeGroups(t *testing.T) {
+	resizedNG := managedNodeGroup("ng-resized", "claim-resized", 10*time.Minute, false)
+	resizedNG.Spec.NodeCount = 3
+	ctrl, kubeClient, recorder := newTestControllerWithRecorder(t,
+		resizedNG,
+		testNodeClaim("claim-resized"),
+		managedNodeGroup("ng-normal", "claim-normal", 10*time.Minute, false),
+		testNodeClaim("claim-normal"),
+	)
+
+	if _, err := ctrl.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// Surfaced, never fought: the group must not be deleted or mutated.
+	if !nodeGroupExists(t, kubeClient, "ng-resized") {
+		t.Error("expected the resized nodegroup to be retained")
+	}
+	if got := metricstest.Value(t, "karpenter_clevercloud_nodegroup_external_resizes"); got != 1 {
+		t.Errorf("nodegroup_external_resizes gauge = %v, want 1", got)
+	}
+	if got := recorder.countReason("NodeGroupExternallyResized"); got != 1 {
+		t.Errorf("NodeGroupExternallyResized events = %d, want 1", got)
+	}
+
+	// The operator fixes it back to 1: the gauge clears on the next sweep.
+	ng := &ngv1.NodeGroup{}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: "ng-resized"}, ng); err != nil {
+		t.Fatal(err)
+	}
+	ng.Spec.NodeCount = 1
+	if err := kubeClient.Update(context.Background(), ng); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ctrl.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	if got := metricstest.Value(t, "karpenter_clevercloud_nodegroup_external_resizes"); got != 0 {
+		t.Errorf("nodegroup_external_resizes gauge after fix = %v, want 0", got)
+	}
+}
