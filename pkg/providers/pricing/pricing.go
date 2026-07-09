@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -53,6 +54,20 @@ const (
 	serviceRAM  = "kubernetes.node.ram"
 
 	httpTimeout = 15 * time.Second
+
+	// maxResponseBytes caps how much of a response body the decoder reads.
+	// Live bodies are a few hundred bytes to ~100 KiB; 1 MiB leaves an order
+	// of magnitude of headroom while bounding a misbehaving endpoint.
+	maxResponseBytes = 1 << 20
+
+	// rateBoundFactor bounds how far a live rate may drift from the compiled
+	// default before the refresh is rejected: an order of magnitude either
+	// way accommodates any plausible repricing while catching unit changes
+	// and tiered-plan misreads. Deliberately NOT a delta against the
+	// last-known-good rate — that state resets on every pod restart, and a
+	// delta rule would permanently reject a legitimate larger change with no
+	// recovery short of a new release.
+	rateBoundFactor = 10
 )
 
 // kubernetesProduct mirrors the fields we consume from GET /v4/kubernetes-product.
@@ -74,8 +89,14 @@ type priceSystem struct {
 }
 
 type countableItem struct {
-	Service    string      `json:"service"`
-	PricePlans []pricePlan `json:"price_plans"`
+	Service      string       `json:"service"`
+	DataUnit     string       `json:"data_unit"`
+	DataQuantity dataQuantity `json:"data_quantity_for_price"`
+	PricePlans   []pricePlan  `json:"price_plans"`
+}
+
+type dataQuantity struct {
+	Quantity int64 `json:"quantity"`
 }
 
 type pricePlan struct {
@@ -209,7 +230,8 @@ func (p *Provider) getJSON(ctx context.Context, rawURL string, query url.Values,
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("GET %s: unexpected status %d", rawURL, resp.StatusCode)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	// A truncated read fails the decode, which routes to last-known-good.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(out); err != nil {
 		return fmt.Errorf("decoding %s: %w", rawURL, err)
 	}
 	return nil
@@ -224,22 +246,65 @@ func flavorsForTopology(product *kubernetesProduct, topology string) ([]string, 
 	return nil, fmt.Errorf("topology %q not found in kubernetes-product", topology)
 }
 
+// extractRates pulls and validates the two node rates. Every check that
+// fails returns an error so the caller keeps its last-known-good catalogue:
+// this data feeds consolidation and provisioning decisions, and a
+// wrong-but-parseable payload is worse than a stale one.
 func extractRates(ps *priceSystem) (rates, error) {
+	if ps.Currency != "EUR" {
+		return rates{}, fmt.Errorf("price-system currency %q, expected EUR: prices would be mislabeled", ps.Currency)
+	}
 	var r rates
 	var haveVCPU, haveRAM bool
 	for _, c := range ps.Countable {
-		if len(c.PricePlans) == 0 {
-			continue
-		}
 		switch c.Service {
 		case serviceVCPU:
+			if err := validateCountable(c, "vcpu", 1); err != nil {
+				return rates{}, err
+			}
 			r.vcpu, haveVCPU = c.PricePlans[0].Price, true
 		case serviceRAM:
+			// The pricing formula multiplies this rate by nominal GB, which
+			// only holds while the countable is priced per 1e9 bytes.
+			if err := validateCountable(c, "B", 1_000_000_000); err != nil {
+				return rates{}, err
+			}
 			r.ram, haveRAM = c.PricePlans[0].Price, true
 		}
 	}
 	if !haveVCPU || !haveRAM {
 		return r, fmt.Errorf("price-system missing rate (vcpu=%t, ram=%t)", haveVCPU, haveRAM)
 	}
+	if err := checkRateBound("vcpu", r.vcpu, instancetype.DefaultVCPURate); err != nil {
+		return rates{}, err
+	}
+	if err := checkRateBound("ram", r.ram, instancetype.DefaultRAMRate); err != nil {
+		return rates{}, err
+	}
 	return r, nil
+}
+
+func validateCountable(c countableItem, wantUnit string, wantQuantity int64) error {
+	if len(c.PricePlans) != 1 {
+		// Tiered plans whose FIRST tier is free are the platform norm on
+		// other services; blindly reading PricePlans[0] would price nodes at
+		// zero the day the node services converge on that style.
+		return fmt.Errorf("service %s has %d price plans, expected exactly 1: tiered pricing is not understood", c.Service, len(c.PricePlans))
+	}
+	if c.DataUnit != wantUnit || c.DataQuantity.Quantity != wantQuantity {
+		return fmt.Errorf("service %s is priced per %d %q, expected per %d %q: the price formula would be wrong",
+			c.Service, c.DataQuantity.Quantity, c.DataUnit, wantQuantity, wantUnit)
+	}
+	if price := c.PricePlans[0].Price; price <= 0 {
+		return fmt.Errorf("service %s has non-positive rate %v", c.Service, price)
+	}
+	return nil
+}
+
+func checkRateBound(name string, rate, defaultRate float64) error {
+	if rate < defaultRate/rateBoundFactor || rate > defaultRate*rateBoundFactor {
+		return fmt.Errorf("%s rate %v is outside the plausibility band [%v, %v]",
+			name, rate, defaultRate/rateBoundFactor, defaultRate*rateBoundFactor)
+	}
+	return nil
 }
