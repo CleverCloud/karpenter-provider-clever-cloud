@@ -31,6 +31,8 @@ package garbagecollection
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/awslabs/operatorpkg/reconciler"
@@ -42,6 +44,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -61,7 +64,12 @@ const (
 )
 
 type Controller struct {
-	kubeClient        client.Client
+	kubeClient client.Client
+	// uncached reads straight from the API server. Every destructive decision
+	// here is based on the ABSENCE of an object from the informer cache — the
+	// one signal a stale cache fakes — so it is confirmed uncached before a
+	// VM is destroyed or a launch written off.
+	uncached          client.Reader
 	nodeGroupProvider *nodegroup.Provider
 	recorder          events.Recorder
 	// warned dedups the refusal log/event per NodeGroup for this process
@@ -69,8 +77,8 @@ type Controller struct {
 	warned map[string]struct{}
 }
 
-func NewController(kubeClient client.Client, nodeGroupProvider *nodegroup.Provider, recorder events.Recorder) *Controller {
-	return &Controller{kubeClient: kubeClient, nodeGroupProvider: nodeGroupProvider, recorder: recorder, warned: map[string]struct{}{}}
+func NewController(kubeClient client.Client, uncached client.Reader, nodeGroupProvider *nodegroup.Provider, recorder events.Recorder) *Controller {
+	return &Controller{kubeClient: kubeClient, uncached: uncached, nodeGroupProvider: nodeGroupProvider, recorder: recorder, warned: map[string]struct{}{}}
 }
 
 func (c *Controller) Name() string {
@@ -90,14 +98,18 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	for i := range nodeClaims.Items {
 		claimNames[nodeClaims.Items[i].Name] = struct{}{}
 	}
-	if err := c.reapVanishedNodeClaims(ctx, nodeClaims); err != nil {
-		return reconciler.Result{}, err
-	}
 	// Set through a defer so the gauge reflects this sweep's (possibly
 	// partial) count even when a Delete below errors out mid-loop; a stale
 	// value from a previous sweep must not keep an alert firing or silent.
 	refused := 0
 	defer func() { metrics.GCRefusedNodeGroups.Set(float64(refused), nil) }()
+	// One stuck object must not shield the others until the next sweep, and
+	// the two phases must not shield each other: failures are collected and
+	// everything else keeps running.
+	var errs []error
+	if err := c.reapVanishedNodeClaims(ctx, nodeClaims); err != nil {
+		errs = append(errs, err)
+	}
 	for i := range nodeGroups {
 		ng := &nodeGroups[i]
 		if !ng.DeletionTimestamp.IsZero() || time.Since(ng.CreationTimestamp.Time) < minAge {
@@ -124,13 +136,26 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 			c.refuse(ctx, ng, "refusing to garbage collect nodegroup whose NodeClaim owner is alive but whose nodeclaim label matches nothing; fix the label")
 			continue
 		}
+		// Deleting the group destroys a VM: confirm every identity that could
+		// prove a live claim — the label-derived name AND the owner-reference
+		// names — is really gone with uncached reads, not just absent from a
+		// possibly-stale cache.
+		alive, err := c.anyClaimAliveUncached(ctx, append([]string{claimName}, owners...))
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if alive {
+			continue
+		}
 		if err := c.nodeGroupProvider.Delete(ctx, ng.Name); err != nil {
 			if apierrors.IsNotFound(err) {
 				// Someone else (owner-reference cascade, operator) deleted it
 				// between List and Delete — not this safety net's work.
 				continue
 			}
-			return reconciler.Result{}, err
+			errs = append(errs, fmt.Errorf("deleting nodegroup %q, %w", ng.Name, err))
+			continue
 		}
 		metrics.GCReapedNodeGroups.Inc(nil)
 		c.recorder.Publish(events.Event{
@@ -142,7 +167,31 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		})
 		log.FromContext(ctx).WithValues("NodeGroup", ng.Name).Info("garbage collected orphaned nodegroup")
 	}
+	if len(errs) > 0 {
+		return reconciler.Result{}, errors.Join(errs...)
+	}
 	return reconciler.Result{RequeueAfter: pollPeriod}, nil
+}
+
+// anyClaimAliveUncached reports whether any of the named NodeClaims exists on
+// the API server (not merely in the cache). Names may repeat; duplicates are
+// checked once.
+func (c *Controller) anyClaimAliveUncached(ctx context.Context, names []string) (bool, error) {
+	checked := map[string]struct{}{}
+	for _, name := range names {
+		if _, dup := checked[name]; dup {
+			continue
+		}
+		checked[name] = struct{}{}
+		err := c.uncached.Get(ctx, types.NamespacedName{Name: name}, &karpv1.NodeClaim{})
+		if err == nil {
+			return true, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("confirming nodeclaim %q absence, %w", name, err)
+		}
+	}
+	return false, nil
 }
 
 // reapVanishedNodeClaims fast-fails NodeClaims whose NodeGroup disappeared
@@ -164,6 +213,7 @@ func (c *Controller) reapVanishedNodeClaims(ctx context.Context, nodeClaims *kar
 	for i := range allGroups.Items {
 		groupNames[allGroups.Items[i].Name] = struct{}{}
 	}
+	var errs []error
 	for i := range nodeClaims.Items {
 		claim := &nodeClaims.Items[i]
 		// Never touch claims that are not this provider's: a second karpenter
@@ -188,8 +238,17 @@ func (c *Controller) reapVanishedNodeClaims(ctx context.Context, nodeClaims *kar
 		if _, ok := groupNames[groupName]; ok {
 			continue
 		}
+		// Writing off a launch is destructive too: confirm the group is
+		// really gone with an uncached read, not just absent from the cache.
+		if err := c.uncached.Get(ctx, types.NamespacedName{Name: groupName}, &ngv1.NodeGroup{}); err == nil {
+			continue
+		} else if !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("confirming nodegroup %q absence, %w", groupName, err))
+			continue
+		}
 		if err := c.kubeClient.Delete(ctx, claim); client.IgnoreNotFound(err) != nil {
-			return err
+			errs = append(errs, fmt.Errorf("deleting vanished nodeclaim %q, %w", claim.Name, err))
+			continue
 		}
 		metrics.NodeGroupVanished.Inc(nil)
 		c.recorder.Publish(events.Event{
@@ -202,7 +261,7 @@ func (c *Controller) reapVanishedNodeClaims(ctx context.Context, nodeClaims *kar
 		log.FromContext(ctx).WithValues("NodeClaim", claim.Name, "NodeGroup", groupName).Info(
 			"deleted nodeclaim whose nodegroup vanished before registration")
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // refuse surfaces a reap refusal: a gauge tick per sweep (done by the
