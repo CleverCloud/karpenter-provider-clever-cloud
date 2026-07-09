@@ -95,6 +95,7 @@ func main() {
 		)...).
 		WithControllers(ctx, controllers.NewControllers(
 			op.GetClient(),
+			op.Manager.GetAPIReader(),
 			op.EventRecorder,
 			nodeGroupProvider,
 			instanceTypeProvider,
