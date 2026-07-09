@@ -17,9 +17,6 @@ limitations under the License.
 package main
 
 import (
-	"os"
-
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/karpenter/pkg/utils/env"
 
 	coremetrics "sigs.k8s.io/karpenter/pkg/cloudprovider/metrics"
@@ -43,15 +40,10 @@ func main() {
 
 	// FLAVORS_CONFIG_PATH points at a YAML list of per-flavor overrides (mounted
 	// from the chart's ConfigMap). They overlay the base catalog — the dynamic
-	// refresher's result, or the built-in DefaultFlavors — and always win.
-	var overrides []instancetype.FlavorOverride
-	if flavorsPath := env.WithDefaultString("FLAVORS_CONFIG_PATH", ""); flavorsPath != "" {
-		var err error
-		if overrides, err = instancetype.LoadFlavorsFromFile(flavorsPath); err != nil {
-			log.FromContext(ctx).Error(err, "loading flavor overrides")
-			os.Exit(1)
-		}
-	}
+	// refresher's result, or the built-in DefaultFlavors — and always win. An
+	// invalid file degrades to the base catalogue instead of crashlooping the
+	// controller (surfaced via the flavors_config_invalid gauge).
+	overrides := instancetype.LoadFlavorsOrDegrade(env.WithDefaultString("FLAVORS_CONFIG_PATH", ""))
 
 	instanceTypeProvider := instancetype.NewProvider(region, nil, overrides)
 

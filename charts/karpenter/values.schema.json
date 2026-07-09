@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "karpenter chart values (partial schema)",
+  "description": "Validates the settings.flavors overrides at helm install/upgrade time, before a typo reaches the controller. Everything else is intentionally unconstrained.",
+  "type": "object",
+  "properties": {
+    "settings": {
+      "type": "object",
+      "properties": {
+        "flavors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Flavor name (e.g. 2XS..XL). A name outside the built-in catalogue introduces a new flavor and must also set cpu, memoryKi and priceHourly."
+              },
+              "cpu": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "vCPU count."
+              },
+              "memoryKi": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Kernel-visible memory in KiB."
+              },
+              "priceHourly": {
+                "type": "number",
+                "minimum": 0,
+                "description": "EUR per hour."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
