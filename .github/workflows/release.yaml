@@ -12,6 +12,23 @@ jobs:
       packages: write # push the image and Helm charts to ghcr.io
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # The in-tree Chart.yaml values are placeholders (overridden at package time), but a
+      # bare git-tree `helm install` and the generated deploy/karpenter.yaml resolve the
+      # image tag from appVersion — fail the release early if they lag the tag.
+      - name: Verify chart placeholders match the release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          rc=0
+          for f in charts/karpenter/Chart.yaml charts/karpenter-crd/Chart.yaml; do
+            version=$(sed -n 's/^version: //p' "$f")
+            appVersion=$(sed -n 's/^appVersion: //p' "$f")
+            if [ "$appVersion" != "$TAG" ] || [ "v$version" != "$TAG" ]; then
+              echo "::error file=$f::version=$version appVersion=$appVersion do not match tag $TAG — bump the placeholders (and run 'make raw-manifest') in the release commit."
+              rc=1
+            fi
+          done
+          exit $rc
       - name: Log in to GitHub Container Registry
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

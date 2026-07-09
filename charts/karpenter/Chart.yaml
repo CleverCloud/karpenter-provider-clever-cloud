@@ -2,9 +2,10 @@ apiVersion: v2
 name: karpenter
 description: Karpenter node autoscaling for Clever Kubernetes Engine (CKE)
 type: application
-# Placeholder — the release workflow overrides version/appVersion at package time from the git tag.
-version: 0.9.2
-appVersion: v0.9.2
+# Placeholder — the release workflow overrides version/appVersion at package time from the
+# git tag, and fails the release if these values lag the tag. Bump both in the release commit.
+version: 0.10.0
+appVersion: v0.10.0
 keywords:
   - karpenter
   - autoscaling
