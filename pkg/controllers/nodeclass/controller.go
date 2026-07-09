@@ -35,6 +35,7 @@ import (
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
+	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 )
 
@@ -71,6 +72,17 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	} else {
 		nodeClass.StatusConditions().SetTrue(v1alpha1.ConditionTypeValidationSucceeded)
 	}
+	// Probe that the cluster actually serves the NodeGroup API: on a non-CKE
+	// cluster the NodeClass must not go Ready, so provisioning fails here with
+	// a readable condition instead of at the first Create.
+	apiServed := true
+	if err := c.kubeClient.List(ctx, &ngv1.NodeGroupList{}, client.Limit(1)); err != nil {
+		apiServed = false
+		nodeClass.StatusConditions().SetFalse(v1alpha1.ConditionTypeNodeGroupAPIServed, "NodeGroupAPIUnavailable",
+			fmt.Sprintf("listing nodegroups.api.clever-cloud.com: %s (is this a Clever Kubernetes Engine cluster?)", err))
+	} else {
+		nodeClass.StatusConditions().SetTrue(v1alpha1.ConditionTypeNodeGroupAPIServed)
+	}
 	if !equality.Semantic.DeepEqual(stored, nodeClass) {
 		if err := c.kubeClient.Status().Patch(ctx, nodeClass, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 			if errors.IsConflict(err) {
@@ -78,6 +90,13 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			}
 			return reconcile.Result{}, client.IgnoreNotFound(err)
 		}
+	}
+	if !apiServed {
+		// Re-probe on a short cadence: without it, a transient discovery
+		// failure (apiserver blip at startup, CRD applied moments later)
+		// would park the NodeClass NotReady — and provisioning with it —
+		// until the next informer resync, which defaults to 10 hours.
+		return reconcile.Result{RequeueAfter: time.Minute}, nil
 	}
 	return reconcile.Result{}, nil
 }

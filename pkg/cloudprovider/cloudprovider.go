@@ -78,7 +78,9 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		}
 		return nil, fmt.Errorf("resolving node class from nodeclaim, %w", err)
 	}
-	if readiness := nodeClass.StatusConditions().Get(status.ConditionReady); readiness.IsFalse() {
+	// Ready must be affirmatively True: an Unknown readiness (controller not
+	// yet reconciled, stale status) must not launch machines either.
+	if readiness := nodeClass.StatusConditions().Get(status.ConditionReady); !readiness.IsTrue() {
 		return nil, cloudprovider.NewNodeClassNotReadyError(errors.New(readiness.Message))
 	}
 	instanceType, err := c.resolveInstanceType(nodeClaim)

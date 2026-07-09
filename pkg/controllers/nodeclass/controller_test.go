@@ -18,21 +18,26 @@ package nodeclass_test
 
 import (
 	"context"
+	"github.com/awslabs/operatorpkg/status"
 	"strings"
 	"testing"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
+	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodeclass"
 )
@@ -203,5 +208,45 @@ func TestReconcileMissingNodeClassNoError(t *testing.T) {
 
 	if result := reconcileNodeClass(t, c, "absent"); result != (reconcile.Result{}) {
 		t.Errorf("unexpected result %+v", result)
+	}
+}
+
+func TestReconcileNotReadyWhenNodeGroupAPIUnserved(t *testing.T) {
+	// Simulate a non-CKE cluster: listing nodegroups fails with a no-match
+	// discovery error. The NodeClass must not go Ready — provisioning has to
+	// fail here, with a readable condition, not at the first Create.
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(testNodeClass("default", nil)).
+		WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*ngv1.NodeGroupList); ok {
+					return &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "api.clever-cloud.com", Kind: "NodeGroup"}}
+				}
+				return cl.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+	ctrl := nodeclass.NewController(kubeClient)
+
+	result, err := ctrl.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "default"}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// A failed probe must re-check on a short cadence: the informer resync
+	// (10h by default) must never be what unparks provisioning.
+	if result.RequeueAfter != time.Minute {
+		t.Errorf("RequeueAfter = %v, want 1m while the API is unserved", result.RequeueAfter)
+	}
+	nc := &v1alpha1.CleverNodeClass{}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: "default"}, nc); err != nil {
+		t.Fatal(err)
+	}
+	if nc.StatusConditions().Get(v1alpha1.ConditionTypeNodeGroupAPIServed).IsTrue() {
+		t.Error("expected NodeGroupAPIServed to be false when the API is not served")
+	}
+	if nc.StatusConditions().Get(status.ConditionReady).IsTrue() {
+		t.Error("expected the NodeClass not to be Ready when the NodeGroup API is not served")
 	}
 }
