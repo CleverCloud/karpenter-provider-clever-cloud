@@ -5,6 +5,7 @@ go 1.26.5
 require (
 	github.com/awslabs/operatorpkg v0.0.0-20251222193911-34e9a1898737
 	github.com/mitchellh/hashstructure/v2 v2.0.2
+	github.com/prometheus/client_golang v1.23.2
 	github.com/samber/lo v1.53.0
 	k8s.io/api v0.36.2
 	k8s.io/apimachinery v0.36.2
@@ -47,7 +48,6 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect

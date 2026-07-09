@@ -30,6 +30,7 @@ import (
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/events"
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
@@ -46,8 +47,14 @@ func newTestProvider(t *testing.T, objs ...client.Object) (*cloudprovider.CloudP
 		WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
 		Build()
 	itp := instancetype.NewProvider("par", nil, nil)
-	ngp := nodegroup.NewProvider(kubeClient)
+	ngp := nodegroup.NewProvider(kubeClient, noopRecorder{})
 	return cloudprovider.New(kubeClient, itp, ngp), kubeClient
+}
+
+// noopRecorder discards events; these tests assert on errors, not events.
+type noopRecorder struct{}
+
+func (noopRecorder) Publish(...events.Event) {
 }
 
 func readyNodeClass(name string) *v1alpha1.CleverNodeClass {

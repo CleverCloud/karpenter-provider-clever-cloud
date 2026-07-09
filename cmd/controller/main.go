@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/karpenter/pkg/utils/env"
 
+	coremetrics "sigs.k8s.io/karpenter/pkg/cloudprovider/metrics"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/overlay"
 	corecontrollers "sigs.k8s.io/karpenter/pkg/controllers"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -72,9 +73,12 @@ func main() {
 		pricingCtrl = pricingcontroller.NewController(resolver, instanceTypeProvider, period)
 	}
 
-	nodeGroupProvider := nodegroup.NewProvider(op.GetClient())
+	nodeGroupProvider := nodegroup.NewProvider(op.GetClient(), op.EventRecorder)
 	cleverCloudProvider := cloudprovider.New(op.GetClient(), instanceTypeProvider, nodeGroupProvider)
-	decoratedCloudProvider := overlay.Decorate(cleverCloudProvider, op.GetClient(), op.InstanceTypeStore)
+	// Innermost decorator so durations/errors measure the actual provider
+	// calls (karpenter_cloudprovider_* series), then the NodeOverlay layer.
+	metricsCloudProvider := coremetrics.Decorate(cleverCloudProvider)
+	decoratedCloudProvider := overlay.Decorate(metricsCloudProvider, op.GetClient(), op.InstanceTypeStore)
 	clusterState := state.NewCluster(op.Clock, op.GetClient(), decoratedCloudProvider)
 
 	op.
@@ -85,12 +89,13 @@ func main() {
 			op.GetClient(),
 			op.EventRecorder,
 			decoratedCloudProvider,
-			cleverCloudProvider,
+			metricsCloudProvider,
 			clusterState,
 			op.InstanceTypeStore,
 		)...).
 		WithControllers(ctx, controllers.NewControllers(
 			op.GetClient(),
+			op.EventRecorder,
 			nodeGroupProvider,
 			instanceTypeProvider,
 			pricingCtrl,

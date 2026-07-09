@@ -44,6 +44,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics"
 )
 
 const (
@@ -366,6 +367,10 @@ func (p *Provider) Get(flavor string) (*cloudprovider.InstanceType, error) {
 			return p.newInstanceType(f), nil
 		}
 	}
+	// A running NodeGroup referencing a flavor the catalogue no longer
+	// carries degrades cluster-wide GC — count it so the condition is
+	// visible without diffing logs.
+	metrics.UnknownFlavorLookups.Inc(nil)
 	return nil, fmt.Errorf("unknown flavor %q", flavor)
 }
 

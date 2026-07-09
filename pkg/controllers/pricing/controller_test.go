@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/pricing"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 )
 
@@ -49,6 +50,9 @@ func TestReconcileUpdatesProvider(t *testing.T) {
 	if result.RequeueAfter != 12*time.Hour {
 		t.Errorf("expected RequeueAfter 12h, got %v", result.RequeueAfter)
 	}
+	if metricstest.Value(t, "karpenter_clevercloud_pricing_last_successful_refresh_timestamp_seconds") == 0 {
+		t.Error("expected the last-successful-refresh gauge to be set")
+	}
 	it, err := itp.Get("M")
 	if err != nil {
 		t.Fatalf("Get(M): %v", err)
@@ -65,6 +69,7 @@ func TestReconcileUpdatesProvider(t *testing.T) {
 func TestReconcileKeepsLastKnownGoodOnError(t *testing.T) {
 	itp := instancetype.NewProvider("par", nil, nil)
 	ctrl := pricing.NewController(stubResolver{err: errors.New("api down")}, itp, 12*time.Hour)
+	failuresBefore := metricstest.Value(t, "karpenter_clevercloud_pricing_refresh_failures_total")
 
 	result, err := ctrl.Reconcile(context.Background())
 	if err != nil {
@@ -72,6 +77,9 @@ func TestReconcileKeepsLastKnownGoodOnError(t *testing.T) {
 	}
 	if result.RequeueAfter != 30*time.Minute {
 		t.Errorf("expected failure RequeueAfter 30m, got %v", result.RequeueAfter)
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_pricing_refresh_failures_total") - failuresBefore; delta != 1 {
+		t.Errorf("pricing_refresh_failures_total delta = %v, want 1", delta)
 	}
 	// The default catalog must be intact.
 	if got := len(itp.List()); got != len(instancetype.DefaultFlavors) {

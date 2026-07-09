@@ -18,6 +18,7 @@ package garbagecollection_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,20 +29,56 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/garbagecollection"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
+// fakeRecorder captures published events for assertions.
+type fakeRecorder struct {
+	mu     sync.Mutex
+	events []events.Event
+}
+
+func (r *fakeRecorder) Publish(evts ...events.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, evts...)
+}
+
+func (r *fakeRecorder) countReason(reason string) int {
+	return len(r.eventsByReason(reason))
+}
+
+func (r *fakeRecorder) eventsByReason(reason string) []events.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var matched []events.Event
+	for _, e := range r.events {
+		if e.Reason == reason {
+			matched = append(matched, e)
+		}
+	}
+	return matched
+}
+
 func newTestController(t *testing.T, objs ...client.Object) (*garbagecollection.Controller, client.Client) {
+	ctrl, kubeClient, _ := newTestControllerWithRecorder(t, objs...)
+	return ctrl, kubeClient
+}
+
+func newTestControllerWithRecorder(t *testing.T, objs ...client.Object) (*garbagecollection.Controller, client.Client, *fakeRecorder) {
 	t.Helper()
 	kubeClient := fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(objs...).
 		Build()
-	return garbagecollection.NewController(kubeClient, nodegroup.NewProvider(kubeClient)), kubeClient
+	recorder := &fakeRecorder{}
+	return garbagecollection.NewController(kubeClient, nodegroup.NewProvider(kubeClient, recorder), recorder), kubeClient, recorder
 }
 
 // managedNodeGroup builds a karpenter-managed NodeGroup backdated by age,
@@ -246,6 +283,51 @@ func TestReconcileKeepsLabeledNodeGroupWithoutOwnerReference(t *testing.T) {
 	}
 	if !nodeGroupExists(t, kubeClient, "copied-pool") {
 		t.Error("expected labeled nodegroup without a NodeClaim owner reference to be retained")
+	}
+}
+
+func TestReconcileSurfacesReapsAndRefusals(t *testing.T) {
+	ctrl, kubeClient, recorder := newTestControllerWithRecorder(t,
+		managedNodeGroup("ng-orphan", "claim-gone", 10*time.Minute, false),
+		labeledNodeGroup("copied-pool", "", 10*time.Minute, false),
+	)
+	reapedBefore := metricstest.Value(t, "karpenter_clevercloud_gc_reaped_nodegroups_total")
+
+	if _, err := ctrl.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if nodeGroupExists(t, kubeClient, "ng-orphan") {
+		t.Error("expected orphaned nodegroup to be reaped")
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_gc_reaped_nodegroups_total") - reapedBefore; delta != 1 {
+		t.Errorf("gc_reaped_nodegroups_total delta = %v, want 1", delta)
+	}
+	if got := recorder.countReason("GarbageCollected"); got != 1 {
+		t.Errorf("GarbageCollected events = %d, want 1", got)
+	}
+	if got := metricstest.Value(t, "karpenter_clevercloud_gc_refused_nodegroups"); got != 1 {
+		t.Errorf("gc_refused_nodegroups gauge = %v, want 1", got)
+	}
+	if got := recorder.countReason("GarbageCollectionRefused"); got != 1 {
+		t.Errorf("GarbageCollectionRefused events = %d, want 1", got)
+	}
+
+	// A second sweep keeps the gauge at the persisting refusal and
+	// republishes the event — hourly dedupe is the real recorder's job (the
+	// fake captures every publish), so each publish must carry the timeout.
+	if _, err := ctrl.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	if got := metricstest.Value(t, "karpenter_clevercloud_gc_refused_nodegroups"); got != 1 {
+		t.Errorf("gc_refused_nodegroups gauge after second sweep = %v, want 1", got)
+	}
+	if got := recorder.countReason("GarbageCollectionRefused"); got != 2 {
+		t.Errorf("GarbageCollectionRefused publishes after second sweep = %d, want 2 (recorder dedupes in production)", got)
+	}
+	for _, e := range recorder.eventsByReason("GarbageCollectionRefused") {
+		if e.DedupeTimeout != time.Hour {
+			t.Errorf("GarbageCollectionRefused DedupeTimeout = %v, want 1h", e.DedupeTimeout)
+		}
 	}
 }
 

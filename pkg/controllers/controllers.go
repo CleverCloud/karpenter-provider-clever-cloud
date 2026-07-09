@@ -21,6 +21,7 @@ package controllers
 import (
 	"github.com/awslabs/operatorpkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/karpenter/pkg/events"
 
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/garbagecollection"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/instancetypecapacity"
@@ -33,10 +34,10 @@ import (
 
 // NewControllers wires the Clever Cloud controllers. pricingController is
 // optional (nil when the dynamic price refresher is disabled).
-func NewControllers(kubeClient client.Client, nodeGroupProvider *nodegroup.Provider, instanceTypeProvider *instancetype.Provider, pricingController *pricing.Controller) []controller.Controller {
+func NewControllers(kubeClient client.Client, recorder events.Recorder, nodeGroupProvider *nodegroup.Provider, instanceTypeProvider *instancetype.Provider, pricingController *pricing.Controller) []controller.Controller {
 	controllers := []controller.Controller{
 		providerid.NewController(kubeClient),
-		garbagecollection.NewController(kubeClient, nodeGroupProvider),
+		garbagecollection.NewController(kubeClient, nodeGroupProvider, recorder),
 		nodeclass.NewController(kubeClient),
 		instancetypecapacity.NewController(kubeClient, instanceTypeProvider),
 	}

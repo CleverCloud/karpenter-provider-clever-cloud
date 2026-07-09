@@ -40,9 +40,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
-	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
+
+	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
@@ -56,13 +62,14 @@ const (
 type Controller struct {
 	kubeClient        client.Client
 	nodeGroupProvider *nodegroup.Provider
-	// warned dedups the refusal log per NodeGroup for this process lifetime;
-	// Reconcile is a singleton, no locking needed.
+	recorder          events.Recorder
+	// warned dedups the refusal log/event per NodeGroup for this process
+	// lifetime; Reconcile is a singleton, no locking needed.
 	warned map[string]struct{}
 }
 
-func NewController(kubeClient client.Client, nodeGroupProvider *nodegroup.Provider) *Controller {
-	return &Controller{kubeClient: kubeClient, nodeGroupProvider: nodeGroupProvider, warned: map[string]struct{}{}}
+func NewController(kubeClient client.Client, nodeGroupProvider *nodegroup.Provider, recorder events.Recorder) *Controller {
+	return &Controller{kubeClient: kubeClient, nodeGroupProvider: nodeGroupProvider, recorder: recorder, warned: map[string]struct{}{}}
 }
 
 func (c *Controller) Name() string {
@@ -82,6 +89,11 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	for i := range nodeClaims.Items {
 		claimNames[nodeClaims.Items[i].Name] = struct{}{}
 	}
+	// Set through a defer so the gauge reflects this sweep's (possibly
+	// partial) count even when a Delete below errors out mid-loop; a stale
+	// value from a previous sweep must not keep an alert firing or silent.
+	refused := 0
+	defer func() { metrics.GCRefusedNodeGroups.Set(float64(refused), nil) }()
 	for i := range nodeGroups {
 		ng := &nodeGroups[i]
 		if !ng.DeletionTimestamp.IsZero() || time.Since(ng.CreationTimestamp.Time) < minAge {
@@ -96,33 +108,58 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		}
 		owners := nodegroup.NodeClaimOwners(ng)
 		if len(owners) == 0 {
-			c.warnOnce(ctx, ng.Name, "refusing to garbage collect nodegroup carrying the managed label without a NodeClaim owner reference; "+
+			refused++
+			c.refuse(ctx, ng, "refusing to garbage collect nodegroup carrying the managed label without a NodeClaim owner reference; "+
 				"remove the label if it was copied from a karpenter-created manifest, or delete the nodegroup manually if its owner was deliberately orphaned")
 			continue
 		}
 		if ownerAlive(owners, claimNames) {
 			// The mutable nodeclaim label disagrees with a living owner —
 			// never reap a group whose recorded owner still exists.
-			c.warnOnce(ctx, ng.Name, "refusing to garbage collect nodegroup whose NodeClaim owner is alive but whose nodeclaim label matches nothing; fix the label")
+			refused++
+			c.refuse(ctx, ng, "refusing to garbage collect nodegroup whose NodeClaim owner is alive but whose nodeclaim label matches nothing; fix the label")
 			continue
 		}
-		if err := c.nodeGroupProvider.Delete(ctx, ng.Name); client.IgnoreNotFound(err) != nil {
+		if err := c.nodeGroupProvider.Delete(ctx, ng.Name); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Someone else (owner-reference cascade, operator) deleted it
+				// between List and Delete — not this safety net's work.
+				continue
+			}
 			return reconciler.Result{}, err
 		}
+		metrics.GCReapedNodeGroups.Inc(nil)
+		c.recorder.Publish(events.Event{
+			InvolvedObject: ng,
+			Type:           corev1.EventTypeNormal,
+			Reason:         "GarbageCollected",
+			Message:        "deleted orphaned nodegroup: no NodeClaim references it",
+			DedupeValues:   []string{ng.Name},
+		})
 		log.FromContext(ctx).WithValues("NodeGroup", ng.Name).Info("garbage collected orphaned nodegroup")
 	}
 	return reconciler.Result{RequeueAfter: pollPeriod}, nil
 }
 
-// warnOnce logs the refusal reason once per NodeGroup per process lifetime —
-// the condition persists until an operator acts, and one line per 2-minute
-// sweep would drown the signal.
-func (c *Controller) warnOnce(ctx context.Context, name, msg string) {
-	if _, ok := c.warned[name]; ok {
-		return
+// refuse surfaces a reap refusal: a gauge tick per sweep (done by the
+// caller), a log line once per NodeGroup per process lifetime (the condition
+// persists, one line per 2-minute sweep would drown the signal), and a
+// Kubernetes Event republished hourly — events age out of etcd after ~1h,
+// and an operator investigating a days-old refusal must still find it on
+// kubectl describe.
+func (c *Controller) refuse(ctx context.Context, ng *ngv1.NodeGroup, msg string) {
+	if _, ok := c.warned[ng.Name]; !ok {
+		c.warned[ng.Name] = struct{}{}
+		log.FromContext(ctx).WithValues("NodeGroup", ng.Name).Info(msg)
 	}
-	c.warned[name] = struct{}{}
-	log.FromContext(ctx).WithValues("NodeGroup", name).Info(msg)
+	c.recorder.Publish(events.Event{
+		InvolvedObject: ng,
+		Type:           corev1.EventTypeWarning,
+		Reason:         "GarbageCollectionRefused",
+		Message:        msg,
+		DedupeValues:   []string{ng.Name},
+		DedupeTimeout:  time.Hour,
+	})
 }
 
 func ownerAlive(owners []string, claimNames map[string]struct{}) bool {

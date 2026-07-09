@@ -22,6 +22,7 @@ package nodegroup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -34,11 +35,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics"
 )
 
 const (
@@ -46,11 +50,6 @@ const (
 	// The full form is "clevercloud://<nodegroup-name>".
 	ProviderIDPrefix = "clevercloud://"
 
-	// quotaCheckTimeout bounds how long Create waits for the Clever Cloud
-	// operator to accept or reject (quota) a new NodeGroup. Rejections are
-	// observed within 1-3s; on timeout we optimistically assume the group
-	// will converge and let Karpenter's registration TTL be the backstop.
-	quotaCheckTimeout = 15 * time.Second
 	// quotaCheckInterval is the poll period during the quota check.
 	quotaCheckInterval = time.Second
 
@@ -59,6 +58,13 @@ const (
 	// Any NodeGroup deletion clears the backoff since it frees capacity.
 	quotaBackoff = time.Minute
 )
+
+// quotaCheckTimeout bounds how long Create waits for the Clever Cloud
+// operator to accept or reject (quota) a new NodeGroup. Rejections are
+// observed within 1-3s; on timeout we optimistically assume the group
+// will converge and let Karpenter's registration TTL be the backstop.
+// Variable only so tests can exercise the timeout path without waiting 15s.
+var quotaCheckTimeout = 15 * time.Second
 
 // ErrQuotaExceeded is returned by Create when the organisation quota rejects
 // the requested capacity.
@@ -73,6 +79,7 @@ func (e *ErrQuotaExceeded) Error() string {
 // Provider performs CRUD operations on Clever Cloud NodeGroups.
 type Provider struct {
 	kubeClient client.Client
+	recorder   events.Recorder
 
 	// createMu serializes NodeGroup creations. Concurrent creations make the
 	// upstream quota engine evaluate all in-flight groups together, rejecting
@@ -85,8 +92,8 @@ type Provider struct {
 	quotaMessage    string
 }
 
-func NewProvider(kubeClient client.Client) *Provider {
-	return &Provider{kubeClient: kubeClient}
+func NewProvider(kubeClient client.Client, recorder events.Recorder) *Provider {
+	return &Provider{kubeClient: kubeClient, recorder: recorder}
 }
 
 // quotaBackoffActive reports whether a recent quota rejection should fail
@@ -152,6 +159,9 @@ func NodeClaimOwners(ng *ngv1.NodeGroup) []string {
 func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.CleverNodeClass, flavor string) (*ngv1.NodeGroup, error) {
 	p.createMu.Lock()
 	defer p.createMu.Unlock()
+	// No event on the backoff fast-fail: karpenter-core already publishes an
+	// InsufficientCapacityError event per attempt, and claims get fresh names
+	// each retry so per-claim dedupe cannot bound the volume.
 	if active, message := p.quotaBackoffActive(); active {
 		return nil, &ErrQuotaExceeded{Message: fmt.Sprintf("%s (cached for up to %s; freed capacity clears it immediately)", message, quotaBackoff)}
 	}
@@ -205,17 +215,51 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 		}
 		ng = existing
 	}
-	if err := p.waitForAcceptance(ctx, ng.Name); err != nil {
+	synced, err := p.waitForAcceptance(ctx, ng.Name)
+	if err != nil {
+		quotaErr := &ErrQuotaExceeded{}
+		if errors.As(err, &quotaErr) {
+			p.publishQuotaEvent(nodeClaim, err)
+		}
 		return nil, err
+	}
+	if !synced {
+		// Optimistic-launch path: today the only signal that the operator
+		// never accepted the group. Karpenter's registration TTL backstops it.
+		metrics.NodeGroupAcceptanceTimeouts.Inc(nil)
+		log.FromContext(ctx).WithValues("NodeGroup", ng.Name).Info(
+			"nodegroup not accepted by the node-group operator within the poll window; proceeding optimistically")
+		p.recorder.Publish(events.Event{
+			InvolvedObject: nodeClaim,
+			Type:           corev1.EventTypeWarning,
+			Reason:         "NodeGroupAcceptanceTimeout",
+			Message:        fmt.Sprintf("NodeGroup %s was not accepted by the node-group operator within %s; proceeding optimistically (the registration TTL is the backstop)", ng.Name, quotaCheckTimeout),
+			DedupeValues:   []string{nodeClaim.Name},
+		})
 	}
 	return ng, nil
 }
 
+// publishQuotaEvent surfaces a quota rejection on the NodeClaim so users see
+// it in kubectl describe, not only in controller logs and scheduler events.
+func (p *Provider) publishQuotaEvent(nodeClaim *karpv1.NodeClaim, err error) {
+	p.recorder.Publish(events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeWarning,
+		Reason:         "NodeGroupQuotaExceeded",
+		Message:        err.Error(),
+		DedupeValues:   []string{nodeClaim.Name},
+	})
+}
+
 // waitForAcceptance polls the NodeGroup until the Clever Cloud operator
-// reports it Synced, rejects it on quota, or the timeout elapses (treated as
-// optimistic success).
-func (p *Provider) waitForAcceptance(ctx context.Context, name string) error {
-	ctx, cancel := context.WithTimeout(ctx, quotaCheckTimeout)
+// reports it Synced, rejects it on quota, or the timeout elapses. A timeout
+// returns (false, nil): the caller treats it as optimistic success but must
+// surface it — it is the only signal distinguishing a down operator from
+// normal provisioning. A cancelled parent context (controller shutdown) is
+// NOT a timeout and returns its error, so shutdowns don't fake that signal.
+func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bool, error) {
+	ctx, cancel := context.WithTimeout(parentCtx, quotaCheckTimeout)
 	defer cancel()
 	err := wait.PollUntilContextCancel(ctx, quotaCheckInterval, true, func(ctx context.Context) (bool, error) {
 		ng := &ngv1.NodeGroup{}
@@ -227,6 +271,11 @@ func (p *Provider) waitForAcceptance(ctx context.Context, name string) error {
 			if cond := ng.GetCondition(ngv1.ConditionTypeReconcileFailed); cond != nil {
 				msg = cond.Message
 			}
+			// Record before the cleanup delete: the rejection happened even
+			// if freeing the reservation below fails. Fresh upstream
+			// rejections only — backoff fast-fails don't count.
+			p.recordQuotaRejection(msg)
+			metrics.NodeGroupQuotaRejections.Inc(nil)
 			// Free the rejected reservation immediately so it does not
 			// starve other NodeGroups in the org. Deleted directly (not via
 			// p.Delete) because removing a rejected group frees no real
@@ -234,15 +283,20 @@ func (p *Provider) waitForAcceptance(ctx context.Context, name string) error {
 			if err := p.kubeClient.Delete(ctx, &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: name}}); err != nil && !apierrors.IsNotFound(err) {
 				return false, fmt.Errorf("cleaning up quota-rejected nodegroup, %w", err)
 			}
-			p.recordQuotaRejection(msg)
 			return false, &ErrQuotaExceeded{Message: msg}
 		}
 		return ng.IsSynced(), nil
 	})
-	if err == nil || wait.Interrupted(err) {
-		return nil
+	if err == nil {
+		return true, nil
 	}
-	return err
+	if wait.Interrupted(err) {
+		if parentCtx.Err() != nil {
+			return false, parentCtx.Err()
+		}
+		return false, nil
+	}
+	return false, err
 }
 
 // Get fetches a NodeGroup by name.
