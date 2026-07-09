@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/version"
 )
 
 const (
@@ -222,6 +223,10 @@ func (p *Provider) getJSON(ctx context.Context, rawURL string, query url.Values,
 		return fmt.Errorf("building request for %s: %w", rawURL, err)
 	}
 	req.Header.Set("Accept", "application/json")
+	// Identify the fleet's traffic: every CKE cluster running this provider
+	// polls these endpoints, and platform support must be able to attribute
+	// the requests and see the version distribution.
+	req.Header.Set("User-Agent", "karpenter-provider-clever-cloud/"+version.Version)
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("GET %s: %w", rawURL, err)
