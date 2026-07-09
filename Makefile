@@ -25,7 +25,17 @@ test: ## Run unit tests
 generate: ## Generate deepcopy functions and the CleverNodeClass CRD
 	go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION) object paths="./pkg/apis/..."
 	go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION) crd paths="./pkg/apis/v1alpha1/..." output:crd:artifacts:config=deploy/crds
+	$(MAKE) sync-karpenter-crds
 	$(MAKE) sync-chart-crds
+
+.PHONY: sync-karpenter-crds
+sync-karpenter-crds: ## Refresh the vendored karpenter.sh CRDs from the pinned sigs.k8s.io/karpenter module
+	@go mod download sigs.k8s.io/karpenter
+	dir="$$(go list -m -f '{{.Dir}}' sigs.k8s.io/karpenter)"; \
+	if [ -z "$$dir" ]; then echo "cannot locate the sigs.k8s.io/karpenter module directory"; exit 1; fi; \
+	rm -f deploy/crds/karpenter.sh_*.yaml; \
+	cp "$$dir"/pkg/apis/crds/karpenter.sh_*.yaml deploy/crds/; \
+	chmod u+w deploy/crds/karpenter.sh_*.yaml
 
 .PHONY: raw-manifest
 raw-manifest: ## Regenerate deploy/karpenter.yaml from the Helm chart (never edit it by hand)
