@@ -18,15 +18,18 @@ package garbagecollection_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -37,6 +40,8 @@ import (
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
+
+var errTest = errors.New("injected failure")
 
 // fakeRecorder captures published events for assertions.
 type fakeRecorder struct {
@@ -78,7 +83,9 @@ func newTestControllerWithRecorder(t *testing.T, objs ...client.Object) (*garbag
 		WithObjects(objs...).
 		Build()
 	recorder := &fakeRecorder{}
-	return garbagecollection.NewController(kubeClient, nodegroup.NewProvider(kubeClient, recorder), recorder), kubeClient, recorder
+	// The fake client serves as its own uncached reader: cache and API server
+	// agree in these tests. Staleness scenarios build the controller by hand.
+	return garbagecollection.NewController(kubeClient, kubeClient, nodegroup.NewProvider(kubeClient, recorder), recorder), kubeClient, recorder
 }
 
 // managedNodeGroup builds a karpenter-managed NodeGroup backdated by age,
@@ -421,5 +428,80 @@ func TestReconcileFastFailsVanishedNodeClaims(t *testing.T) {
 	}
 	if got := recorder.countReason("NodeGroupVanished"); got != 1 {
 		t.Errorf("NodeGroupVanished events = %d, want 1", got)
+	}
+}
+
+func TestReconcileConfirmsAbsenceUncachedBeforeDestroying(t *testing.T) {
+	// Simulate informer staleness: the cached client is missing the NodeClaim
+	// and the NodeGroup that the uncached reader (the API server) still sees.
+	recorder := &fakeRecorder{}
+	cached := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(
+		managedNodeGroup("ng-stale", "claim-stale", 10*time.Minute, false),
+		vanishedClaim("claim-nogroup", 10*time.Minute),
+	).Build()
+	uncached := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(
+		testNodeClaim("claim-stale"),
+		&ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: "claim-nogroup"}, Spec: ngv1.NodeGroupSpec{Flavor: "2XS", NodeCount: 1}},
+	).Build()
+	ctrl := garbagecollection.NewController(cached, uncached, nodegroup.NewProvider(cached, recorder), recorder)
+
+	if _, err := ctrl.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// The NodeGroup survives: its claim exists on the API server.
+	if !nodeGroupExists(t, cached, "ng-stale") {
+		t.Error("expected the nodegroup to be retained when the uncached read finds its nodeclaim")
+	}
+	// The NodeClaim survives: its group exists on the API server.
+	if !nodeClaimExists(t, cached, "claim-nogroup") {
+		t.Error("expected the nodeclaim to be retained when the uncached read finds its nodegroup")
+	}
+}
+
+func TestReconcileConfirmsOwnerNamesUncached(t *testing.T) {
+	// The owner reference is the identity: a group whose label matches
+	// nothing but whose recorded owner is alive on the API server (stale
+	// cache) must be kept — the uncached confirm covers the owner names too.
+	recorder := &fakeRecorder{}
+	ng := labeledNodeGroup("ng-owner-stale", "claim-nowhere", 10*time.Minute, false)
+	ng.OwnerReferences = []metav1.OwnerReference{
+		{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: "claim-owner", UID: types.UID("uid-claim-owner")},
+	}
+	cached := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(ng).Build()
+	uncached := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(testNodeClaim("claim-owner")).Build()
+	ctrl := garbagecollection.NewController(cached, uncached, nodegroup.NewProvider(cached, recorder), recorder)
+
+	if _, err := ctrl.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !nodeGroupExists(t, cached, "ng-owner-stale") {
+		t.Error("expected the nodegroup to be retained when its owner is alive on the API server")
+	}
+}
+
+func TestReconcileContinuesPastDeleteFailures(t *testing.T) {
+	// One stuck NodeGroup must not shield the others until the next sweep.
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(
+		managedNodeGroup("ng-stuck", "claim-gone", 10*time.Minute, false),
+		managedNodeGroup("ng-reapable", "claim-gone", 10*time.Minute, false),
+	).WithInterceptorFuncs(interceptor.Funcs{
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if obj.GetName() == "ng-stuck" {
+				return apierrors.NewInternalError(errTest)
+			}
+			return cl.Delete(ctx, obj, opts...)
+		},
+	}).Build()
+	recorder := &fakeRecorder{}
+	ctrl := garbagecollection.NewController(kubeClient, kubeClient, nodegroup.NewProvider(kubeClient, recorder), recorder)
+
+	if _, err := ctrl.Reconcile(context.Background()); err == nil {
+		t.Fatal("expected the sweep to report the stuck deletion")
+	}
+	if nodeGroupExists(t, kubeClient, "ng-reapable") {
+		t.Error("expected the second orphan to be reaped despite the first failing")
+	}
+	if !nodeGroupExists(t, kubeClient, "ng-stuck") {
+		t.Error("expected the stuck nodegroup to still exist")
 	}
 }
