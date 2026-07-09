@@ -10,7 +10,7 @@ This guide walks you through deploying the Karpenter provider for Clever Cloud o
 
 > **Note:** No Clever Cloud API token or credentials are required. The provider drives the in-cluster NodeGroup API (`nodegroups.api.clever-cloud.com/v1`) that every CKE cluster serves; the Clever Cloud operator upstream turns NodeGroups into VMs.
 
-Each release publishes the controller image and both Helm charts to ghcr.io, so the default path below needs no local build. Chart versions follow the release tags without the `v` prefix: release `v0.9.2` publishes chart version `0.9.2` and image tag `v0.9.2`. To build and deploy your own image instead, see [Installing from source](#installing-from-source).
+Each release publishes the controller image and both Helm charts to ghcr.io, so the default path below needs no local build. Chart versions follow the release tags without the `v` prefix: release `v0.10.0` publishes chart version `0.10.0` and image tag `v0.10.0`. To build and deploy your own image instead, see [Installing from source](#installing-from-source).
 
 ## Step 1 — Install the CRDs
 
@@ -69,7 +69,7 @@ To run your own build instead of the published artifacts, you additionally need 
 
 ```sh
 export IMAGE=<registry>/karpenter-clevercloud
-export TAG=v0.9.2
+export TAG=v0.10.0
 
 make image IMAGE=$IMAGE TAG=$TAG
 docker push $IMAGE:$TAG

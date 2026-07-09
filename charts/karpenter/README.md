@@ -18,8 +18,8 @@ chart to upgrade CRDs through Helm.
 ## Install
 
 Each release publishes the chart to ghcr.io as an OCI artifact, versioned on
-the release tag without the `v` prefix (release `v0.9.2` → chart version
-`0.9.2`). No image settings are needed — the chart's `appVersion` pins the
+the release tag without the `v` prefix (release `v0.10.0` → chart version
+`0.10.0`). No image settings are needed — the chart's `appVersion` pins the
 matching published image:
 
 ```sh
@@ -32,13 +32,13 @@ To run your own build instead, push the controller image to a registry your
 cluster can pull from, then install the chart from the repo checkout:
 
 ```sh
-make image IMAGE=<registry>/karpenter-clevercloud TAG=v0.9.2
-docker push <registry>/karpenter-clevercloud:v0.9.2
+make image IMAGE=<registry>/karpenter-clevercloud TAG=v0.10.0
+docker push <registry>/karpenter-clevercloud:v0.10.0
 
 helm install karpenter charts/karpenter \
   --namespace karpenter --create-namespace \
   --set image.repository=<registry>/karpenter-clevercloud \
-  --set image.tag=v0.9.2
+  --set image.tag=v0.10.0
 ```
 
 Then create a NodePool and a CleverNodeClass (see
