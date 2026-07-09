@@ -243,6 +243,27 @@ func LoadFlavorsFromFile(path string) ([]FlavorOverride, error) {
 	return overrides, nil
 }
 
+// LoadFlavorsOrDegrade loads the overrides file but never fails the caller:
+// the chart rolls the pod on every settings.flavors change, so an invalid
+// file used to convert a typo straight into a CrashLoopBackOff of the
+// platform's autoscaler. Serving the base catalogue without the overrides is
+// strictly better — the degradation is surfaced through the
+// flavors_config_invalid gauge and an error log. An empty path is a no-op.
+func LoadFlavorsOrDegrade(path string) []FlavorOverride {
+	metrics.FlavorsConfigInvalid.Set(0, nil)
+	if path == "" {
+		return nil
+	}
+	overrides, err := LoadFlavorsFromFile(path)
+	if err != nil {
+		metrics.FlavorsConfigInvalid.Set(1, nil)
+		log.Log.WithName("instancetype").Error(err,
+			"invalid flavor overrides file; running WITHOUT the configured overrides (base catalogue only) — fix settings.flavors")
+		return nil
+	}
+	return overrides
+}
+
 // ParseFlavorOverrides unmarshals a YAML list of partial flavor overrides and
 // validates it. Each entry must have a non-empty, unique name; any field that
 // is set must satisfy its bound (cpu > 0, memoryKi > 0, priceHourly >= 0). A

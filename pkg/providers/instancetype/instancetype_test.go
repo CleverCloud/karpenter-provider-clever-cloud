@@ -17,6 +17,8 @@ limitations under the License.
 package instancetype_test
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -573,6 +575,44 @@ func TestSynthesizeServesDegradedTypesWithoutTouchingTheCatalog(t *testing.T) {
 			if it.Name == "CUSTOM" {
 				t.Error("Synthesize must not add the flavor to List()")
 			}
+		}
+	})
+}
+
+func TestLoadFlavorsOrDegradeNeverFails(t *testing.T) {
+	t.Run("empty path is a no-op", func(t *testing.T) {
+		if got := instancetype.LoadFlavorsOrDegrade(""); got != nil {
+			t.Errorf("expected nil overrides, got %v", got)
+		}
+		if v := metricstest.Value(t, "karpenter_clevercloud_instancetype_flavors_config_invalid"); v != 0 {
+			t.Errorf("flavors_config_invalid = %v, want 0", v)
+		}
+	})
+
+	t.Run("invalid file degrades and raises the gauge", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "flavors.yaml")
+		if err := os.WriteFile(path, []byte("not: a list"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := instancetype.LoadFlavorsOrDegrade(path); got != nil {
+			t.Errorf("expected nil overrides on invalid file, got %v", got)
+		}
+		if v := metricstest.Value(t, "karpenter_clevercloud_instancetype_flavors_config_invalid"); v != 1 {
+			t.Errorf("flavors_config_invalid = %v, want 1", v)
+		}
+	})
+
+	t.Run("valid file loads and clears the gauge", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "flavors.yaml")
+		if err := os.WriteFile(path, []byte("- name: M\n  priceHourly: 0.1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got := instancetype.LoadFlavorsOrDegrade(path)
+		if len(got) != 1 || got[0].Name != "M" {
+			t.Errorf("unexpected overrides: %v", got)
+		}
+		if v := metricstest.Value(t, "karpenter_clevercloud_instancetype_flavors_config_invalid"); v != 0 {
+			t.Errorf("flavors_config_invalid = %v, want 0", v)
 		}
 	})
 }

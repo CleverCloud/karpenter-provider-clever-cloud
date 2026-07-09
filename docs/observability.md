@@ -17,6 +17,7 @@ All provider series are prefixed `karpenter_clevercloud_`.
 | `nodegroup_external_resizes` | gauge | Managed NodeGroups whose `nodeCount` is not 1 — something outside karpenter resizes them (the platform's alert-driven scaler via an inherited `autoscalingEnabled`, a human, anything with `nodegroups/scale` RBAC). | **Non-zero breaks the 1 NodeClaim = 1 NodeGroup invariant**: the extra nodes are neither tracked nor priced by karpenter. Find the resizer; ensure the cluster's `autoscalingEnabled` feature is off (the two autoscalers must never run together). |
 | `gc_reaped_nodegroups_total` | counter | The GC safety net deleted an orphaned NodeGroup (its NodeClaim was force-deleted outside the normal flow). | Occasional ticks are the safety net working. Frequent ticks mean something force-deletes NodeClaims — find it. |
 | `gc_refused_nodegroups` | gauge | NodeGroups the last GC sweep refused to reap: managed label present, but no verified dead NodeClaim owner. | **Non-zero needs attention** — each one is a VM billing hourly. A copied manifest: remove the `karpenter.clever-cloud.com/managed` label. A deliberately orphaned group: delete it manually. Details in the `GarbageCollectionRefused` event on the NodeGroup. |
+| `instancetype_flavors_config_invalid` | gauge | 1 while the `settings.flavors` overrides file failed to load: the controller runs on the base catalogue WITHOUT the configured overrides instead of crashlooping. | Fix `settings.flavors` (the chart also validates it at install time via values.schema.json); the next pod roll picks it up. **Note**: a flavor that only the overrides kept in the catalogue leaves it while the gauge is 1 — its nodes are then rolled by drift (see [Flavor removal semantics](#flavor-removal-semantics)). |
 | `pricing_refresh_failures_total` | counter | A catalogue refresh from the public price API failed; the last-known-good catalogue stays in use. | Transient failures are harmless. Persistent failures mean prices/flavors drift from reality: check egress to `api.clever-cloud.com` and the error log, or pin the catalogue via `settings.flavors`. |
 | `pricing_last_successful_refresh_timestamp_seconds` | gauge | Unix time of the last successful catalogue refresh. **Absent until the first success, and exports no series when the refresher is disabled** (`settings.pricing.enabled=false`). | Alert on staleness only when > 0 (see below). |
 | `instancetype_unknown_flavor_lookups_total` | counter | An instance-type lookup referenced a flavor absent from the served catalogue. | A running NodeGroup uses a flavor the catalogue lost (upstream change, topology misconfig, removed override). GC and termination keep working on a synthesized type, and the affected nodes are **rolled by drift under disruption budgets** (see [Flavor removal semantics](#flavor-removal-semantics)); restore the flavor via `settings.flavors` or fix `CLEVER_CLOUD_TOPOLOGY` to stop the roll. |
@@ -35,6 +36,9 @@ karpenter_clevercloud_gc_refused_nodegroups > 0
 
 # Something outside karpenter resizes its nodegroups
 karpenter_clevercloud_nodegroup_external_resizes > 0
+
+# The flavors overrides file is broken; the configured overrides are inactive
+karpenter_clevercloud_instancetype_flavors_config_invalid > 0
 
 # Catalogue stale for more than two refresh periods (only when refresher active)
 karpenter_clevercloud_pricing_last_successful_refresh_timestamp_seconds > 0
