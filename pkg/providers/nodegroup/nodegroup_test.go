@@ -19,7 +19,9 @@ package nodegroup_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,13 +34,42 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
+// fakeRecorder captures published events for assertions.
+type fakeRecorder struct {
+	mu     sync.Mutex
+	events []events.Event
+}
+
+func (r *fakeRecorder) Publish(evts ...events.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, evts...)
+}
+
+func (r *fakeRecorder) reasons() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	reasons := make([]string, 0, len(r.events))
+	for _, e := range r.events {
+		reasons = append(reasons, e.Reason)
+	}
+	return reasons
+}
+
 func newTestProvider(t *testing.T, objs ...client.Object) (*nodegroup.Provider, client.Client) {
+	provider, kubeClient, _ := newTestProviderWithRecorder(t, objs...)
+	return provider, kubeClient
+}
+
+func newTestProviderWithRecorder(t *testing.T, objs ...client.Object) (*nodegroup.Provider, client.Client, *fakeRecorder) {
 	t.Helper()
 	// No WithStatusSubresource for NodeGroup: status must stay writable via
 	// plain Update so the tests can play the Clever Cloud operator, and so
@@ -47,7 +78,8 @@ func newTestProvider(t *testing.T, objs ...client.Object) (*nodegroup.Provider, 
 		WithScheme(scheme.Scheme).
 		WithObjects(objs...).
 		Build()
-	return nodegroup.NewProvider(kubeClient), kubeClient
+	recorder := &fakeRecorder{}
+	return nodegroup.NewProvider(kubeClient, recorder), kubeClient, recorder
 }
 
 func testNodeClass(name string) *v1alpha1.CleverNodeClass {
@@ -326,9 +358,10 @@ func TestCreateRejectsForeignNodeGroup(t *testing.T) {
 }
 
 func TestCreateQuotaRejectionCleansUpAndReturnsTypedError(t *testing.T) {
-	provider, kubeClient := newTestProvider(t)
+	provider, kubeClient, recorder := newTestProviderWithRecorder(t)
 	nodeClaim := testNodeClaim("default-quota")
 	message := "Quota exceeded: RAM max reached"
+	rejectionsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_quota_rejections_total")
 
 	done := rejectOnceCreated(t, kubeClient, nodeClaim.Name, message)
 	_, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XS")
@@ -343,6 +376,62 @@ func TestCreateQuotaRejectionCleansUpAndReturnsTypedError(t *testing.T) {
 	// The rejected NodeGroup must have been deleted to free the reservation.
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: nodeClaim.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
 		t.Errorf("expected quota-rejected nodegroup to be deleted, got %v", err)
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_quota_rejections_total") - rejectionsBefore; delta != 1 {
+		t.Errorf("quota_rejections_total delta = %v, want 1", delta)
+	}
+	if !slices.Contains(recorder.reasons(), "NodeGroupQuotaExceeded") {
+		t.Errorf("expected a NodeGroupQuotaExceeded event on the nodeclaim, got %v", recorder.reasons())
+	}
+}
+
+func TestCreateAcceptanceTimeoutProceedsOptimisticallyAndSurfaces(t *testing.T) {
+	prev := nodegroup.SetQuotaCheckTimeout(300 * time.Millisecond)
+	t.Cleanup(func() { nodegroup.SetQuotaCheckTimeout(prev) })
+
+	provider, _, recorder := newTestProviderWithRecorder(t)
+	timeoutsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
+
+	// Nothing plays the operator: the group never turns Synced, the poll
+	// times out, and Create must still succeed (optimistic launch) while
+	// surfacing the timeout through the counter and a NodeClaim event.
+	ng, err := provider.Create(context.Background(), testNodeClaim("default-slow"), testNodeClass("default"), "2XS")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if ng.Name != "default-slow" {
+		t.Fatalf("nodegroup name = %q, want %q", ng.Name, "default-slow")
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total") - timeoutsBefore; delta != 1 {
+		t.Errorf("acceptance_timeouts_total delta = %v, want 1", delta)
+	}
+	if !slices.Contains(recorder.reasons(), "NodeGroupAcceptanceTimeout") {
+		t.Errorf("expected a NodeGroupAcceptanceTimeout event on the nodeclaim, got %v", recorder.reasons())
+	}
+}
+
+func TestCreateParentCancellationIsNotAnAcceptanceTimeout(t *testing.T) {
+	prev := nodegroup.SetQuotaCheckTimeout(5 * time.Second)
+	t.Cleanup(func() { nodegroup.SetQuotaCheckTimeout(prev) })
+
+	provider, _, recorder := newTestProviderWithRecorder(t)
+	timeoutsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
+
+	// Controller shutdown mid-poll must surface as an error, not as the
+	// operator-down signal: no counter tick, no Warning event.
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+	if _, err := provider.Create(ctx, testNodeClaim("default-cancel"), testNodeClass("default"), "2XS"); err == nil {
+		t.Fatal("expected an error when the parent context is cancelled mid-poll")
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total") - timeoutsBefore; delta != 0 {
+		t.Errorf("acceptance_timeouts_total delta = %v, want 0 on parent cancellation", delta)
+	}
+	if slices.Contains(recorder.reasons(), "NodeGroupAcceptanceTimeout") {
+		t.Error("parent cancellation must not publish a NodeGroupAcceptanceTimeout event")
 	}
 }
 

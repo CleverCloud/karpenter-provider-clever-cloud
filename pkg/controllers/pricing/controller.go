@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 )
 
@@ -72,10 +73,12 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		// Keep the last-known-good catalog; never clear it. Returning the error
 		// would route through the rate limiter and discard our chosen requeue,
 		// so we log and retry sooner than the period instead.
+		metrics.PricingRefreshFailures.Inc(nil)
 		log.FromContext(ctx).Error(err, "refreshing flavor catalog; keeping last-known-good")
 		return reconciler.Result{RequeueAfter: c.failureRequeue()}, nil
 	}
 	c.instanceTypeProvider.SetBaseFlavors(flavors)
+	metrics.PricingLastSuccessfulRefresh.Set(float64(time.Now().Unix()), nil)
 	log.FromContext(ctx).Info("refreshed flavor catalog from clever cloud api", "flavors", len(flavors))
 	return reconciler.Result{RequeueAfter: c.period}, nil
 }

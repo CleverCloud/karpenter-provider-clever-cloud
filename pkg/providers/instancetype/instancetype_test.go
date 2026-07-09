@@ -27,6 +27,7 @@ import (
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
 
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 )
 
@@ -131,9 +132,13 @@ func TestGetKnownFlavor(t *testing.T) {
 
 func TestGetUnknownFlavorErrors(t *testing.T) {
 	p := instancetype.NewProvider("par", nil, nil)
+	lookupsBefore := metricstest.Value(t, "karpenter_clevercloud_instancetype_unknown_flavor_lookups_total")
 
 	if _, err := p.Get("3XL"); err == nil {
 		t.Fatal("expected error for unknown flavor")
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_instancetype_unknown_flavor_lookups_total") - lookupsBefore; delta != 1 {
+		t.Errorf("unknown_flavor_lookups_total delta = %v, want 1", delta)
 	}
 }
 
