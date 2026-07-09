@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"github.com/mitchellh/hashstructure/v2"
+	"github.com/samber/lo"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -51,14 +52,17 @@ type CleverNodeClass struct {
 }
 
 // Hash returns a stable hash of the fields that, when changed, must trigger
-// drift on NodeClaims provisioned from this NodeClass.
+// drift on NodeClaims provisioned from this NodeClass. hashstructure can only
+// fail on types the spec does not contain (channels, funcs, bad hash tags);
+// lo.Must turns a future spec change introducing one into a loud panic
+// instead of silently hashing every NodeClass to the same value and mass-
+// drifting or never-drifting the fleet.
 func (in *CleverNodeClass) Hash() string {
-	hash, _ := hashstructure.Hash(in.Spec, hashstructure.FormatV2, &hashstructure.HashOptions{
+	return fmt.Sprint(lo.Must(hashstructure.Hash(in.Spec, hashstructure.FormatV2, &hashstructure.HashOptions{
 		SlicesAsSets:    true,
 		IgnoreZeroValue: true,
 		ZeroNil:         true,
-	})
-	return fmt.Sprint(hash)
+	})))
 }
 
 // CleverNodeClassList contains a list of CleverNodeClass
