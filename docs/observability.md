@@ -14,6 +14,7 @@ All provider series are prefixed `karpenter_clevercloud_`.
 | `nodegroup_acceptance_timeouts_total` | counter | A NodeGroup creation was not accepted by the node-group operator within the poll window and proceeded optimistically. | One-off ticks are benign (slow reconcile). **Sustained growth means the node-group operator is down or wedged**: every launch will burn the 15-minute registration TTL. Check the operator on the control-plane VM (platform-side); scale-ups stall until it recovers. |
 | `nodegroup_quota_rejections_total` | counter | The organisation quota rejected a NodeGroup creation (fresh upstream rejections; cached-backoff fast-fails are not counted). | Normal near the quota ceiling — karpenter relaxes to other options. If persistent while workloads stay Pending, raise the org quota or lower NodePool limits. |
 | `nodegroup_vanished_total` | counter | A NodeGroup disappeared after creation while its NodeClaim was still unregistered — usually the quota engine reclaiming an accepted group. Each tick is a launch fast-failed instead of burning the 15-minute registration TTL. | Occasional ticks near the quota ceiling are the documented upstream race. Sustained growth means the platform keeps reclaiming accepted groups — check quota headroom and the node-group operator. |
+| `nodegroup_external_resizes` | gauge | Managed NodeGroups whose `nodeCount` is not 1 — something outside karpenter resizes them (the platform's alert-driven scaler via an inherited `autoscalingEnabled`, a human, anything with `nodegroups/scale` RBAC). | **Non-zero breaks the 1 NodeClaim = 1 NodeGroup invariant**: the extra nodes are neither tracked nor priced by karpenter. Find the resizer; ensure the cluster's `autoscalingEnabled` feature is off (the two autoscalers must never run together). |
 | `gc_reaped_nodegroups_total` | counter | The GC safety net deleted an orphaned NodeGroup (its NodeClaim was force-deleted outside the normal flow). | Occasional ticks are the safety net working. Frequent ticks mean something force-deletes NodeClaims — find it. |
 | `gc_refused_nodegroups` | gauge | NodeGroups the last GC sweep refused to reap: managed label present, but no verified dead NodeClaim owner. | **Non-zero needs attention** — each one is a VM billing hourly. A copied manifest: remove the `karpenter.clever-cloud.com/managed` label. A deliberately orphaned group: delete it manually. Details in the `GarbageCollectionRefused` event on the NodeGroup. |
 | `pricing_refresh_failures_total` | counter | A catalogue refresh from the public price API failed; the last-known-good catalogue stays in use. | Transient failures are harmless. Persistent failures mean prices/flavors drift from reality: check egress to `api.clever-cloud.com` and the error log, or pin the catalogue via `settings.flavors`. |
@@ -31,6 +32,9 @@ increase(karpenter_clevercloud_nodegroup_acceptance_timeouts_total[1h]) > 0
 # A NodeGroup the GC refuses to reap keeps billing — use `for: 30m` in the
 # alert rule to skip refusals the operator fixes quickly.
 karpenter_clevercloud_gc_refused_nodegroups > 0
+
+# Something outside karpenter resizes its nodegroups
+karpenter_clevercloud_nodegroup_external_resizes > 0
 
 # Catalogue stale for more than two refresh periods (only when refresher active)
 karpenter_clevercloud_pricing_last_successful_refresh_timestamp_seconds > 0
@@ -89,6 +93,7 @@ condition.
 | `NodeGroupQuotaExceeded` | NodeClaim | Warning | The org quota freshly rejected this claim's NodeGroup (message carries the quota detail). Backoff fast-fails emit no provider event — karpenter-core already publishes an `InsufficientCapacityError` event per attempt. |
 | `NodeGroupAcceptanceTimeout` | NodeClaim | Warning | The operator did not accept the NodeGroup in time; the launch proceeded optimistically. Controller shutdowns mid-poll are excluded. |
 | `NodeGroupVanished` | NodeClaim | Warning | The NodeGroup disappeared after launch before the node registered; the launch was failed (acceptance poll) or the claim deleted (GC sweep) instead of waiting out the registration TTL. |
+| `NodeGroupExternallyResized` | NodeGroup | Warning | The group's nodeCount is not 1; republished hourly while the condition persists. |
 | `GarbageCollected` | NodeGroup | Normal | The GC safety net deleted this orphaned group. |
 | `GarbageCollectionRefused` | NodeGroup | Warning | The GC found this group orphan-like but refused to reap it (no verified dead owner); republished hourly while the condition persists so it survives etcd's event TTL. |
 
