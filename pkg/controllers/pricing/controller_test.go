@@ -36,6 +36,15 @@ func (s stubResolver) Resolve(context.Context) ([]instancetype.Flavor, error) {
 	return s.flavors, s.err
 }
 
+// withinJitter asserts a requeue landed in the ±10% jitter window around want.
+func withinJitter(t *testing.T, got, want time.Duration) {
+	t.Helper()
+	lo, hi := time.Duration(float64(want)*0.9), time.Duration(float64(want)*1.1)
+	if got < lo || got > hi {
+		t.Errorf("RequeueAfter = %v, want within [%v, %v]", got, lo, hi)
+	}
+}
+
 func TestReconcileUpdatesProvider(t *testing.T) {
 	itp := instancetype.NewProvider("par", nil, nil)
 	resolver := stubResolver{flavors: []instancetype.Flavor{
@@ -47,9 +56,7 @@ func TestReconcileUpdatesProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if result.RequeueAfter != 12*time.Hour {
-		t.Errorf("expected RequeueAfter 12h, got %v", result.RequeueAfter)
-	}
+	withinJitter(t, result.RequeueAfter, 12*time.Hour)
 	if metricstest.Value(t, "karpenter_clevercloud_pricing_last_successful_refresh_timestamp_seconds") == 0 {
 		t.Error("expected the last-successful-refresh gauge to be set")
 	}
@@ -75,9 +82,7 @@ func TestReconcileKeepsLastKnownGoodOnError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile must swallow the error, got %v", err)
 	}
-	if result.RequeueAfter != 30*time.Minute {
-		t.Errorf("expected failure RequeueAfter 30m, got %v", result.RequeueAfter)
-	}
+	withinJitter(t, result.RequeueAfter, 30*time.Minute)
 	if delta := metricstest.Value(t, "karpenter_clevercloud_pricing_refresh_failures_total") - failuresBefore; delta != 1 {
 		t.Errorf("pricing_refresh_failures_total delta = %v, want 1", delta)
 	}
@@ -102,9 +107,7 @@ func TestReconcileEmptyResultKeepsCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if result.RequeueAfter != time.Hour {
-		t.Errorf("expected RequeueAfter 1h, got %v", result.RequeueAfter)
-	}
+	withinJitter(t, result.RequeueAfter, time.Hour)
 	if got := len(itp.List()); got != len(instancetype.DefaultFlavors) {
 		t.Errorf("empty result must keep the catalog (%d), got %d", len(instancetype.DefaultFlavors), got)
 	}
@@ -116,7 +119,5 @@ func TestFailureRequeueNeverExceedsPeriod(t *testing.T) {
 	ctrl := pricing.NewController(stubResolver{err: errors.New("boom")}, itp, 5*time.Minute)
 
 	result, _ := ctrl.Reconcile(context.Background())
-	if result.RequeueAfter != 5*time.Minute {
-		t.Errorf("expected failure requeue capped at the 5m period, got %v", result.RequeueAfter)
-	}
+	withinJitter(t, result.RequeueAfter, 5*time.Minute)
 }
