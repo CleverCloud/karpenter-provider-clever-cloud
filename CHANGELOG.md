@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### ✨ Added
+
+- **`test`: automated integration and end-to-end suites** — the behavioral claims of `docs/E2E-RESULTS.md` stop relying on ad-hoc manual re-validation. `make test-envtest` (now part of PR CI) runs the controllers against a real kube-apiserver: it proves every vendored CRD installs on the targeted Kubernetes version and exercises the admission/finalizer/watch semantics the fake client cannot. `make e2e` runs the full provider against a live CKE cluster — provision, consolidation, drift, both faces of the GC safety net, and quota fast-fail without leaks — with layered cleanup (in-suite plus `hack/e2e-cleanup.sh`) because leaked NodeGroups bill hourly. The e2e stage is deliberately local-only: CKE test clusters are ephemeral and cluster-admin credentials stay out of CI. Setup and semantics in `docs/e2e.md`.
+
 ### 🔄 Changed
 
 - **`fix(pricing)`: the public price API is no longer trusted blindly** — a refresh is now rejected (keeping the last-known-good catalogue) when the currency is not EUR, the RAM countable is not priced per 10⁹ bytes, a node service carries more than one price plan (tiered first-tier-free plans are the platform norm on other services and `price_plans[0]` would read the free tier), a rate is non-positive, or a rate drifts more than an order of magnitude from the built-in defaults. Response bodies are capped at 1 MiB. `NominalGB` stays seed-side by design: the API never exposes sizing — `settings.flavors` is the mitigation for an upstream re-spec.

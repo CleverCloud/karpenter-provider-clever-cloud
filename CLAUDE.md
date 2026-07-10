@@ -11,6 +11,8 @@ A [Karpenter](https://karpenter.sh) cloud provider for Clever Kubernetes Engine 
 ```sh
 make build       # go build -o bin/karpenter-clevercloud ./cmd/controller
 make test        # go test ./pkg/... ./cmd/...
+make test-envtest  # controllers against a real kube-apiserver (setup-envtest downloads binaries)
+make e2e         # full suite against a live CKE cluster (E2E_CONTEXT required — docs/e2e.md)
 make generate    # controller-gen: deepcopy + CleverNodeClass CRD → deploy/crds, then sync into both Helm charts
 make vet         # go vet ./...
 make lint        # golangci-lint v2 (config in .golangci.yml, runs via go run — no install needed)
@@ -88,11 +90,11 @@ Two Helm charts, deliberately overlapping: `charts/karpenter` installs the contr
 
 ## Testing
 
-Unit tests use the controller-runtime fake client (see `pkg/cloudprovider/cloudprovider_test.go` for the pattern: `fake.NewClientBuilder().WithScheme(scheme.Scheme).WithStatusSubresource(&v1alpha1.CleverNodeClass{})`). No envtest/cluster needed. `docs/E2E-RESULTS.md` records validation runs against a live CKE cluster — behavioral claims in the README (provisioning times, quota behavior, measured capacities) come from there.
+Unit tests use the controller-runtime fake client (see `pkg/cloudprovider/cloudprovider_test.go` for the pattern: `fake.NewClientBuilder().WithScheme(scheme.Scheme).WithStatusSubresource(&v1alpha1.CleverNodeClass{})`). No envtest/cluster needed. Two more stages exist (`docs/e2e.md`): `make test-envtest` (`test/envtest/`, runs in PR CI) drives the controllers against a real kube-apiserver and proves the vendored CRDs install; `make e2e` (`test/e2e/`, behind the `e2e` build tag) runs the whole provider against a live CKE cluster and REQUIRES `E2E_CONTEXT` — it creates real hourly-billed VMs, cleans up after itself, and `hack/e2e-cleanup.sh` is the no-controller fallback sweep. The e2e stage is **local-only by policy**: CKE test clusters are ephemeral (destroyed at the end of a working session) and their cluster-admin kubeconfigs must never land in GitHub Actions secrets — do not wire `make e2e` into any workflow. `docs/E2E-RESULTS.md` records the original manual validation runs — behavioral claims in the README (provisioning times, quota behavior, measured capacities) come from there and the e2e wait bounds derive from its timing envelope.
 
 ## CI
 
-PRs run `make vet`, `make build`, `make chart-lint`, a generated-files drift check (`make generate raw-manifest` must produce no diff), `make test`, `go test -race ./pkg/... ./cmd/...`, golangci-lint (`ci-lint.yaml` — same version as `make lint`), and a git-hygiene gate (`git.yaml`: every commit message must be a Conventional Commit, no `fixup!`/`squash!` commits). Pushing a `v*` tag builds the image, pushes it to ghcr.io, and publishes both Helm charts as OCI artifacts to `oci://ghcr.io/<owner>/<repo>/charts/{karpenter,karpenter-crd}` (chart version = tag without the `v` prefix, appVersion = tag — the in-repo `Chart.yaml` versions are placeholders overridden at package time, but the release fails fast if they lag the tag: bump both files and run `make raw-manifest` in the release commit). Commit conventions are documented in CONTRIBUTING.md.
+PRs run `make vet`, `make build`, `make chart-lint`, a generated-files drift check (`make generate raw-manifest` must produce no diff), `make test`, `go test -race ./pkg/... ./cmd/...`, `make test-envtest`, golangci-lint (`ci-lint.yaml` — same version as `make lint`), and a git-hygiene gate (`git.yaml`: every commit message must be a Conventional Commit, no `fixup!`/`squash!` commits). Pushing a `v*` tag builds the image, pushes it to ghcr.io, and publishes both Helm charts as OCI artifacts to `oci://ghcr.io/<owner>/<repo>/charts/{karpenter,karpenter-crd}` (chart version = tag without the `v` prefix, appVersion = tag — the in-repo `Chart.yaml` versions are placeholders overridden at package time, but the release fails fast if they lag the tag: bump both files and run `make raw-manifest` in the release commit). Commit conventions are documented in CONTRIBUTING.md.
 
 ## Operational constraints that shape the code
 
