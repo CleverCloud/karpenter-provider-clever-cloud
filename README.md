@@ -34,8 +34,8 @@ cluster-admin access and `helm`. The step-by-step
 ### From the published charts
 
 Each release publishes the [karpenter-crd](charts/karpenter-crd/README.md) and [karpenter](charts/karpenter/README.md)
-charts to ghcr.io as OCI artifacts, versioned on the release tag without the `v` prefix (release `v0.10.0` → chart
-version `0.10.0`). Install the CRDs first, then the controller — no image settings are needed, the chart pulls the
+charts to ghcr.io as OCI artifacts, versioned on the release tag without the `v` prefix (release `v0.11.0` → chart
+version `0.11.0`). Install the CRDs first, then the controller — no image settings are needed, the chart pulls the
 matching published image by default:
 
 ```
@@ -94,8 +94,8 @@ $ make run
 To build the docker image and push it to your registry, you can use the following commands:
 
 ```
-$ make image IMAGE=<your-registry>/karpenter-clevercloud TAG=v0.10.0
-$ docker push <your-registry>/karpenter-clevercloud:v0.10.0
+$ make image IMAGE=<your-registry>/karpenter-clevercloud TAG=v0.11.0
+$ docker push <your-registry>/karpenter-clevercloud:v0.11.0
 ```
 
 #### From the helm charts
@@ -112,7 +112,7 @@ $ helm upgrade --install karpenter-crd charts/karpenter-crd \
 $ helm upgrade --install karpenter charts/karpenter \
     --namespace karpenter --create-namespace \
     --set image.repository=<your-registry>/karpenter-clevercloud \
-    --set image.tag=v0.10.0 \
+    --set image.tag=v0.11.0 \
     --wait
 ```
 
