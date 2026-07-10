@@ -16,3 +16,5 @@ jobs:
     - run: make test
     - name: Run tests with race detector
       run: go test -race ./pkg/... ./cmd/...
+    - name: Run controller integration tests against a real apiserver (envtest)
+      run: make test-envtest
