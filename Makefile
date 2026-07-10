@@ -1,6 +1,11 @@
 CONTROLLER_GEN_VERSION ?= v0.20.1
 # Keep in sync with the version pinned in .github/workflows/ci-lint.yaml
 GOLANGCI_LINT_VERSION ?= v2.12.2
+# setup-envtest ships with controller-runtime; keep the major.minor in sync
+# with the sigs.k8s.io/controller-runtime version in go.mod.
+SETUP_ENVTEST_VERSION ?= v0.24.1
+# apiserver/etcd binaries used by envtest; tracks the k8s.io/* minor in go.mod
+ENVTEST_K8S_VERSION ?= 1.36.0
 IMAGE ?= ghcr.io/clevercloud/karpenter
 TAG ?= dev
 # Helm chart version derived from TAG (v0.2.0 -> 0.2.0)
@@ -20,6 +25,21 @@ run: build ## Run the controller locally against the current kubeconfig
 .PHONY: test
 test: ## Run unit tests
 	go test ./pkg/... ./cmd/...
+
+.PHONY: test-envtest
+test-envtest: ## Run controller integration tests against a real kube-apiserver (envtest)
+	@# The assignment must be its own statement: a failing $$(...) inside a
+	@# command's env prefix is silently discarded by sh, and the suite would
+	@# skip itself on the resulting empty KUBEBUILDER_ASSETS — a green no-op.
+	assets="$$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) -p path)" && \
+		KUBEBUILDER_ASSETS="$$assets" go test -count=1 ./test/envtest/...
+
+.PHONY: e2e
+e2e: ## Run the e2e suite against a real CKE cluster (requires E2E_CONTEXT; see docs/e2e.md)
+	@# Backstop only — the suite enforces its own deadline (E2E_TIMEOUT) plus
+	@# a cleanup reserve against t.Deadline(); a go test timeout would kill
+	@# the process without running the cleanup that deletes billed VMs.
+	go test -count=1 -v -tags e2e -timeout 90m ./test/e2e/...
 
 .PHONY: generate
 generate: ## Generate deepcopy functions and the CleverNodeClass CRD
