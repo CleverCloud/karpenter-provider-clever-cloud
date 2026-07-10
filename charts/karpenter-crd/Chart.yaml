@@ -4,8 +4,8 @@ description: CustomResourceDefinitions for the Karpenter Clever Cloud provider â
 type: application
 # Placeholder â€” the release workflow overrides version/appVersion at package time from the
 # git tag, and fails the release if these values lag the tag. Bump both in the release commit.
-version: 0.10.0
-appVersion: v0.10.0
+version: 0.11.0
+appVersion: v0.11.0
 keywords:
   - karpenter
   - autoscaling

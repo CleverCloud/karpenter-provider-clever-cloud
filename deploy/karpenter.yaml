@@ -14,10 +14,10 @@ metadata:
   name: karpenter
   namespace: karpenter
   labels:
-    helm.sh/chart: karpenter-0.10.0
+    helm.sh/chart: karpenter-0.11.0
     app.kubernetes.io/name: karpenter
     app.kubernetes.io/instance: karpenter
-    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/version: "v0.11.0"
     app.kubernetes.io/managed-by: Helm
 spec:
   maxUnavailable: 1
@@ -33,10 +33,10 @@ metadata:
   name: karpenter
   namespace: karpenter
   labels:
-    helm.sh/chart: karpenter-0.10.0
+    helm.sh/chart: karpenter-0.11.0
     app.kubernetes.io/name: karpenter
     app.kubernetes.io/instance: karpenter
-    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/version: "v0.11.0"
     app.kubernetes.io/managed-by: Helm
 ---
 # Source: karpenter/templates/clusterrole.yaml
@@ -45,10 +45,10 @@ kind: ClusterRole
 metadata:
   name: karpenter
   labels:
-    helm.sh/chart: karpenter-0.10.0
+    helm.sh/chart: karpenter-0.11.0
     app.kubernetes.io/name: karpenter
     app.kubernetes.io/instance: karpenter
-    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/version: "v0.11.0"
     app.kubernetes.io/managed-by: Helm
 rules:
   # karpenter-core: read
@@ -104,10 +104,10 @@ kind: ClusterRoleBinding
 metadata:
   name: karpenter
   labels:
-    helm.sh/chart: karpenter-0.10.0
+    helm.sh/chart: karpenter-0.11.0
     app.kubernetes.io/name: karpenter
     app.kubernetes.io/instance: karpenter
-    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/version: "v0.11.0"
     app.kubernetes.io/managed-by: Helm
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -125,10 +125,10 @@ metadata:
   name: karpenter
   namespace: karpenter
   labels:
-    helm.sh/chart: karpenter-0.10.0
+    helm.sh/chart: karpenter-0.11.0
     app.kubernetes.io/name: karpenter
     app.kubernetes.io/instance: karpenter
-    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/version: "v0.11.0"
     app.kubernetes.io/managed-by: Helm
 rules:
   # Leader election.
@@ -150,10 +150,10 @@ metadata:
   name: karpenter-lease
   namespace: kube-node-lease
   labels:
-    helm.sh/chart: karpenter-0.10.0
+    helm.sh/chart: karpenter-0.11.0
     app.kubernetes.io/name: karpenter
     app.kubernetes.io/instance: karpenter
-    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/version: "v0.11.0"
     app.kubernetes.io/managed-by: Helm
 rules:
   # Karpenter deletes node leases when finalizing terminated nodes.
@@ -168,10 +168,10 @@ metadata:
   name: karpenter
   namespace: karpenter
   labels:
-    helm.sh/chart: karpenter-0.10.0
+    helm.sh/chart: karpenter-0.11.0
     app.kubernetes.io/name: karpenter
     app.kubernetes.io/instance: karpenter
-    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/version: "v0.11.0"
     app.kubernetes.io/managed-by: Helm
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -189,10 +189,10 @@ metadata:
   name: karpenter-lease
   namespace: kube-node-lease
   labels:
-    helm.sh/chart: karpenter-0.10.0
+    helm.sh/chart: karpenter-0.11.0
     app.kubernetes.io/name: karpenter
     app.kubernetes.io/instance: karpenter
-    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/version: "v0.11.0"
     app.kubernetes.io/managed-by: Helm
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -210,10 +210,10 @@ metadata:
   name: karpenter
   namespace: karpenter
   labels:
-    helm.sh/chart: karpenter-0.10.0
+    helm.sh/chart: karpenter-0.11.0
     app.kubernetes.io/name: karpenter
     app.kubernetes.io/instance: karpenter
-    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/version: "v0.11.0"
     app.kubernetes.io/managed-by: Helm
 spec:
   type: ClusterIP
@@ -233,10 +233,10 @@ metadata:
   name: karpenter
   namespace: karpenter
   labels:
-    helm.sh/chart: karpenter-0.10.0
+    helm.sh/chart: karpenter-0.11.0
     app.kubernetes.io/name: karpenter
     app.kubernetes.io/instance: karpenter
-    app.kubernetes.io/version: "v0.10.0"
+    app.kubernetes.io/version: "v0.11.0"
     app.kubernetes.io/managed-by: Helm
 spec:
   replicas: 1
@@ -259,7 +259,7 @@ spec:
         clever-cloud.com/cluster-node-role: control-plane
       containers:
         - name: controller
-          image: ghcr.io/clevercloud/karpenter:v0.10.0
+          image: ghcr.io/clevercloud/karpenter:v0.11.0
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 65532
