@@ -29,6 +29,26 @@ jobs:
             fi
           done
           exit $rc
+      # A tag push runs none of the PR workflows (they trigger on branches and
+      # pull_request only), so without this the publish had no test, lint or
+      # generated-files gate at all — the very check whose failure message tells
+      # maintainers to run `make raw-manifest`. `needs:` cannot reach across
+      # workflow files, so the gate lives here.
+      - uses: ./.github/actions/install-deps
+      - name: Gate the release on the same checks pull requests run
+        run: |
+          make vet
+          make build
+          make chart-lint
+          make test-chart
+          make test
+          make test-envtest
+          make generate raw-manifest
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Generated files are out of date at this tag. Run 'make generate raw-manifest' and re-tag."
+            git diff
+            exit 1
+          fi
       - name: Log in to GitHub Container Registry
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
