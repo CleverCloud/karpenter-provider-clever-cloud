@@ -10,6 +10,8 @@
 
 - **`fix(charts)`: default tolerations** — the controller now tolerates `node-role.kubernetes.io/control-plane:NoSchedule`. No CKE node role is tainted today, so this is a no-op; it is shipped so that a topology which starts tainting the only nodes the controller could run on cannot reproduce the same silent-`Pending` failure. It grants no access to Karpenter-managed nodes, which are excluded by affinity rather than by a taint.
 
+- **`fix(test,examples)`: the e2e suite and the example workloads no longer assume `ALL_IN_ONE`** — both selected `clever-cloud.com/cluster-node-role: worker` to keep pods off pre-existing capacity. That only works where the sole non-Karpenter node is the control plane; on `DEDICATED_COMPUTE`/`DISTRIBUTED` the pre-existing pool is worker nodes too, so pods landed on it, no NodeClaim was created, and the suite failed on a healthy cluster while the examples silently demonstrated nothing. Both now require `karpenter.sh/nodepool` to **exist** — the exact dual of the chart rule.
+
 ## 0.11.0 - 2026-07-10
 
 Pre-GA hardening: this release makes the provider loud and provable. Every known failure path — quota races, vanished NodeGroups, the public pricing API, a broken flavors file, a flavor leaving the catalogue — now degrades locally with a metric and an event instead of failing silently or cluster-wide; destructive garbage collection requires proof of ownership; and the behavioral claims are continuously verified by an envtest stage in PR CI plus a local end-to-end suite automating the live-cluster campaigns. Built on karpenter-core 1.13.
