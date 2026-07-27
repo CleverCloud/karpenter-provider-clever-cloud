@@ -255,8 +255,17 @@ spec:
       securityContext:
         fsGroup: 65532
       priorityClassName: "system-cluster-critical"
-      nodeSelector:
-        clever-cloud.com/cluster-node-role: control-plane
+      tolerations:
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/control-plane
+          operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: karpenter.sh/nodepool
+                operator: DoesNotExist
       containers:
         - name: controller
           image: ghcr.io/clevercloud/karpenter:v0.11.0

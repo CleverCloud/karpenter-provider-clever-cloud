@@ -36,7 +36,9 @@ helm upgrade --install karpenter \
 
 No image settings are needed: the chart's `appVersion` pins the matching published image (`ghcr.io/clevercloud/karpenter:v<version>`).
 
-The controller is pinned to control-plane nodes by default (`nodeSelector: clever-cloud.com/cluster-node-role: control-plane`) — Karpenter must never run on a node it can deprovision, and CKE control-plane nodes are schedulable. See [the chart values](../../charts/karpenter/README.md) for everything you can tune.
+Karpenter must never run on a node it can deprovision, or it can delete the node it is running on. The chart enforces that with a required node affinity on `karpenter.sh/nodepool` **DoesNotExist**: Karpenter stamps that label on every node it provisions and on no other, so the controller lands on whatever capacity the cluster already has — a schedulable control-plane node on `ALL_IN_ONE`, a node from the pre-existing pool on `DEDICATED_COMPUTE` and `DISTRIBUTED`, where the control plane runs outside the cluster and no node carries a control-plane role. The rule names no topology on purpose, so it keeps holding as CKE adds them.
+
+Set `nodeSelector` to pin the controller further (it is ANDed with the affinity, so it can only narrow placement). Replacing `affinity` removes the guarantee. See [the chart values](../../charts/karpenter/README.md) for everything you can tune.
 
 > **Warning:** Do not enable CKE's own `autoscalingEnabled` on the cluster alongside this provider — two autoscalers will fight over the same NodeGroups.
 

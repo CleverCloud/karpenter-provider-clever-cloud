@@ -39,13 +39,47 @@ podDisruptionBudget:
 
 priorityClassName: system-cluster-critical
 
-# -- The controller must run on nodes Karpenter does not manage; CKE
-# control-plane nodes are schedulable and fit that role.
-nodeSelector:
-  clever-cloud.com/cluster-node-role: control-plane
+# -- Extra node selector for the controller pod. Empty by default: the
+# placement guarantee lives in `affinity` below, which holds on every CKE
+# topology. Anything set here is ANDed with that affinity, so it can only
+# narrow placement further — never widen it onto Karpenter-managed nodes.
+nodeSelector: {}
 
-tolerations: []
-affinity: {}
+# -- Tolerations for the controller pod. No CKE node role carries a taint
+# today, so the entry below is a no-op; it is shipped so that a topology which
+# starts tainting the only nodes the controller could run on does not silently
+# strand it in Pending. It grants no access to Karpenter-managed nodes: those
+# are excluded by `affinity`, not by a taint.
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+
+# -- Affinity for the controller pod. The default encodes the one rule that
+# must never be weakened: Karpenter must not run on capacity it can itself
+# deprovision, or it can delete the node it is running on.
+#
+# karpenter-core stamps `karpenter.sh/nodepool` on every node it provisions, so
+# requiring that label to be ABSENT selects exactly the nodes Karpenter does
+# not manage — on ALL_IN_ONE (where the control plane is an in-cluster node),
+# on DEDICATED_COMPUTE and DISTRIBUTED (where it is not and only worker nodes
+# exist), and on any topology added later. The rule deliberately names no
+# topology: enumerating them is the same bug deferred to the next one.
+#
+# The brief window before karpenter-core stamps the label on a brand-new node
+# is closed by the `karpenter.sh/unregistered:NoExecute` taint the provider
+# puts on every NodeGroup it creates, which this pod does not tolerate.
+#
+# Overriding this value removes the guarantee — narrow it with `nodeSelector`
+# instead.
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: karpenter.sh/nodepool
+              operator: DoesNotExist
+
 topologySpreadConstraints: []
 
 controller:

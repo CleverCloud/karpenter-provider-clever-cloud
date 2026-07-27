@@ -100,5 +100,5 @@ PRs run `make vet`, `make build`, `make chart-lint`, a generated-files drift che
 
 - Org quota defaults to 40 vCPU / 40 GB RAM **including the control plane**; quota rejections are normal operation, not errors.
 - Provisioning takes ~40–90 s; deletion ~40 s.
-- The controller must run on nodes karpenter does not manage — both the Helm chart and `deploy/karpenter.yaml` pin it to control-plane nodes.
+- The controller must run on nodes karpenter does not manage. The chart (and the `deploy/karpenter.yaml` generated from it) enforces that with a required node affinity on `karpenter.sh/nodepool` **DoesNotExist** — karpenter-core stamps that label on every node it provisions and on no other, so the rule holds on `ALL_IN_ONE` (schedulable in-cluster control-plane node), on `DEDICATED_COMPUTE`/`DISTRIBUTED` (control plane outside the cluster, only worker nodes) and on any topology added later. Never re-encode a specific topology's node label as a default: `clever-cloud.com/cluster-node-role: control-plane` was that bug, and `test/chart` fails if it comes back.
 - Don't enable CKE's own `autoscalingEnabled` alongside this provider (two autoscalers fighting).

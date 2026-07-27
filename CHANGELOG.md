@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### 🔄 Changed
+
+- **`fix(charts)`: the controller is schedulable on every CKE topology, not just `ALL_IN_ONE`** — the chart pinned the controller with `nodeSelector: clever-cloud.com/cluster-node-role: control-plane`. That label only exists on `ALL_IN_ONE`, where the control plane is made of in-cluster nodes. On `DEDICATED_COMPUTE` and `DISTRIBUTED` the control plane runs on VMs outside the cluster and every node is a worker, so **no node ever matched**: `helm install` reported success, every object was created, and the controller sat `Pending` forever while nothing was ever provisioned — silently, on two of the three topologies. The default is now `nodeSelector: {}` plus a required node affinity on `karpenter.sh/nodepool` **DoesNotExist**. karpenter-core stamps that label on every node it provisions and on no other, so the placement guarantee that motivated the original selector — *never run on capacity Karpenter can deprovision* — is preserved verbatim while naming no topology, and therefore keeps holding for topologies added later. A `karpenter.sh/unregistered:NoExecute` toleration is deliberately **not** granted, so the brief pre-registration window stays closed. `test/chart` (`make test-chart`, wired into PR CI) fails if a topology-specific node label comes back as a chart default.
+
+  ⚠️ **Behaviour change for existing installs.** On `ALL_IN_ONE` the controller pod is recreated and may move off the control-plane node onto any other node Karpenter does not manage. Nothing is *relying* on control-plane pinning for correctness — the invariant was always "not on Karpenter's own nodes", and the new rule states exactly that — but if you deliberately want the controller on control-plane nodes (co-location with the API server, a dedicated maintenance window), set it back explicitly: `--set nodeSelector."clever-cloud\.com/cluster-node-role"=control-plane`. That still ANDs with the affinity, so the guarantee is not weakened.
+
+- **`fix(charts)`: default tolerations** — the controller now tolerates `node-role.kubernetes.io/control-plane:NoSchedule`. No CKE node role is tainted today, so this is a no-op; it is shipped so that a topology which starts tainting the only nodes the controller could run on cannot reproduce the same silent-`Pending` failure. It grants no access to Karpenter-managed nodes, which are excluded by affinity rather than by a taint.
+
 ## 0.11.0 - 2026-07-10
 
 Pre-GA hardening: this release makes the provider loud and provable. Every known failure path — quota races, vanished NodeGroups, the public pricing API, a broken flavors file, a flavor leaving the catalogue — now degrades locally with a metric and an event instead of failing silently or cluster-wide; destructive garbage collection requires proof of ownership; and the behavioral claims are continuously verified by an envtest stage in PR CI plus a local end-to-end suite automating the live-cluster campaigns. Built on karpenter-core 1.13.
