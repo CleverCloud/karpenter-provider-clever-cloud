@@ -384,31 +384,43 @@ func testQuotaFastFail(t *testing.T, ctx context.Context, f *framework) {
 	if err := f.client.Create(ctx, f.nodePool(poolName, poolName, []string{"XL"}, "400")); err != nil {
 		t.Fatalf("creating nodepool: %v", err)
 	}
+	// Baseline BEFORE the workload exists. quota_rejections_total is a
+	// process-lifetime counter and the scenarios share one controller, so an
+	// earlier scenario touching the org quota — normal operation near the
+	// ceiling, and exactly what this suite runs at — would satisfy a `>= 1`
+	// wait instantly, at t=0, before the ReplicaSet has created a single pod.
+	// The assertion below would then read 0/0 and fail on a healthy cluster.
+	// Assert on the delta, the way the unit tests do via pkg/metrics/metricstest.
+	rejectionsBefore := f.metric("karpenter_clevercloud_nodegroup_quota_rejections_total")
 	if err := f.client.Create(ctx, f.deployment("quota-inflate", 4, "1", "1Gi", true)); err != nil {
 		t.Fatalf("creating deployment: %v", err)
 	}
 
 	f.eventually(ctx, 10*time.Minute, "quota rejection surfaced", func(ctx context.Context) (bool, string) {
-		if f.metric("karpenter_clevercloud_nodegroup_quota_rejections_total") >= 1 {
+		now := f.metric("karpenter_clevercloud_nodegroup_quota_rejections_total")
+		if now > rejectionsBefore {
 			return true, ""
 		}
-		return false, "quota_rejections_total still 0"
+		return false, fmt.Sprintf("quota_rejections_total still %v (baseline %v)", now, rejectionsBefore)
 	})
 
-	pods := &corev1.PodList{}
-	if err := f.client.List(ctx, pods, client.InNamespace(f.namespace), client.MatchingLabels{"app": "quota-inflate"}); err != nil {
-		t.Fatalf("listing quota pods: %v", err)
-	}
-	pending := 0
-	for _, p := range pods.Items {
-		if p.Status.Phase == corev1.PodPending {
-			pending++
+	// Poll the pod list rather than reading it once: the rejection can surface
+	// before every replica has been created, and a single read would race it.
+	var pending, total int
+	f.eventually(ctx, 2*time.Minute, "a pod parked Pending by the quota", func(ctx context.Context) (bool, string) {
+		pods := &corev1.PodList{}
+		if err := f.client.List(ctx, pods, client.InNamespace(f.namespace), client.MatchingLabels{"app": "quota-inflate"}); err != nil {
+			return false, fmt.Sprintf("listing quota pods: %v", err)
 		}
-	}
-	if pending == 0 {
-		t.Error("expected at least one pod parked Pending by the quota")
-	}
-	t.Logf("quota scenario: %d/%d pods Pending after rejection", pending, len(pods.Items))
+		pending, total = 0, len(pods.Items)
+		for _, p := range pods.Items {
+			if p.Status.Phase == corev1.PodPending {
+				pending++
+			}
+		}
+		return pending > 0, fmt.Sprintf("%d/%d pods Pending", pending, total)
+	})
+	t.Logf("quota scenario: %d/%d pods Pending after rejection", pending, total)
 
 	// The whole point of the fast-fail path: once the pressure is gone, no
 	// NodeGroup may survive the rejection churn.
