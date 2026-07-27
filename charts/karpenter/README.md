@@ -64,7 +64,7 @@ kubectl apply -f examples/v1/general-purpose.yaml
 | `settings.featureGates.nodeRepair` | `false` | Enable node auto-repair |
 | `settings.flavors` | `[]` | Per-flavor overrides overlaid on the base catalogue (`name` required; `cpu`/`memoryKi`/`priceHourly` optional). Empty = base catalogue unchanged. Mounted via a ConfigMap; always win and re-applied after every dynamic refresh |
 | `settings.pricing.enabled` | `true` | Background refresher pulling CKE prices/flavors from Clever Cloud's public API. Enabled by default; requires egress to `apiURL` (TCP 443). Set `false` to keep the controller fully in-cluster |
-| `settings.pricing.refreshPeriod` / `apiURL` / `topology` | `12h` / `https://api.clever-cloud.com` / `DISTRIBUTED` | Refresh interval, API base URL (override for proxy/testing), and CKE topology whose flavor list is used |
+| `settings.pricing.refreshPeriod` / `apiURL` / `topology` | `12h` / `https://api.clever-cloud.com` / `""` | Refresh interval, API base URL (override for proxy/testing), and an OPTIONAL restriction of the catalogue to one CKE topology (empty = union of all, the default) |
 | `settings.pricing.kubernetesProductURL` / `priceSystemURL` | `""` / `""` | Optional full-URL override per endpoint (default: `apiURL` + standard path); set only if the two APIs live at different hosts/paths |
 | `controller.resources` | 200m/256Mi, limit 512Mi | Controller container resources |
 | `controller.env` | `[]` | Extra environment variables |

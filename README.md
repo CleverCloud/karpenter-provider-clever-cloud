@@ -155,7 +155,7 @@ The controller is configured through environment variables, all set by the helm 
 | `PRICING_API_URL`         | `String`   | `https://api.clever-cloud.com` | no | Base URL of the Clever Cloud public API, used for both endpoints (override for a proxy or testing) |
 | `PRICING_PRODUCT_URL`     | `String`   | _(derived from `PRICING_API_URL`)_ | no | Full URL of the `kubernetes-product` endpoint; overrides the base for this endpoint only |
 | `PRICING_PRICE_SYSTEM_URL`| `String`   | _(derived from `PRICING_API_URL`)_ | no | Full URL of the `billing/price-system` endpoint; overrides the base for this endpoint only |
-| `CLEVER_CLOUD_TOPOLOGY`   | `String`   | `DISTRIBUTED`      | no       | CKE topology whose available-flavor list is fetched |
+| `CLEVER_CLOUD_TOPOLOGY`   | `String`   | _(unset)_          | no       | Optionally restrict the flavor catalogue to one CKE topology; unset takes the union of all |
 
 ### Flavor catalogue
 
@@ -190,8 +190,11 @@ API at `PRICING_API_URL` for:
 
 - the per-resource rates (`/v4/billing/price-system`, keyed by `zone_id = CLEVER_CLOUD_REGION`),
   from which per-flavor prices are recomputed; and
-- the available-flavor list for `CLEVER_CLOUD_TOPOLOGY` (`/v4/kubernetes-product`), which drives
-  which flavors are offered.
+- the available-flavor list (`/v4/kubernetes-product`), which drives which flavors are offered.
+  By default this is the **union of every topology's** list. The per-topology lists are a product
+  listing rather than an admission rule — a NodeGroup asking for a flavor its own topology does not
+  advertise is provisioned anyway — so restricting to one topology could only shrink a working
+  catalogue. Set `CLEVER_CLOUD_TOPOLOGY` only if you deliberately want that restriction.
 
 Both endpoints default to `PRICING_API_URL` + their standard path. You can point them elsewhere with
 `settings.pricing.apiURL` (base, shared) or, if the two APIs must live at different hosts/paths, override

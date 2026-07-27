@@ -120,8 +120,10 @@ spec:
             - name: PRICING_PRICE_SYSTEM_URL
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.settings.pricing.topology }}
             - name: CLEVER_CLOUD_TOPOLOGY
-              value: {{ .Values.settings.pricing.topology | quote }}
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             - name: MEMORY_LIMIT
               valueFrom:

@@ -64,14 +64,14 @@ Flavor catalog (2XS…XL) with EUR/hour prices. The catalog served by `List()` i
 
 ### Pricing (pkg/providers/pricing)
 
-Resolves the catalog from Clever Cloud's public, token-less API: `/v4/kubernetes-product` gives flavor **names** per topology (no sizing), `/v4/billing/price-system?zone_id=<region>` gives the per-vCPU and per-nominal-GB **rates**. `Resolve` combines live names ∩ `SizingByName` × live rates into `[]instancetype.Flavor` (a named flavor without a sizing seed is skipped — the API never exposes cpu/memory). Any fetch/parse error, missing rate, unknown topology, or empty result returns an error so the controller keeps the last-known-good catalog.
+Resolves the catalog from Clever Cloud's public, token-less API: `/v4/kubernetes-product` gives flavor **names** per topology (no sizing), `/v4/billing/price-system?zone_id=<region>` gives the per-vCPU and per-nominal-GB **rates**. `CLEVER_CLOUD_TOPOLOGY` is an **optional restriction**: unset (the default) takes the union of every topology's names, because the per-topology lists are advisory — a flavor outside a cluster's own topology provisions fine (measured). An explicitly configured topology that does not exist fails every refresh rather than degrading quietly. `Resolve` combines live names ∩ `SizingByName` × live rates into `[]instancetype.Flavor` (a named flavor without a sizing seed is skipped — the API never exposes cpu/memory). Any fetch/parse error, missing rate, unknown topology, or empty result returns an error so the controller keeps the last-known-good catalog.
 
 ### NodeGroup lifecycle & quota (pkg/providers/nodegroup)
 
 `Create` is deliberately conservative because the CKE beta quota engine misbehaves under concurrency (leaked reservations were observed during testing):
 
 1. All creations are **serialized** through `createMu`.
-2. After creating, it polls up to 15s for the upstream operator to accept (`Synced`) or reject (`QuotaExceeded`) the group. Timeout = optimistic success (karpenter's 15-min registration TTL is the backstop).
+2. After creating, it polls up to 15s for the upstream operator to accept (`Synced`) or refuse the group. A refusal is terminal whatever its reason: `QuotaExceeded` returns `ErrQuotaExceeded`, any other `ReconcileFailed` returns `ErrFlavorRejected` (which additionally holds that flavor out of `resolveInstanceType` for 5 min, since karpenter-core keeps no per-offering memory of an `InsufficientCapacityError`). Both free the reservation, and a failure to free it never downgrades the refusal to success. Timeout = optimistic success (karpenter's 15-min registration TTL is the backstop).
 3. On quota rejection: the NodeGroup is deleted immediately (frees the reservation), a **1-minute backoff** fails subsequent creates fast, and `ErrQuotaExceeded` is returned — which `cloudprovider.Create` maps to karpenter's `InsufficientCapacityError` so the scheduler relaxes to other options instead of waiting out the TTL.
 4. Any `Delete` clears the backoff (freed capacity).
 

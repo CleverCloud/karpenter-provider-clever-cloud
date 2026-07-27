@@ -149,9 +149,16 @@ settings:
     # them separately); leave empty to derive both from `apiURL`.
     kubernetesProductURL: ""
     priceSystemURL: ""
-    # -- CKE topology whose available-flavor list is fetched (e.g. DISTRIBUTED,
-    # DEDICATED_COMPUTE, ALL_IN_ONE).
-    topology: DISTRIBUTED
+    # -- OPTIONAL restriction of the flavor catalogue to one CKE topology
+    # (`DISTRIBUTED`, `DEDICATED_COMPUTE`, `ALL_IN_ONE`). Leave empty — the
+    # default — to take the UNION of every topology's flavor list, which is what
+    # a cluster can actually provision: the per-topology lists are a product
+    # listing, not an admission rule (a NodeGroup asking for a flavor its own
+    # topology does not advertise is provisioned anyway). Setting this can only
+    # ever shrink a working catalogue, and a topology CKE adds later enters the
+    # catalogue on its own while this is empty. A value that does not exist
+    # upstream fails every refresh loudly rather than degrading quietly.
+    topology: ""
 
 service:
   # -- Expose the metrics endpoint through a ClusterIP service.

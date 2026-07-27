@@ -44,9 +44,24 @@ import (
 const (
 	// DefaultBaseURL is the public Clever Cloud API root.
 	DefaultBaseURL = "https://api.clever-cloud.com"
-	// DefaultTopology is the CKE topology whose available-flavor list is used
-	// (DISTRIBUTED exposes the full 2XS…XL set).
-	DefaultTopology = "DISTRIBUTED"
+	// TopologyAll is the default: take the union of every topology's
+	// available-flavor list rather than one topology's.
+	//
+	// The per-topology lists are a product listing, not an admission rule — a
+	// NodeGroup asking for a flavor the cluster's own topology does not
+	// advertise is provisioned anyway (measured: 2XS on an ALL_IN_ONE cluster,
+	// which advertises only S…XL). Pinning one topology therefore could only
+	// ever SHRINK a working catalogue, and getting it wrong — the old default
+	// was DISTRIBUTED, which is wrong on two of the three topologies — silently
+	// dropped flavors that work. Taking the union removes a mandatory
+	// per-cluster setting nobody can derive, and a topology CKE adds later
+	// enters the catalogue on its own.
+	//
+	// This is only safe because an upstream refusal is now terminal: if the
+	// platform ever does enforce the lists, Create fails fast with
+	// ErrFlavorRejected and the flavor is held out of provisioning, instead of
+	// looping on it every registration TTL.
+	TopologyAll = ""
 
 	productPath     = "/v4/kubernetes-product"
 	priceSystemPath = "/v4/billing/price-system"
@@ -116,6 +131,9 @@ type rates struct {
 // endpoints; ProductURL and PriceSystemURL optionally override the full URL of
 // an individual endpoint (each defaults to BaseURL + its standard path), so the
 // two public APIs can be pointed at different hosts, a proxy, or a mock.
+// Topology is OPTIONAL: empty (TopologyAll) takes the union of every topology's
+// flavor list, which is what a cluster can actually provision; set it only to
+// deliberately restrict the catalogue.
 type Options struct {
 	BaseURL        string
 	ProductURL     string
@@ -143,10 +161,6 @@ func NewProvider(opts Options) *Provider {
 		base = DefaultBaseURL
 	}
 	base = strings.TrimRight(base, "/")
-	topology := opts.Topology
-	if topology == "" {
-		topology = DefaultTopology
-	}
 	productURL := opts.ProductURL
 	if productURL == "" {
 		productURL = base + productPath
@@ -159,16 +173,18 @@ func NewProvider(opts Options) *Provider {
 		productURL:     productURL,
 		priceSystemURL: priceSystemURL,
 		region:         opts.Region,
-		topology:       topology,
+		topology:       opts.Topology,
 		client:         &http.Client{Timeout: httpTimeout},
 	}
 }
 
 // Resolve fetches the live available-flavor list and per-resource rates and
-// returns a freshly priced catalog. Flavors offered by the API but absent from
-// the static sizing seed are skipped with a warning. Any fetch/parse failure,
-// a missing rate, an unknown topology, or an empty result returns an error so
-// the caller keeps its last-known-good catalog.
+// returns a freshly priced catalog. With no topology configured (the default)
+// the flavor list is the union of every topology's, which is what a cluster can
+// actually provision. Flavors offered by the API but absent from the static
+// sizing seed are skipped with a warning. Any fetch/parse failure, a missing
+// rate, an explicitly configured topology that does not exist, or an empty
+// result returns an error so the caller keeps its last-known-good catalog.
 func (p *Provider) Resolve(ctx context.Context) ([]instancetype.Flavor, error) {
 	logger := log.FromContext(ctx).WithName("pricing")
 
@@ -242,12 +258,35 @@ func (p *Provider) getJSON(ctx context.Context, rawURL string, query url.Values,
 	return nil
 }
 
+// flavorsForTopology returns the flavors of one topology, or the union of every
+// topology when none is requested. The union is deterministic: topologies and
+// flavors keep the order the API returned them in, first occurrence wins.
 func flavorsForTopology(product *kubernetesProduct, topology string) ([]string, error) {
+	if topology == TopologyAll {
+		var union []string
+		seen := map[string]struct{}{}
+		for _, t := range product.Topologies {
+			for _, f := range t.AvailableFlavors {
+				if _, dup := seen[f]; dup {
+					continue
+				}
+				seen[f] = struct{}{}
+				union = append(union, f)
+			}
+		}
+		if len(union) == 0 {
+			return nil, fmt.Errorf("kubernetes-product exposes no flavors in any topology")
+		}
+		return union, nil
+	}
 	for _, t := range product.Topologies {
 		if t.Topology == topology {
 			return t.AvailableFlavors, nil
 		}
 	}
+	// An explicit topology that does not exist is a configuration error, not a
+	// reason to serve a narrower catalogue: fail so the last-known-good one
+	// stays in use and pricing_refresh_failures_total moves.
 	return nil, fmt.Errorf("topology %q not found in kubernetes-product", topology)
 }
 

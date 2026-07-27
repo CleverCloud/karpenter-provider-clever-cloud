@@ -309,8 +309,6 @@ spec:
               value: "12h"
             - name: PRICING_API_URL
               value: "https://api.clever-cloud.com"
-            - name: CLEVER_CLOUD_TOPOLOGY
-              value: "DISTRIBUTED"
             - name: MEMORY_LIMIT
               valueFrom:
                 resourceFieldRef:

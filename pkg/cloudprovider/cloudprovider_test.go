@@ -641,6 +641,8 @@ func TestIsDriftedIgnoresForeignHashVersions(t *testing.T) {
 					"every node in the fleet on a controller upgrade", reason)
 			}
 		})
+	}
+}
 
 // markRefused simulates the Clever Cloud operator refusing the NodeGroup for a
 // reason that is not the organisation quota.
