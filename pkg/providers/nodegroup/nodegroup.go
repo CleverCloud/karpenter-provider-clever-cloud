@@ -76,6 +76,27 @@ func (e *ErrQuotaExceeded) Error() string {
 	return fmt.Sprintf("clever cloud quota exceeded: %s", e.Message)
 }
 
+// ErrFlavorRejected is returned by Create when the upstream operator refuses
+// the NodeGroup for a reason that is not the organisation quota — a flavor the
+// cluster cannot provision, a spec it will not accept. It is terminal: waiting
+// for a group the operator has already refused only burns karpenter's
+// registration TTL, and retrying the same flavor reproduces it.
+type ErrFlavorRejected struct {
+	Flavor  string
+	Reason  string
+	Message string
+}
+
+func (e *ErrFlavorRejected) Error() string {
+	return fmt.Sprintf("clever cloud refused flavor %s (%s): %s", e.Flavor, e.Reason, e.Message)
+}
+
+// flavorBackoff is how long a flavor stays out of the catalogue after the
+// upstream operator refused it. Long enough that karpenter re-plans onto
+// another flavor instead of looping on the refused one, short enough that a
+// transient refusal or a platform-side fix is picked up without a restart.
+const flavorBackoff = 5 * time.Minute
+
 // Provider performs CRUD operations on Clever Cloud NodeGroups.
 type Provider struct {
 	kubeClient client.Client
@@ -90,6 +111,11 @@ type Provider struct {
 	mu              sync.Mutex
 	quotaRejectedAt time.Time
 	quotaMessage    string
+	// rejectedFlavors remembers, per flavor, when the upstream operator last
+	// refused it for a non-quota reason. Without it the scheduler re-picks the
+	// cheapest flavor immediately and loops: karpenter-core keeps no
+	// per-offering memory of an InsufficientCapacityError.
+	rejectedFlavors map[string]time.Time
 }
 
 func NewProvider(kubeClient client.Client, recorder events.Recorder) *Provider {
@@ -109,6 +135,38 @@ func (p *Provider) recordQuotaRejection(message string) {
 	defer p.mu.Unlock()
 	p.quotaRejectedAt = time.Now()
 	p.quotaMessage = message
+}
+
+// RejectedFlavors returns the flavors currently held out of provisioning
+// because the upstream operator refused them. The cloud provider filters them
+// out when resolving an instance type, so the scheduler relaxes to another
+// flavor instead of retrying the refused one.
+func (p *Provider) RejectedFlavors() map[string]struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := map[string]struct{}{}
+	for flavor, at := range p.rejectedFlavors {
+		if time.Since(at) < flavorBackoff {
+			out[flavor] = struct{}{}
+		}
+	}
+	return out
+}
+
+func (p *Provider) recordFlavorRejection(flavor string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.rejectedFlavors == nil {
+		p.rejectedFlavors = map[string]time.Time{}
+	}
+	p.rejectedFlavors[flavor] = time.Now()
+}
+
+// clearFlavorRejection forgets a refusal as soon as the same flavor succeeds.
+func (p *Provider) clearFlavorRejection(flavor string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.rejectedFlavors, flavor)
 }
 
 func (p *Provider) clearQuotaRejection() {
@@ -224,6 +282,23 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 		if errors.As(err, &quotaErr) {
 			p.publishQuotaEvent(nodeClaim, err)
 		}
+		rejectedErr := &ErrFlavorRejected{}
+		if errors.As(err, &rejectedErr) {
+			// Hold the flavor out of provisioning for a short window:
+			// karpenter-core keeps no per-offering memory of an
+			// InsufficientCapacityError, so without this the scheduler
+			// re-picks the cheapest flavor immediately and loops on the one
+			// that was just refused.
+			p.recordFlavorRejection(rejectedErr.Flavor)
+			p.recorder.Publish(events.Event{
+				InvolvedObject: nodeClaim,
+				Type:           corev1.EventTypeWarning,
+				Reason:         "NodeGroupRejected",
+				Message: fmt.Sprintf("Clever Cloud refused flavor %s (%s): %s — holding that flavor out of provisioning for %s so the scheduler relaxes to another one",
+					rejectedErr.Flavor, rejectedErr.Reason, rejectedErr.Message, flavorBackoff),
+				DedupeValues: []string{nodeClaim.Name},
+			})
+		}
 		if errors.Is(err, ErrNodeGroupVanished) {
 			metrics.NodeGroupVanished.Inc(nil)
 			// The documented cause is the quota engine reclaiming an accepted
@@ -239,6 +314,13 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 			})
 		}
 		return nil, err
+	}
+	if synced {
+		// ng.Spec.Flavor, not the requested flavor: on the AlreadyExists
+		// adoption path the group that was actually accepted can carry a
+		// different one, and releasing the hold on the wrong flavor would both
+		// keep a usable flavor out and let a refused one back in.
+		p.clearFlavorRejection(ng.Spec.Flavor)
 	}
 	if !synced {
 		// Optimistic-launch path: today the only signal that the operator
@@ -319,6 +401,28 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bo
 				return false, fmt.Errorf("cleaning up quota-rejected nodegroup, %w", err)
 			}
 			return false, &ErrQuotaExceeded{Message: msg}
+		}
+		// Any other ReconcileFailed is a refusal too. Previously it was
+		// indistinguishable from "still reconciling": the poll timed out, Create
+		// reported optimistic success, and the launch burned the full 15-minute
+		// registration TTL before karpenter re-planned — onto the same flavor,
+		// forever, with the operator's own explanation never surfaced anywhere.
+		if reason, message, failed := ng.ReconcileFailure(); failed {
+			metrics.NodeGroupRejections.Inc(nil)
+			// Free the refused reservation, exactly as the quota branch does —
+			// but never let its failure replace the refusal. This Delete runs on
+			// the poll's own 15s context, so a refusal observed late enough
+			// would fail it with a wrapped context.DeadlineExceeded;
+			// wait.Interrupted would then match, waitForAcceptance would return
+			// (false, nil), and Create would report optimistic success for a
+			// group the operator has already refused — the exact 15-minute TTL
+			// burn this branch exists to prevent. The typed error wins; the
+			// leftover group is reclaimed by the GC sweep.
+			if err := p.kubeClient.Delete(ctx, &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: name}}); err != nil && !apierrors.IsNotFound(err) {
+				log.FromContext(ctx).WithValues("NodeGroup", name).Error(err,
+					"could not delete the refused nodegroup; the garbage collector will reclaim it")
+			}
+			return false, &ErrFlavorRejected{Flavor: ng.Spec.Flavor, Reason: reason, Message: message}
 		}
 		return ng.IsSynced(), nil
 	})

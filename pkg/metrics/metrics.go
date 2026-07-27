@@ -75,6 +75,23 @@ var (
 		nil,
 	)
 
+	// NodeGroupRejections is the number of NodeGroup creations the upstream
+	// operator refused for a reason that is NOT the organisation quota — a
+	// flavor the cluster cannot provision, a spec it will not accept. Unlike a
+	// quota rejection these are not normal operation: the request was
+	// well-formed as far as this provider knows, and the flavor is held out of
+	// provisioning for a few minutes so the scheduler relaxes to another one.
+	NodeGroupRejections = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "nodegroup",
+			Name:      "rejections_total",
+			Help:      "NodeGroup creations refused by the node-group operator for a non-quota reason. The refused flavor is held out of provisioning briefly.",
+		},
+		nil,
+	)
+
 	// NodeGroupExternalResizes is the number of managed NodeGroups whose
 	// nodeCount is not 1 — something outside this provider resized them (the
 	// platform's alert-driven scaler through the inherited autoscalingEnabled
@@ -188,6 +205,7 @@ var (
 func init() {
 	NodeGroupAcceptanceTimeouts.Add(0, nil)
 	NodeGroupQuotaRejections.Add(0, nil)
+	NodeGroupRejections.Add(0, nil)
 	NodeGroupVanished.Add(0, nil)
 	NodeGroupExternalResizes.Set(0, nil)
 	FlavorsConfigInvalid.Set(0, nil)

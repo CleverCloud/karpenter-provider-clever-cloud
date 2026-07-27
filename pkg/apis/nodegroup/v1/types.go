@@ -134,6 +134,20 @@ func (in *NodeGroup) IsQuotaExceeded() bool {
 	return false
 }
 
+// ReconcileFailure returns the reason and message of a ReconcileFailed=True
+// condition, and whether one is present. Quota rejections are one reason among
+// several: a flavor the cluster cannot provision, a spec the operator refuses,
+// an upstream image failure all land here too. Callers must treat any of them
+// as terminal — waiting for a group the operator has already refused only
+// burns karpenter's registration TTL.
+func (in *NodeGroup) ReconcileFailure() (reason, message string, failed bool) {
+	cond := in.GetCondition(ConditionTypeReconcileFailed)
+	if cond == nil || cond.Status != corev1.ConditionTrue {
+		return "", "", false
+	}
+	return cond.Reason, cond.Message, true
+}
+
 // IsSynced reports whether the upstream operator reconciled the NodeGroup to
 // its desired state.
 func (in *NodeGroup) IsSynced() bool {

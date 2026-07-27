@@ -90,13 +90,18 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	ng, err := c.nodeGroupProvider.Create(ctx, nodeClaim, nodeClass, instanceType.Name)
 	if err != nil {
 		quotaErr := &nodegroup.ErrQuotaExceeded{}
-		if errors.As(err, &quotaErr) || errors.Is(err, nodegroup.ErrNodeGroupVanished) {
+		rejectedErr := &nodegroup.ErrFlavorRejected{}
+		if errors.As(err, &quotaErr) || errors.As(err, &rejectedErr) || errors.Is(err, nodegroup.ErrNodeGroupVanished) {
 			// Surfacing an InsufficientCapacityError lets the scheduler mark
 			// the offering unavailable and relax to other options instead of
 			// waiting out the 15min registration TTL. A vanish takes the same
 			// path: a plain error would make karpenter-core retry the SAME
 			// claim with the same flavor in a create→vanish loop that holds
-			// the creation mutex; ICE deletes the claim and re-plans.
+			// the creation mutex; ICE deletes the claim and re-plans. So does
+			// an upstream refusal of the flavor itself — core keeps no
+			// per-offering memory, so the provider holds the refused flavor out
+			// of resolveInstanceType for a few minutes to make the re-plan land
+			// somewhere else.
 			return nil, cloudprovider.NewInsufficientCapacityError(err)
 		}
 		return nil, err
@@ -280,9 +285,17 @@ func (c *CloudProvider) resolveNodeClassFromNodeClaim(ctx context.Context, nodeC
 // NodeClaim's scheduling requirements and resource requests.
 func (c *CloudProvider) resolveInstanceType(nodeClaim *karpv1.NodeClaim) (*cloudprovider.InstanceType, error) {
 	requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
+	// Flavors the upstream operator refused recently are held out: the
+	// catalogue is deliberately permissive (it offers every flavor the platform
+	// advertises, for any topology), so the refusal is the only signal that one
+	// of them is not usable on THIS cluster.
+	rejected := c.nodeGroupProvider.RejectedFlavors()
 	var best *cloudprovider.InstanceType
 	bestPrice := 0.0
 	for _, it := range c.instanceTypeProvider.List() {
+		if _, held := rejected[it.Name]; held {
+			continue
+		}
 		if it.Requirements.Intersects(requirements) != nil {
 			continue
 		}
@@ -300,6 +313,10 @@ func (c *CloudProvider) resolveInstanceType(nodeClaim *karpv1.NodeClaim) (*cloud
 		}
 	}
 	if best == nil {
+		if len(rejected) > 0 {
+			return nil, fmt.Errorf("no clever cloud flavor satisfies the nodeclaim requirements and resource requests "+
+				"(%d flavor(s) currently held out after an upstream refusal)", len(rejected))
+		}
 		return nil, fmt.Errorf("no clever cloud flavor satisfies the nodeclaim requirements and resource requests")
 	}
 	return best, nil
