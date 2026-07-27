@@ -371,9 +371,12 @@ func TestIsDriftedOnNodeClassChange(t *testing.T) {
 	cp, kubeClient := newTestProvider(t, nodeClass)
 	ng := &ngv1.NodeGroup{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        "default-drift",
-			Labels:      map[string]string{v1alpha1.ManagedLabelKey: "true"},
-			Annotations: map[string]string{v1alpha1.NodeClassHashLabelKey: nodeClass.Hash()},
+			Name:   "default-drift",
+			Labels: map[string]string{v1alpha1.ManagedLabelKey: "true"},
+			Annotations: map[string]string{
+				v1alpha1.NodeClassHashLabelKey:             nodeClass.Hash(),
+				v1alpha1.NodeClassHashVersionAnnotationKey: v1alpha1.NodeClassHashVersion,
+			},
 		},
 		Spec: ngv1.NodeGroupSpec{Flavor: "XS", NodeCount: 1},
 	}
@@ -581,5 +584,62 @@ func TestCreateRefusesUnknownReadiness(t *testing.T) {
 	}
 	if !corecloudprovider.IsNodeClassNotReadyError(err) {
 		t.Fatalf("expected NodeClassNotReadyError, got %T: %v", err, err)
+	}
+}
+
+// TestIsDriftedIgnoresForeignHashVersions is the fleet-roll guard. A NodeGroup
+// stamped by an older generation of Hash() carries a value that is not
+// comparable to the current one; comparing them anyway would report drift on
+// every NodeGroup at once and replace every node — real, hourly-billed VMs —
+// the first time CleverNodeClassSpec or the hashing changes.
+func TestIsDriftedIgnoresForeignHashVersions(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+	}{
+		{
+			name: "stale hash version",
+			annotations: map[string]string{
+				v1alpha1.NodeClassHashLabelKey:             "hash-from-an-older-generation",
+				v1alpha1.NodeClassHashVersionAnnotationKey: "v1",
+			},
+		},
+		{
+			name: "no hash version at all",
+			annotations: map[string]string{
+				v1alpha1.NodeClassHashLabelKey: "hash-from-an-older-generation",
+			},
+		},
+		{
+			name:        "no hash at all",
+			annotations: map[string]string{v1alpha1.NodeClassHashVersionAnnotationKey: v1alpha1.NodeClassHashVersion},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nodeClass := readyNodeClass("default")
+			cp, kubeClient := newTestProvider(t, nodeClass)
+			ng := &ngv1.NodeGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "default-foreign",
+					Labels:      map[string]string{v1alpha1.ManagedLabelKey: "true"},
+					Annotations: tc.annotations,
+				},
+				Spec: ngv1.NodeGroupSpec{Flavor: "XS", NodeCount: 1},
+			}
+			if err := kubeClient.Create(context.Background(), ng); err != nil {
+				t.Fatal(err)
+			}
+			nodeClaim := testNodeClaim("default-foreign")
+			nodeClaim.Status.ProviderID = "clevercloud://default-foreign"
+
+			reason, err := cp.IsDrifted(context.Background(), nodeClaim)
+			if err != nil {
+				t.Fatalf("IsDrifted: %v", err)
+			}
+			if reason != "" {
+				t.Errorf("expected no drift for an incomparable hash, got %q: this would replace "+
+					"every node in the fleet on a controller upgrade", reason)
+			}
+		})
 	}
 }

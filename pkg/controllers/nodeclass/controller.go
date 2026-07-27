@@ -20,12 +20,14 @@ package nodeclass
 
 import (
 	"context"
+	goerrors "errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -98,7 +100,78 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		// until the next informer resync, which defaults to 10 hours.
 		return reconcile.Result{RequeueAfter: time.Minute}, nil
 	}
+	if err := c.migrateHashVersion(ctx, nodeClass); err != nil {
+		return reconcile.Result{}, err
+	}
 	return reconcile.Result{}, nil
+}
+
+// migrateHashVersion brings NodeGroups stamped by an older generation of
+// Hash() up to the current one. Without it, upgrading the controller after any
+// change to CleverNodeClassSpec or to the hashing would make every existing
+// NodeGroup read as drifted and replace the whole fleet — real, hourly-billed
+// VMs, for no configuration change at all.
+//
+// A NodeGroup whose NodeClaim is ALREADY Drifted keeps its stored hash: the old
+// and new hashes are not comparable, so re-stamping would silently cancel a
+// replacement the user actually asked for. It still gets the new version, so
+// the next genuine spec change is evaluated normally.
+func (c *Controller) migrateHashVersion(ctx context.Context, nodeClass *v1alpha1.CleverNodeClass) error {
+	nodeGroups := &ngv1.NodeGroupList{}
+	if err := c.kubeClient.List(ctx, nodeGroups, client.MatchingLabels{
+		v1alpha1.ManagedLabelKey:   "true",
+		v1alpha1.NodeClassLabelKey: nodeClass.Name,
+	}); err != nil {
+		return err
+	}
+	hash := nodeClass.Hash()
+	var errs []error
+	for i := range nodeGroups.Items {
+		ng := &nodeGroups.Items[i]
+		if ng.Annotations[v1alpha1.NodeClassHashVersionAnnotationKey] == v1alpha1.NodeClassHashVersion {
+			continue
+		}
+		stored := ng.DeepCopy()
+		if ng.Annotations == nil {
+			ng.Annotations = map[string]string{}
+		}
+		ng.Annotations[v1alpha1.NodeClassHashVersionAnnotationKey] = v1alpha1.NodeClassHashVersion
+		drifted, err := c.nodeClaimDrifted(ctx, ng)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if !drifted {
+			ng.Annotations[v1alpha1.NodeClassHashLabelKey] = hash
+		}
+		if equality.Semantic.DeepEqual(stored, ng) {
+			continue
+		}
+		if err := c.kubeClient.Patch(ctx, ng, client.MergeFrom(stored)); err != nil {
+			errs = append(errs, client.IgnoreNotFound(err))
+			continue
+		}
+		log.FromContext(ctx).WithValues("NodeGroup", ng.Name, "hash-version", v1alpha1.NodeClassHashVersion, "drifted", drifted).
+			Info("migrated nodegroup to the current clevernodeclass hash version")
+	}
+	return goerrors.Join(errs...)
+}
+
+// nodeClaimDrifted reports whether the NodeClaim backing this NodeGroup already
+// carries the Drifted condition.
+func (c *Controller) nodeClaimDrifted(ctx context.Context, ng *ngv1.NodeGroup) (bool, error) {
+	name := ng.Labels[v1alpha1.NodeClaimLabelKey]
+	if name == "" {
+		name = ng.Name
+	}
+	nodeClaim := &karpv1.NodeClaim{}
+	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: name}, nodeClaim); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return nodeClaim.StatusConditions().Get(karpv1.ConditionTypeDrifted) != nil, nil
 }
 
 // finalize blocks NodeClass deletion while NodeClaims still reference it.
