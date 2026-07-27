@@ -23,11 +23,13 @@ package providerid
 
 import (
 	"context"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -41,10 +43,22 @@ import (
 
 type Controller struct {
 	kubeClient client.Client
+	// uncached reads straight from the API server. The uniqueness check below
+	// must not run off the informer cache: reconciles are serialised, so the
+	// previous node's patch is already committed upstream when the next one
+	// starts, but it may not have reached the cache yet — and two unstamped
+	// nodes read through that lag would both be told the ID is free.
+	uncached client.Reader
+	// warnedResized dedups the refusal log per node: the reconcile fires on
+	// every update of a node that still has no provider ID, and an extra node
+	// of a resized NodeGroup stays in that state for its whole life. Entries
+	// are dropped as soon as a node is stamped; what remains is bounded by the
+	// number of external resizes, which are anomalies, not routine.
+	warnedResized sync.Map
 }
 
-func NewController(kubeClient client.Client) *Controller {
-	return &Controller{kubeClient: kubeClient}
+func NewController(kubeClient client.Client, uncached client.Reader) *Controller {
+	return &Controller{kubeClient: kubeClient, uncached: uncached}
 }
 
 func (c *Controller) Name() string {
@@ -72,6 +86,45 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if !nodegroup.IsManaged(ng) {
 		return reconcile.Result{}, nil
 	}
+	// The provider ID names the NodeGroup, so it identifies a single node only
+	// while the 1 NodeClaim = 1 NodeGroup invariant holds. Something outside
+	// karpenter can break it — the platform's alert-driven scaler through an
+	// inherited autoscalingEnabled, a human, anything with nodegroups/scale
+	// RBAC — and the garbage collector deliberately only surfaces that, never
+	// fights it. Two Nodes on one provider ID would turn that surfaced anomaly
+	// into destruction: karpenter-core's NodeForNodeClaim matches both, sets
+	// Registered=False/MultipleNodesFound (terminal — registration returns
+	// early on any non-Unknown Registered), and liveness deletes the NodeClaim
+	// 15 minutes later, taking the NodeGroup and every VM in it.
+	//
+	// The check is on the Nodes that EXIST, not on spec.nodeCount. nodeCount is
+	// desired state: on the recovery path (revert the resize back to 1) it
+	// flips immediately while the extra Node object survives ~40s as its VM is
+	// torn down, and any event on it in that window — cordon, drain, kubelet
+	// heartbeat — would pass a nodeCount check and re-create the collision.
+	//
+	// Refusing every node of a resized group is not an option either: the
+	// NodeClaim would never register, and liveness would delete it — the very
+	// outcome above. So exactly one node keeps the ID and the extras are left
+	// inert, for the GC's NodeGroupExternallyResized signal to carry.
+	providerID := nodegroup.ProviderID(nodeGroupName)
+	// Confirmed uncached: see the field comment on Controller.uncached.
+	siblings := &corev1.NodeList{}
+	if err := c.uncached.List(ctx, siblings, client.MatchingLabels{v1alpha1.NodeGroupNodeLabelKey: nodeGroupName}); err != nil {
+		return reconcile.Result{}, err
+	}
+	for i := range siblings.Items {
+		if siblings.Items[i].Name == node.Name || siblings.Items[i].Spec.ProviderID != providerID {
+			continue
+		}
+		if _, warned := c.warnedResized.LoadOrStore(node.Name, struct{}{}); !warned {
+			log.FromContext(ctx).WithValues("Node", node.Name, "NodeGroup", nodeGroupName, "owner", siblings.Items[i].Name).Info(
+				"refusing to stamp a provider id: another node of this nodegroup already carries it, so the id would not be unique " +
+					"(something outside karpenter resized the group; this node stays unregistered and is reported by the garbage collector)")
+		}
+		return reconcile.Result{}, nil
+	}
+	c.warnedResized.Delete(node.Name)
 	stored := node.DeepCopy()
 	node.Spec.ProviderID = nodegroup.ProviderID(nodeGroupName)
 	if err := c.kubeClient.Patch(ctx, node, client.MergeFrom(stored)); err != nil {
@@ -85,6 +138,12 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		For(&corev1.Node{}).
+		// Serialised on purpose. The uniqueness check reads the API server and
+		// then patches; concurrent reconciles could interleave those two steps
+		// and stamp the same provider id on two nodes. One at a time makes the
+		// read-then-write safe, and this controller only ever fires on nodes
+		// that still lack a provider id, so throughput is not a concern.
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		WithEventFilter(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool { return needsProviderID(e.Object) },
 			UpdateFunc: func(e event.UpdateEvent) bool { return needsProviderID(e.ObjectNew) },
