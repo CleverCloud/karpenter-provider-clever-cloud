@@ -19,6 +19,7 @@ package nodegroup_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -129,6 +131,32 @@ func acceptOnceCreated(t *testing.T, kubeClient client.Client, name string) <-ch
 
 // rejectOnceCreated simulates the Clever Cloud operator rejecting the
 // NodeGroup on quota once it appears in the fake client.
+// failOnceCreated flips the NodeGroup to ReconcileFailed with an arbitrary
+// reason once it appears, standing in for the upstream operator.
+func failOnceCreated(t *testing.T, kubeClient client.Client, name, reason, message string) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			ng := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, ng); err != nil {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			ng.Status.Conditions = []ngv1.NodeGroupCondition{{
+				Type: ngv1.ConditionTypeReconcileFailed, Status: corev1.ConditionTrue,
+				Reason: reason, Message: message,
+			}}
+			if err := kubeClient.Update(context.Background(), ng); err != nil {
+				t.Errorf("updating nodegroup status: %v", err)
+			}
+			return
+		}
+	}()
+	return done
+}
+
 func rejectOnceCreated(t *testing.T, kubeClient client.Client, name, message string) <-chan struct{} {
 	t.Helper()
 	done := make(chan struct{})
@@ -571,5 +599,152 @@ func TestCreateFailsWhenNodeGroupVanishesDuringAcceptance(t *testing.T) {
 	var quotaErr *nodegroup.ErrQuotaExceeded
 	if _, err := provider.Create(context.Background(), testNodeClaim("default-after"), testNodeClass("default"), "2XS"); !errors.As(err, &quotaErr) {
 		t.Errorf("expected a fast quota-backoff failure after a vanish, got %v", err)
+	}
+}
+
+// TestCreateNonQuotaRejectionIsTerminal covers every upstream refusal that is
+// not the organisation quota: a flavor the cluster cannot provision, a spec the
+// operator will not accept. Previously such a NodeGroup was indistinguishable
+// from "still reconciling" — the poll timed out, Create reported optimistic
+// success, and the launch burned karpenter's full 15-minute registration TTL
+// before re-planning onto the very same flavor, with the operator's own
+// explanation surfaced nowhere.
+func TestCreateNonQuotaRejectionIsTerminal(t *testing.T) {
+	provider, kubeClient, recorder := newTestProviderWithRecorder(t)
+	nodeClaim := testNodeClaim("default-refused")
+	const (
+		reason  = "FlavorNotAvailable"
+		message = `flavor "2XS" is not available for this cluster`
+	)
+	before := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total")
+
+	done := failOnceCreated(t, kubeClient, nodeClaim.Name, reason, message)
+	_, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XS")
+	<-done
+
+	var rejected *nodegroup.ErrFlavorRejected
+	if !errors.As(err, &rejected) {
+		t.Fatalf("expected *ErrFlavorRejected, got %T: %v", err, err)
+	}
+	if rejected.Flavor != "2XS" || rejected.Reason != reason || rejected.Message != message {
+		t.Errorf("refusal not carried through: %+v", rejected)
+	}
+	// The refused reservation must be freed, exactly as a quota rejection is.
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: nodeClaim.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
+		t.Errorf("expected the refused nodegroup to be deleted, got %v", err)
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total") - before; delta != 1 {
+		t.Errorf("rejections_total delta = %v, want 1", delta)
+	}
+	if !slices.Contains(recorder.reasons(), "NodeGroupRejected") {
+		t.Errorf("expected a NodeGroupRejected event on the nodeclaim, got %v", recorder.reasons())
+	}
+	// The flavor is held out so the scheduler relaxes to another one instead
+	// of looping: karpenter-core keeps no per-offering memory of an ICE.
+	if _, held := provider.RejectedFlavors()["2XS"]; !held {
+		t.Errorf("expected 2XS to be held out after the refusal, got %v", provider.RejectedFlavors())
+	}
+}
+
+// TestRejectedFlavorIsReleasedOnSuccess proves the hold is not sticky: a flavor
+// the operator accepts again is immediately usable.
+func TestRejectedFlavorIsReleasedOnSuccess(t *testing.T) {
+	provider, kubeClient, _ := newTestProviderWithRecorder(t)
+
+	refused := testNodeClaim("default-refused")
+	done := failOnceCreated(t, kubeClient, refused.Name, "FlavorNotAvailable", "nope")
+	_, _ = provider.Create(context.Background(), refused, testNodeClass("default"), "2XS")
+	<-done
+	if _, held := provider.RejectedFlavors()["2XS"]; !held {
+		t.Fatalf("expected 2XS to be held out, got %v", provider.RejectedFlavors())
+	}
+
+	accepted := testNodeClaim("default-ok")
+	syncDone := acceptOnceCreated(t, kubeClient, accepted.Name)
+	if _, err := provider.Create(context.Background(), accepted, testNodeClass("default"), "2XS"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	<-syncDone
+	if _, held := provider.RejectedFlavors()["2XS"]; held {
+		t.Errorf("a flavor the operator accepted must be released, got %v", provider.RejectedFlavors())
+	}
+}
+
+// TestRefusalStaysTerminalWhenCleanupFails guards a context-conflation trap.
+// The cleanup Delete runs on the poll's own 15s context, so a refusal observed
+// late enough fails it with a wrapped context.DeadlineExceeded. Returning that
+// error would make wait.Interrupted match, waitForAcceptance return
+// (false, nil), and Create report optimistic success for a group the operator
+// has already refused — the exact 15-minute registration-TTL burn this branch
+// exists to prevent. Freeing the reservation is best-effort; the refusal is not.
+func TestRefusalStaysTerminalWhenCleanupFails(t *testing.T) {
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
+				return fmt.Errorf("deleting nodegroup: %w", context.DeadlineExceeded)
+			},
+		}).
+		Build()
+	provider := nodegroup.NewProvider(kubeClient, &fakeRecorder{})
+	nodeClaim := testNodeClaim("default-refused")
+
+	done := failOnceCreated(t, kubeClient, nodeClaim.Name, "FlavorNotAvailable", "nope")
+	_, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XS")
+	<-done
+
+	var rejected *nodegroup.ErrFlavorRejected
+	if !errors.As(err, &rejected) {
+		t.Fatalf("a failed cleanup must not downgrade the refusal to success; got %T: %v", err, err)
+	}
+	if _, held := provider.RejectedFlavors()["2XS"]; !held {
+		t.Errorf("the refused flavor must still be held out, got %v", provider.RejectedFlavors())
+	}
+}
+
+// TestAdoptionReleasesTheAdoptedGroupsFlavor pins which flavor the hold is
+// released on. Create is idempotent: on AlreadyExists it adopts the existing
+// group, whose spec.flavor is immutable upstream and can differ from the one
+// just resolved. Releasing the requested flavor instead of the adopted one
+// would keep a usable flavor out of provisioning and quietly let a refused one
+// back in.
+func TestAdoptionReleasesTheAdoptedGroupsFlavor(t *testing.T) {
+	provider, kubeClient, _ := newTestProviderWithRecorder(t)
+
+	// Get XS refused so it is held out.
+	refused := testNodeClaim("default-refused")
+	done := failOnceCreated(t, kubeClient, refused.Name, "FlavorNotAvailable", "nope")
+	_, _ = provider.Create(context.Background(), refused, testNodeClass("default"), "XS")
+	<-done
+	if _, held := provider.RejectedFlavors()["XS"]; !held {
+		t.Fatalf("expected XS to be held out, got %v", provider.RejectedFlavors())
+	}
+
+	// A NodeGroup for the next claim already exists, carrying XS, and is Synced.
+	claim := testNodeClaim("default-adopt")
+	existing := &ngv1.NodeGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: claim.Name,
+			Labels: map[string]string{
+				v1alpha1.ManagedLabelKey:   "true",
+				v1alpha1.NodeClaimLabelKey: claim.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: claim.Name},
+			},
+		},
+		Spec:   ngv1.NodeGroupSpec{Flavor: "XS", NodeCount: 1},
+		Status: ngv1.NodeGroupStatus{Conditions: syncedConditions(), Phase: ngv1.PhaseSynced},
+	}
+	if err := kubeClient.Create(context.Background(), existing); err != nil {
+		t.Fatalf("seeding the existing nodegroup: %v", err)
+	}
+
+	// Create resolves 2XS but adopts the XS group: XS is what became usable.
+	if _, err := provider.Create(context.Background(), claim, testNodeClass("default"), "2XS"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, held := provider.RejectedFlavors()["XS"]; held {
+		t.Errorf("adopting a Synced XS group must release the hold on XS, got %v", provider.RejectedFlavors())
 	}
 }

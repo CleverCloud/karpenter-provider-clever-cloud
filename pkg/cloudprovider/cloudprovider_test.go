@@ -641,5 +641,91 @@ func TestIsDriftedIgnoresForeignHashVersions(t *testing.T) {
 					"every node in the fleet on a controller upgrade", reason)
 			}
 		})
+
+// markRefused simulates the Clever Cloud operator refusing the NodeGroup for a
+// reason that is not the organisation quota.
+func markRefused(t *testing.T, kubeClient client.Client, name, reason string) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			ng := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, ng); err != nil {
+				continue
+			}
+			ng.Status.Conditions = []ngv1.NodeGroupCondition{{
+				Type: ngv1.ConditionTypeReconcileFailed, Status: corev1.ConditionTrue,
+				Reason: reason, Message: "flavor is not available on this cluster",
+			}}
+			if err := kubeClient.Update(context.Background(), ng); err != nil {
+				t.Errorf("updating nodegroup status: %v", err)
+			}
+			return
+		}
+	}()
+	return done
+}
+
+// TestCreateFlavorRefusalReturnsInsufficientCapacity covers the cloudprovider
+// half of the terminal-refusal path. Anything other than an
+// InsufficientCapacityError makes karpenter-core retry the same claim with the
+// same flavor instead of re-planning, so the refusal would still cost a full
+// registration TTL.
+func TestCreateFlavorRefusalReturnsInsufficientCapacity(t *testing.T) {
+	cp, kubeClient := newTestProvider(t, readyNodeClass("default"))
+	nodeClaim := testNodeClaim("default-refused")
+
+	done := markRefused(t, kubeClient, nodeClaim.Name, "FlavorNotAvailable")
+	_, err := cp.Create(context.Background(), nodeClaim)
+	<-done
+
+	if err == nil {
+		t.Fatal("expected the refusal to fail the launch")
+	}
+	if !corecloudprovider.IsInsufficientCapacityError(err) {
+		t.Errorf("expected an InsufficientCapacityError so the scheduler re-plans, got %T: %v", err, err)
+	}
+}
+
+// TestCreateAvoidsARefusedFlavor covers the other half of the coupling. The
+// catalogue is deliberately permissive — it offers every flavor the platform
+// advertises for any topology — so an upstream refusal is the only signal that
+// one of them is unusable here. karpenter-core keeps no per-offering memory of
+// an InsufficientCapacityError, so without the hold the scheduler would re-pick
+// the same cheapest flavor forever.
+func TestCreateAvoidsARefusedFlavor(t *testing.T) {
+	cp, kubeClient := newTestProvider(t, readyNodeClass("default"))
+
+	// 2XS is the cheapest flavor satisfying the claim; get it refused.
+	refused := testNodeClaim("default-refused")
+	done := markRefused(t, kubeClient, refused.Name, "FlavorNotAvailable")
+	if _, err := cp.Create(context.Background(), refused); err == nil {
+		t.Fatal("expected the refusal to fail the launch")
+	}
+	<-done
+
+	// The next launch must land on the next-cheapest flavor instead.
+	next := testNodeClaim("default-next")
+	syncDone := make(chan struct{})
+	go func() {
+		defer close(syncDone)
+		for {
+			ng := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: next.Name}, ng); err == nil {
+				markSynced(t, kubeClient, next.Name)
+				return
+			}
+		}
+	}()
+	created, err := cp.Create(context.Background(), next)
+	<-syncDone
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got := created.Labels[corev1.LabelInstanceTypeStable]; got == "2XS" {
+		t.Errorf("expected the refused flavor to be skipped, got %q again", got)
+	} else if got != "XS" {
+		t.Errorf("expected the next-cheapest flavor XS, got %q", got)
 	}
 }
