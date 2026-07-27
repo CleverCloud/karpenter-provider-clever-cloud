@@ -34,6 +34,13 @@ test-envtest: ## Run controller integration tests against a real kube-apiserver 
 	assets="$$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) -p path)" && \
 		KUBEBUILDER_ASSETS="$$assets" go test -count=1 ./test/envtest/...
 
+.PHONY: test-chart
+test-chart: ## Assert the rendered chart's controller placement (requires helm)
+	@# CHART_TEST_REQUIRE_HELM turns a missing helm binary into a failure
+	@# instead of a skip: this target exists to gate CI, and a silent skip
+	@# would be a green no-op.
+	CHART_TEST_REQUIRE_HELM=1 go test -count=1 ./test/chart/...
+
 .PHONY: e2e
 e2e: ## Run the e2e suite against a real CKE cluster (requires E2E_CONTEXT; see docs/e2e.md)
 	@# Backstop only — the suite enforces its own deadline (E2E_TIMEOUT) plus

@@ -16,6 +16,8 @@ jobs:
     - run: make vet
     - run: make build
     - run: make chart-lint
+    - name: Assert the controller's default placement stays topology-independent
+      run: make test-chart
     - name: Verify generated files are up to date
       run: |
         make generate raw-manifest
