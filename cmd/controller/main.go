@@ -74,7 +74,7 @@ func main() {
 			ProductURL:     env.WithDefaultString("PRICING_PRODUCT_URL", ""),
 			PriceSystemURL: env.WithDefaultString("PRICING_PRICE_SYSTEM_URL", ""),
 			Region:         region, // price-system zone_id
-			Topology:       env.WithDefaultString("CLEVER_CLOUD_TOPOLOGY", pricingprovider.DefaultTopology),
+			Topology:       env.WithDefaultString("CLEVER_CLOUD_TOPOLOGY", pricingprovider.TopologyAll),
 		})
 		period := env.WithDefaultDuration("PRICING_REFRESH_PERIOD", pricingcontroller.DefaultRefreshPeriod)
 		pricingCtrl = pricingcontroller.NewController(resolver, instanceTypeProvider, period)

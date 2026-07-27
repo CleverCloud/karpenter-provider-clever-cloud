@@ -263,3 +263,82 @@ func TestResolveAllUnknownFlavorsErrors(t *testing.T) {
 		t.Fatal("expected error when no available flavor has a sizing seed")
 	}
 }
+
+// TestResolveUnionsEveryTopologyByDefault pins the default: with no topology
+// configured, the catalogue is the union of every topology's flavor list.
+//
+// The per-topology lists are a product listing, not an admission rule — a
+// NodeGroup asking for a flavor its own topology does not advertise is
+// provisioned anyway (measured live: 2XS on an ALL_IN_ONE cluster, which
+// advertises only S…XL). Pinning one topology could therefore only ever shrink
+// a working catalogue, and the previous default (DISTRIBUTED) was wrong on two
+// of the three topologies.
+func TestResolveUnionsEveryTopologyByDefault(t *testing.T) {
+	srv := newServer(handlerConfig{t: t, productBody: `{"topologies":[
+		{"topology":"ALL_IN_ONE","availableFlavors":["S","M"]},
+		{"topology":"DEDICATED_COMPUTE","availableFlavors":["XS","S","M"]},
+		{"topology":"DISTRIBUTED","availableFlavors":["2XS","XS","S","M"]}
+	]}`, priceBody: priceSystemJSON})
+	defer srv.Close()
+
+	flavors, err := newProvider(srv.URL, pricing.TopologyAll).Resolve(context.Background())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	var names []string
+	for _, f := range flavors {
+		names = append(names, f.Name)
+	}
+	want := []string{"S", "M", "XS", "2XS"}
+	if len(names) != len(want) {
+		t.Fatalf("expected the union %v, got %v", want, names)
+	}
+	for _, w := range want {
+		if !containsName(names, w) {
+			t.Errorf("flavor %q missing from the union: got %v", w, names)
+		}
+	}
+}
+
+// TestResolveStillHonoursAnExplicitTopology keeps the knob meaningful: setting
+// it deliberately restricts the catalogue.
+func TestResolveStillHonoursAnExplicitTopology(t *testing.T) {
+	srv := newServer(handlerConfig{t: t, productBody: `{"topologies":[
+		{"topology":"ALL_IN_ONE","availableFlavors":["S","M"]},
+		{"topology":"DISTRIBUTED","availableFlavors":["2XS","XS","S","M"]}
+	]}`, priceBody: priceSystemJSON})
+	defer srv.Close()
+
+	flavors, err := newProvider(srv.URL, "ALL_IN_ONE").Resolve(context.Background())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if len(flavors) != 2 {
+		t.Errorf("an explicit topology must restrict the catalogue, got %d flavors", len(flavors))
+	}
+}
+
+// TestResolveFailsOnAnUnknownExplicitTopology keeps a typo loud: it must not
+// silently degrade to a narrower or wider catalogue.
+func TestResolveFailsOnAnUnknownExplicitTopology(t *testing.T) {
+	srv := newServer(handlerConfig{t: t, productBody: `{"topologies":[{"topology":"DISTRIBUTED","availableFlavors":["2XS"]}]}`, priceBody: priceSystemJSON})
+	defer srv.Close()
+
+	// DEDICATED is a plausible typo for DEDICATED_COMPUTE.
+	_, err := newProvider(srv.URL, "DEDICATED").Resolve(context.Background())
+	if err == nil {
+		t.Fatal("expected an error for an unknown topology")
+	}
+	if !strings.Contains(err.Error(), "DEDICATED") {
+		t.Errorf("error should name the unknown topology, got %v", err)
+	}
+}
+
+func containsName(names []string, want string) bool {
+	for _, n := range names {
+		if n == want {
+			return true
+		}
+	}
+	return false
+}
