@@ -78,3 +78,44 @@ func TestHashIgnoresObjectMetadata(t *testing.T) {
 		t.Errorf("expected metadata to be ignored: %q vs %q", a.Hash(), b.Hash())
 	}
 }
+
+// TestHashTreatsEmptyAndAbsentLabelsAlike pins the normalisation. hashstructure
+// skips a nil map but hashes an empty one, so without it `labels: {}` and an
+// absent `labels` — the same configuration — produced different hashes, and
+// deleting that no-op line replaced every node backed by the NodeClass.
+func TestHashTreatsEmptyAndAbsentLabelsAlike(t *testing.T) {
+	absent := testNodeClass(t, nil)
+	empty := testNodeClass(t, map[string]string{})
+
+	if absent.Hash() != empty.Hash() {
+		t.Errorf("`labels: {}` and an absent `labels` must hash alike, got %q vs %q",
+			empty.Hash(), absent.Hash())
+	}
+}
+
+// TestHashVersionPinnedToSpec is a tripwire, not a behavioural test: it fails
+// whenever the hash of a fixed spec changes. Any change to
+// CleverNodeClassSpec, or to the hashing options, moves it — including adding
+// a field and leaving it unset, which `IgnoreZeroValue` does NOT absorb.
+//
+// When it fails: bump NodeClassHashVersion and update the constant below IN
+// THE SAME COMMIT. The nodeclass controller then re-stamps existing NodeGroups
+// instead of letting the new hash read as drift and replace the whole fleet.
+func TestHashVersionPinnedToSpec(t *testing.T) {
+	const (
+		wantVersion = "v2"
+		// Hash of CleverNodeClassSpec{Labels: {"team": "data"}} under v2.
+		wantHash = "3789529822245891689"
+	)
+	if v1alpha1.NodeClassHashVersion != wantVersion {
+		t.Fatalf("NodeClassHashVersion moved to %q: update wantVersion and wantHash together",
+			v1alpha1.NodeClassHashVersion)
+	}
+	if got := testNodeClass(t, map[string]string{"team": "data"}).Hash(); got != wantHash {
+		t.Errorf("the hash of a fixed spec changed (%q, want %q).\n"+
+			"CleverNodeClassSpec or the hashing changed, so every existing NodeGroup now carries a "+
+			"stale, incomparable hash. Bump NodeClassHashVersion (currently %q) and update wantHash "+
+			"in this test, in the same commit — otherwise upgrading the controller replaces every "+
+			"node in every fleet.", got, wantHash, v1alpha1.NodeClassHashVersion)
+	}
+}

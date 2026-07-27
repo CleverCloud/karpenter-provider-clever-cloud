@@ -176,6 +176,9 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 			},
 			Annotations: map[string]string{
 				v1alpha1.NodeClassHashLabelKey: nodeClass.Hash(),
+				// Which generation of Hash() produced the value above; drift is
+				// only evaluated between matching generations.
+				v1alpha1.NodeClassHashVersionAnnotationKey: v1alpha1.NodeClassHashVersion,
 			},
 			// The NodeClaim owns the NodeGroup: if the NodeClaim disappears
 			// without going through the termination flow, Kubernetes garbage

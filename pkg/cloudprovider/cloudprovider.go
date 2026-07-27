@@ -228,7 +228,18 @@ func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCla
 	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaim.Spec.NodeClassRef.Name}, nodeClass); err != nil {
 		return "", client.IgnoreNotFound(err)
 	}
-	if hash, ok := ng.Annotations[v1alpha1.NodeClassHashLabelKey]; ok && hash != nodeClass.Hash() {
+	// Only compare hashes produced by the same generation of Hash(). A
+	// NodeGroup stamped by an older controller carries a hash that is not
+	// comparable to the current one, and treating the difference as drift
+	// would replace every node in the fleet on a controller upgrade. The
+	// nodeclass controller re-stamps those NodeGroups; until it does, they
+	// simply do not drift.
+	hash, hasHash := ng.Annotations[v1alpha1.NodeClassHashLabelKey]
+	version, hasVersion := ng.Annotations[v1alpha1.NodeClassHashVersionAnnotationKey]
+	if !hasHash || !hasVersion || version != v1alpha1.NodeClassHashVersion {
+		return "", nil
+	}
+	if hash != nodeClass.Hash() {
 		return NodeClassDrifted, nil
 	}
 	return "", nil

@@ -250,3 +250,120 @@ func TestReconcileNotReadyWhenNodeGroupAPIUnserved(t *testing.T) {
 		t.Error("expected the NodeClass not to be Ready when the NodeGroup API is not served")
 	}
 }
+
+// legacyNodeGroup is a NodeGroup as an older controller generation stamped it:
+// a hash, and either no hash-version annotation or a stale one.
+func legacyNodeGroup(name, nodeClassName, hash, version string) *ngv1.NodeGroup {
+	annotations := map[string]string{v1alpha1.NodeClassHashLabelKey: hash}
+	if version != "" {
+		annotations[v1alpha1.NodeClassHashVersionAnnotationKey] = version
+	}
+	return &ngv1.NodeGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Labels: map[string]string{
+				v1alpha1.ManagedLabelKey:   "true",
+				v1alpha1.NodeClassLabelKey: nodeClassName,
+				v1alpha1.NodeClaimLabelKey: name,
+			},
+			Annotations: annotations,
+		},
+		Spec: ngv1.NodeGroupSpec{Flavor: "2XS", NodeCount: 1},
+	}
+}
+
+// TestReconcileMigratesStaleHashVersions is the fleet-roll guard on the write
+// side: NodeGroups stamped by an older generation of Hash() are brought up to
+// the current one, so the incomparable old hash never reads as drift.
+func TestReconcileMigratesStaleHashVersions(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version string
+	}{
+		{name: "no version annotation at all", version: ""},
+		{name: "stale version annotation", version: "v1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nodeClass := testNodeClass("default", map[string]string{"team": "data"})
+			ng := legacyNodeGroup("default-abc12", "default", "hash-from-an-older-generation", tc.version)
+			ctrl, kubeClient := newTestController(t, nodeClass, ng)
+
+			if _, err := ctrl.Reconcile(context.Background(), reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "default"},
+			}); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+
+			got := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: ng.Name}, got); err != nil {
+				t.Fatalf("getting nodegroup: %v", err)
+			}
+			if v := got.Annotations[v1alpha1.NodeClassHashVersionAnnotationKey]; v != v1alpha1.NodeClassHashVersion {
+				t.Errorf("hash version not migrated: got %q, want %q", v, v1alpha1.NodeClassHashVersion)
+			}
+			if h := got.Annotations[v1alpha1.NodeClassHashLabelKey]; h != nodeClass.Hash() {
+				t.Errorf("hash not re-stamped: got %q, want %q — the stale value would read as drift "+
+					"and replace every node backed by this NodeClass", h, nodeClass.Hash())
+			}
+		})
+	}
+}
+
+// TestReconcileKeepsTheStoredHashWhenAlreadyDrifted protects a replacement the
+// user actually asked for: the old and new hashes are not comparable, so
+// re-stamping a NodeGroup whose NodeClaim is already Drifted would silently
+// cancel the roll in flight.
+func TestReconcileKeepsTheStoredHashWhenAlreadyDrifted(t *testing.T) {
+	nodeClass := testNodeClass("default", map[string]string{"team": "data"})
+	ng := legacyNodeGroup("default-abc12", "default", "hash-from-an-older-generation", "v1")
+	nodeClaim := testNodeClaim("default-abc12", "default")
+	nodeClaim.StatusConditions().SetTrue(karpv1.ConditionTypeDrifted)
+	ctrl, kubeClient := newTestController(t, nodeClass, ng, nodeClaim)
+
+	if _, err := ctrl.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "default"},
+	}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got := &ngv1.NodeGroup{}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: ng.Name}, got); err != nil {
+		t.Fatalf("getting nodegroup: %v", err)
+	}
+	if v := got.Annotations[v1alpha1.NodeClassHashVersionAnnotationKey]; v != v1alpha1.NodeClassHashVersion {
+		t.Errorf("hash version must still be migrated, got %q", v)
+	}
+	if h := got.Annotations[v1alpha1.NodeClassHashLabelKey]; h != "hash-from-an-older-generation" {
+		t.Errorf("an already-drifted nodeclaim must keep its stored hash, got %q", h)
+	}
+}
+
+// TestReconcileLeavesForeignNodeGroupsAlone pins the blast radius: the
+// migration must not touch NodeGroups belonging to another NodeClass, nor any
+// group this provider does not manage.
+func TestReconcileLeavesForeignNodeGroupsAlone(t *testing.T) {
+	nodeClass := testNodeClass("default", nil)
+	other := legacyNodeGroup("other-abc12", "other", "untouched", "v1")
+	unmanaged := legacyNodeGroup("manual-abc12", "default", "untouched", "v1")
+	delete(unmanaged.Labels, v1alpha1.ManagedLabelKey)
+	ctrl, kubeClient := newTestController(t, nodeClass, other, unmanaged)
+
+	if _, err := ctrl.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "default"},
+	}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	for _, name := range []string{other.Name, unmanaged.Name} {
+		got := &ngv1.NodeGroup{}
+		if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, got); err != nil {
+			t.Fatalf("getting nodegroup %s: %v", name, err)
+		}
+		if h := got.Annotations[v1alpha1.NodeClassHashLabelKey]; h != "untouched" {
+			t.Errorf("nodegroup %s must not be touched, hash became %q", name, h)
+		}
+		if v := got.Annotations[v1alpha1.NodeClassHashVersionAnnotationKey]; v != "v1" {
+			t.Errorf("nodegroup %s must not be touched, version became %q", name, v)
+		}
+	}
+}
