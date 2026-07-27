@@ -1,3 +1,11 @@
+# Recipes are multi-command pipelines whose failures must not be masked: sh's
+# default keeps going after a failed command, and a pipeline reports only its
+# last stage. `raw-manifest` truncated deploy/karpenter.yaml to its header and
+# still exited 0 when helm failed, so a maintainer could commit an empty
+# shipped manifest with a green make.
+SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
+
 CONTROLLER_GEN_VERSION ?= v0.20.1
 # Keep in sync with the version pinned in .github/workflows/ci-lint.yaml
 GOLANGCI_LINT_VERSION ?= v2.12.2
@@ -66,6 +74,11 @@ sync-karpenter-crds: ## Refresh the vendored karpenter.sh CRDs from the pinned s
 
 .PHONY: raw-manifest
 raw-manifest: ## Regenerate deploy/karpenter.yaml from the Helm chart (never edit it by hand)
+	@# Render to a temp file and only move it into place on success. Writing
+	@# straight to the target truncates it before helm even runs, so a helm
+	@# failure left the shipped manifest as an 8-line header — a namespace and
+	@# nothing else — which `kubectl apply` accepts without complaint.
+	tmp="$$(mktemp)"; \
 	{ \
 		echo "# GENERATED FILE — do not edit. Regenerate with 'make raw-manifest'."; \
 		echo "# Rendered from charts/karpenter with default values; the image tag comes from"; \
@@ -77,7 +90,7 @@ raw-manifest: ## Regenerate deploy/karpenter.yaml from the Helm chart (never edi
 		echo "  name: karpenter"; \
 		helm template karpenter charts/karpenter --namespace karpenter \
 			| sed '/^[[:space:]]*$$/d'; \
-	} > deploy/karpenter.yaml
+	} > "$$tmp" && mv "$$tmp" deploy/karpenter.yaml || { rm -f "$$tmp"; exit 1; }
 
 .PHONY: sync-chart-crds
 sync-chart-crds: ## Sync deploy/crds into both Helm charts (crds/ dir + templated CRD chart)
