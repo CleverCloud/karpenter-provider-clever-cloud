@@ -440,7 +440,28 @@ func (f *framework) deployment(name string, replicas int32, cpu, memory string, 
 	podLabels := map[string]string{"app": name}
 	spec := corev1.PodSpec{
 		TerminationGracePeriodSeconds: ptrInt64(0),
-		NodeSelector:                  map[string]string{v1alpha1.NodeRoleLabelKey: v1alpha1.NodeRoleWorker},
+		// Every scenario asserts that a pending pod produces a NodeClaim, so
+		// the workload must be unschedulable on anything Karpenter did not
+		// create. Selecting `cluster-node-role=worker` only achieved that on
+		// ALL_IN_ONE, where the sole non-Karpenter node is the control plane:
+		// on DEDICATED_COMPUTE and DISTRIBUTED the pre-existing pool is made
+		// of worker nodes too, so the pods would land there, no claim would be
+		// created, and the suite would fail on a perfectly healthy cluster.
+		// Requiring karpenter.sh/nodepool to EXIST is the topology-independent
+		// form: karpenter-core stamps it on every node it provisions and on no
+		// other.
+		Affinity: &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchExpressions: []corev1.NodeSelectorRequirement{{
+							Key:      karpv1.NodePoolLabelKey,
+							Operator: corev1.NodeSelectorOpExists,
+						}},
+					}},
+				},
+			},
+		},
 		// Short not-ready/unreachable tolerations: when a scenario kills a
 		// node out from under a pod (the GC reap), the default 300s eviction
 		// delay would dominate the wait bounds.
@@ -458,12 +479,15 @@ func (f *framework) deployment(name string, replicas int32, cpu, memory string, 
 		}},
 	}
 	if onePodPerNode {
-		spec.Affinity = &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
+		// Add to the node affinity above, never replace it: dropping it would
+		// let the pods schedule on the pre-existing pool and silently stop
+		// exercising Karpenter.
+		spec.Affinity.PodAntiAffinity = &corev1.PodAntiAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
 				LabelSelector: &metav1.LabelSelector{MatchLabels: podLabels},
 				TopologyKey:   corev1.LabelHostname,
 			}},
-		}}
+		}
 	}
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: f.namespace, Labels: f.labels()},

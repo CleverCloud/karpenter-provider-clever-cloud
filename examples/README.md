@@ -39,8 +39,11 @@ kubectl scale deployment inflate --replicas=3
 | [disruption-budget.yaml](workloads/disruption-budget.yaml) | PodDisruptionBudget bounding node drains |
 
 All workloads start at `replicas: 0`: scale them up to trigger provisioning.
-They pin pods to `clever-cloud.com/cluster-node-role: worker` because CKE
-control-plane nodes are schedulable and would otherwise absorb small pods.
+They require `karpenter.sh/nodepool` to exist, which Karpenter stamps on the
+nodes it provisions and on nothing else — so the pods cannot be absorbed by
+capacity that already existed (a schedulable ALL_IN_ONE control-plane node, or
+the pre-existing worker pool on the topologies where the control plane lives
+outside the cluster).
 
 Mind the organisation quota (default 40 vCPU / 40 GB RAM **including the
 control plane**): apply one NodePool example at a time when experimenting on

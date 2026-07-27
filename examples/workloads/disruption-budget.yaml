@@ -17,8 +17,20 @@ spec:
         app: pdb-workload
     spec:
       terminationGracePeriodSeconds: 0
-      nodeSelector:
-        clever-cloud.com/cluster-node-role: worker
+      affinity:
+        nodeAffinity:
+          # Karpenter-only: karpenter-core stamps karpenter.sh/nodepool on
+          # every node it provisions and on no other, so requiring the label
+          # to exist keeps these pods off pre-existing capacity on ANY CKE
+          # topology. Selecting cluster-node-role=worker instead only worked
+          # on ALL_IN_ONE, where the sole non-Karpenter node is the control
+          # plane; elsewhere the pre-existing pool is worker nodes too and the
+          # pods would land there without ever exercising Karpenter.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: karpenter.sh/nodepool
+                    operator: Exists
       containers:
         - name: pdb-workload
           image: registry.k8s.io/pause:3.10
