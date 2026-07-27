@@ -17,6 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"os"
+	"os/signal"
+	"syscall"
+
 	"sigs.k8s.io/karpenter/pkg/utils/env"
 
 	coremetrics "sigs.k8s.io/karpenter/pkg/cloudprovider/metrics"
@@ -35,6 +39,17 @@ import (
 
 func main() {
 	ctx, op := operator.NewOperator()
+
+	// karpenter-core installs no signal handler: operator.NewOperator() roots
+	// its context in context.Background(), and nothing in the module calls
+	// signal.Notify. SIGTERM therefore takes Go's default disposition and kills
+	// the process outright — controller-runtime never runs its shutdown
+	// sequence, so the LeaderElectionReleaseOnCancel the operator asks for
+	// never fires and the replacement pod waits out the full lease on every
+	// rollout. In-flight work is cut mid-flight too: a NodeGroup Create can die
+	// between the API call and its acceptance poll.
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)
+	defer stop()
 
 	region := env.WithDefaultString("CLEVER_CLOUD_REGION", "par")
 
