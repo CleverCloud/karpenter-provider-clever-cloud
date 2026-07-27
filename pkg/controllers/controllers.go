@@ -38,7 +38,7 @@ import (
 // disabled).
 func NewControllers(kubeClient client.Client, uncached client.Reader, recorder events.Recorder, nodeGroupProvider *nodegroup.Provider, instanceTypeProvider *instancetype.Provider, pricingController *pricing.Controller) []controller.Controller {
 	controllers := []controller.Controller{
-		providerid.NewController(kubeClient),
+		providerid.NewController(kubeClient, uncached),
 		garbagecollection.NewController(kubeClient, uncached, nodeGroupProvider, recorder),
 		nodeclass.NewController(kubeClient),
 		instancetypecapacity.NewController(kubeClient, instanceTypeProvider),

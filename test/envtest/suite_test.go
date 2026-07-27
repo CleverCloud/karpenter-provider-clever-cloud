@@ -106,7 +106,7 @@ func TestMain(m *testing.M) {
 		fmt.Printf("registering nodeclass controller: %v\n", err)
 		os.Exit(1)
 	}
-	if err := providerid.NewController(mgr.GetClient()).Register(ctx, mgr); err != nil {
+	if err := providerid.NewController(mgr.GetClient(), mgr.GetAPIReader()).Register(ctx, mgr); err != nil {
 		fmt.Printf("registering providerid controller: %v\n", err)
 		os.Exit(1)
 	}
@@ -303,10 +303,16 @@ func TestNodeClassValidation(t *testing.T) {
 func TestProviderIDStamping(t *testing.T) {
 	ctx := context.Background()
 
-	managed := &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{
-		Name:   "env-managed",
-		Labels: map[string]string{v1alpha1.ManagedLabelKey: "true"},
-	}}
+	managed := &ngv1.NodeGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "env-managed",
+			Labels: map[string]string{v1alpha1.ManagedLabelKey: "true"},
+		},
+		// nodeCount 1 as the provider always creates it: the controller
+		// refuses to stamp a group holding more than one node, since the
+		// provider ID names the group and would not be unique.
+		Spec: ngv1.NodeGroupSpec{NodeCount: 1},
+	}
 	unmanaged := &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: "env-unmanaged"}}
 	for _, ng := range []*ngv1.NodeGroup{managed, unmanaged} {
 		if err := kubeClient.Create(ctx, ng); err != nil {
