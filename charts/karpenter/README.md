@@ -2,7 +2,7 @@
 
 Helm chart for the [Karpenter provider for Clever Kubernetes Engine](https://github.com/CleverCloud/karpenter-provider-clever-cloud).
 
-The chart installs the controller (Deployment pinned to control-plane
+The chart installs the controller (Deployment kept off Karpenter-managed
 nodes, RBAC, leader-election roles, metrics Service, PDB) and carries the
 required CRDs in its `crds/` directory: `nodepools.karpenter.sh`,
 `nodeclaims.karpenter.sh`, `nodeoverlays.karpenter.sh` and
@@ -54,7 +54,9 @@ kubectl apply -f examples/v1/general-purpose.yaml
 |---|---|---|
 | `image.repository` / `image.tag` / `image.digest` | ghcr.io/clevercloud/karpenter | Controller image (digest wins over tag) |
 | `replicas` | `1` | Leader election keeps a single active controller |
-| `nodeSelector` | control-plane role | Karpenter must not run on nodes it manages |
+| `nodeSelector` | `{}` | Extra pinning, ANDed with `affinity` |
+| `affinity` | require `karpenter.sh/nodepool` absent | Karpenter must not run on nodes it manages — holds on every CKE topology |
+| `tolerations` | control-plane `NoSchedule` | No-op today (no CKE node role is tainted); future-proofs placement |
 | `settings.region` | `par` | Zone advertised on instance types |
 | `settings.logLevel` | `info` | debug / info / error |
 | `settings.disableLeaderElection` | `false` | For single-replica dev setups |

@@ -102,7 +102,7 @@ $ docker push <your-registry>/karpenter-clevercloud:v0.11.0
 
 Two charts are located under [charts/](charts/): [karpenter-crd](charts/karpenter-crd/README.md) installs and upgrades
 the CustomResourceDefinitions, and [karpenter](charts/karpenter/README.md) installs the controller stack (Deployment
-pinned to control-plane nodes, RBAC, metrics Service, PodDisruptionBudget). Install the CRDs first, then the
+kept off Karpenter-managed nodes, RBAC, metrics Service, PodDisruptionBudget). Install the CRDs first, then the
 controller, pointing it at the image you pushed:
 
 ```
@@ -210,7 +210,7 @@ helm upgrade --install karpenter oci://ghcr.io/clevercloud/karpenter-provider-cl
 ```
 
 **Precedence:** any `settings.flavors` overrides are re-applied on top of every refresh, so they
-always win. **Egress:** the controller runs on control-plane nodes; the refresher needs to reach
+always win. **Egress:** the refresher needs to reach
 `api.clever-cloud.com` on TCP 443. If your cluster restricts egress with NetworkPolicies, allow that
 destination from the controller pod (the chart ships no NetworkPolicy) or disable the refresher.
 No token is required.
@@ -263,12 +263,23 @@ Changing a NodeClass marks the NodeClaims built from it as drifted; Karpenter th
 
 ### Targeting Karpenter nodes
 
-Control-plane nodes in CKE are schedulable. To steer a workload onto (auto-scaled) workers:
+A CKE cluster always has capacity Karpenter did not create — a schedulable
+control-plane node on `ALL_IN_ONE`, a pre-existing node pool on the topologies whose control plane
+runs outside the cluster. To steer a workload onto Karpenter's own (auto-scaled) nodes, require the
+label Karpenter stamps on them and on nothing else:
 
 ```yaml
-nodeSelector:
-  clever-cloud.com/cluster-node-role: worker
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: karpenter.sh/nodepool
+              operator: Exists
 ```
+
+(`clever-cloud.com/cluster-node-role: worker` is **not** equivalent: on the topologies where the
+control plane is outside the cluster, the pre-existing pool is made of worker nodes too.)
 
 ## License
 
