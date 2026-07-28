@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 - 2026-07-28
+
+Every CKE topology, and nothing silently destructive. The controller is no longer pinned to a node role that exists only on `ALL_IN_ONE`: it is kept off the capacity Karpenter manages by a rule that names no topology, so it also schedules on `DEDICATED_COMPUTE` and `DISTRIBUTED` — where it previously sat `Pending` forever while `helm install` reported success. Three paths that ended in destroyed or stranded capacity are closed: a provider ID is never stamped on more than one node of an externally resized NodeGroup, a change to the NodeClass hash migrates existing NodeGroups instead of replacing every node in the fleet, and an upstream refusal is terminal instead of burning a 15-minute registration TTL on the same flavor. The flavor catalogue no longer depends on getting a per-cluster topology setting right, SIGTERM shuts the controller down cleanly, and the release pipeline runs the full pull-request check set before publishing anything. Built on karpenter-core 1.14.
 
 ### 🔄 Changed
 
