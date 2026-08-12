@@ -83,6 +83,13 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if readiness := nodeClass.StatusConditions().Get(status.ConditionReady); !readiness.IsTrue() {
 		return nil, cloudprovider.NewNodeClassNotReadyError(errors.New(readiness.Message))
 	}
+	// Readiness conditions survive deletion untouched (the nodeclass finalize
+	// path only lists NodeClaims), so DeletionTimestamp is the only terminating
+	// signal here. Refusing lets karpenter-core delete the claim instead of
+	// launching a VM the nodeclass finalizer would then wait on indefinitely.
+	if !nodeClass.DeletionTimestamp.IsZero() {
+		return nil, cloudprovider.NewNodeClassNotReadyError(fmt.Errorf("nodeclass %s is terminating", nodeClass.Name))
+	}
 	instanceType, err := c.resolveInstanceType(nodeClaim)
 	if err != nil {
 		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("resolving instance type, %w", err))
