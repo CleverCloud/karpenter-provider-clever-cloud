@@ -67,11 +67,15 @@ for class in "${classes[@]}"; do
   "${KUBECTL[@]}" delete "$class" --ignore-not-found --wait=false
 done
 
-# 5. Node objects can outlive their VM when nothing ran the normal
-#    termination flow (cosmetic, but don't litter the test cluster).
+# 5. Nodes: core stamps its karpenter.sh/termination finalizer on every
+#    registered Node, and only the (dead) controller removes it. The Clever
+#    Cloud NodeGroup finalizer needs the Node to be deletable before it tears
+#    the VM down, so a held Node wedges NodeGroup teardown forever — strip the
+#    finalizers, then delete.
 mapfile -t nodes < <(names nodes)
 for node in "${nodes[@]}"; do
-  echo "deleting orphaned ${node}"
+  echo "force-deleting orphaned ${node}"
+  "${KUBECTL[@]}" patch "$node" --type merge -p '{"metadata":{"finalizers":null}}'
   "${KUBECTL[@]}" delete "$node" --ignore-not-found --wait=false
 done
 
@@ -87,4 +91,23 @@ if [ -n "$live" ]; then
   echo "$live" >&2
   exit 1
 fi
-echo "==> sweep complete; any remaining e2e nodegroup is already terminating"
+
+# Terminating groups still bill until the platform finalizer releases them,
+# and a wedged teardown (e.g. a finalizer this sweep failed to strip) would
+# otherwise pass as "already terminating". Wait ~2x the documented ~40 s
+# teardown for them to actually disappear, then fail loudly with the
+# survivors.
+deadline=$((SECONDS + 90))
+while :; do
+  remaining="$(names nodegroups.api.clever-cloud.com)"
+  if [ -z "$remaining" ]; then
+    break
+  fi
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    echo "ERROR: e2e nodegroups still terminating after 90s (teardown wedged, VMs keep billing):" >&2
+    echo "$remaining" >&2
+    exit 1
+  fi
+  sleep 5
+done
+echo "==> sweep complete; no e2e nodegroups remain"
