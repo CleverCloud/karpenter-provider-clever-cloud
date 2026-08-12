@@ -19,6 +19,7 @@ package instancetype_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -279,6 +280,20 @@ func TestParseFlavorOverrides(t *testing.T) {
 		}
 	})
 
+	t.Run("mistyped field key", func(t *testing.T) {
+		// Non-strict unmarshaling used to drop the unknown key silently:
+		// every field is optional, so "price" instead of "priceHourly"
+		// decoded into an all-nil override that passed every validation —
+		// the operator's pin never applied and nothing surfaced it.
+		_, err := instancetype.ParseFlavorOverrides([]byte("- name: M\n  price: 0.30\n"))
+		if err == nil {
+			t.Fatal("expected an error for a mistyped field key")
+		}
+		if !strings.Contains(err.Error(), "price") {
+			t.Errorf("error must name the unknown field so the operator can fix it: %v", err)
+		}
+	})
+
 	cases := map[string]string{
 		"empty":          `[]`,
 		"empty name":     "- name: \"\"\n  cpu: 4\n",
@@ -286,6 +301,7 @@ func TestParseFlavorOverrides(t *testing.T) {
 		"zero memory":    "- name: M\n  memoryKi: 0\n",
 		"negative price": "- name: M\n  priceHourly: -1\n",
 		"duplicate name": "- name: M\n  cpu: 4\n- name: M\n  cpu: 8\n",
+		"duplicate key":  "- name: M\n  priceHourly: 0.1\n  priceHourly: 0.2\n",
 		"malformed":      "not: a list",
 	}
 	for name, data := range cases {
@@ -599,6 +615,34 @@ func TestLoadFlavorsOrDegradeNeverFails(t *testing.T) {
 		}
 		if v := metricstest.Value(t, "karpenter_clevercloud_instancetype_flavors_config_invalid"); v != 1 {
 			t.Errorf("flavors_config_invalid = %v, want 1", v)
+		}
+	})
+
+	t.Run("mistyped field key degrades instead of silently no-oping", func(t *testing.T) {
+		// "price" instead of "priceHourly" used to parse into an all-nil
+		// override: the file loaded "successfully", the gauge stayed 0 and
+		// the operator's pin never applied. Strict parsing turns it into
+		// the same loud degradation as any other invalid file.
+		path := filepath.Join(t.TempDir(), "flavors.yaml")
+		if err := os.WriteFile(path, []byte("- name: M\n  price: 0.30\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got := instancetype.LoadFlavorsOrDegrade(path)
+		if got != nil {
+			t.Errorf("expected nil overrides on a mistyped key, got %v", got)
+		}
+		if v := metricstest.Value(t, "karpenter_clevercloud_instancetype_flavors_config_invalid"); v != 1 {
+			t.Errorf("flavors_config_invalid = %v, want 1", v)
+		}
+		// The degraded result must serve the untouched base catalogue, not a
+		// half-applied one.
+		p := instancetype.NewProvider("par", nil, got)
+		m, err := p.Get("M")
+		if err != nil {
+			t.Fatalf("Get(M): %v", err)
+		}
+		if m.Offerings[0].Price != 0.1167 {
+			t.Errorf("expected the base price 0.1167, got %v", m.Offerings[0].Price)
 		}
 	})
 
