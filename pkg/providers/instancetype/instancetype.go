@@ -383,16 +383,44 @@ func ApplyOverrides(base []Flavor, overrides []FlavorOverride) ([]Flavor, []stri
 	return result, skipped
 }
 
+// generalizableResources are the only observed keys that hold across every VM
+// of a flavor: cpu, memory, ephemeral-storage and pods are per-flavor
+// hardware/platform figures. Everything else a node reports (device-plugin
+// extended resources like nvidia.com/gpu, hugepages) is per-node software:
+// letting one plugin-equipped node advertise it for the whole flavor would
+// make the scheduler provision fresh nodes of that flavor for pods the new
+// node can never run.
+var generalizableResources = []corev1.ResourceName{
+	corev1.ResourceCPU,
+	corev1.ResourceMemory,
+	corev1.ResourceEphemeralStorage,
+	corev1.ResourcePods,
+}
+
+// filterGeneralizable deep-copies the generalizable keys of a node-reported
+// resource list, dropping everything per-node.
+func filterGeneralizable(list corev1.ResourceList) corev1.ResourceList {
+	out := make(corev1.ResourceList, len(generalizableResources))
+	for _, name := range generalizableResources {
+		if q, ok := list[name]; ok {
+			out[name] = q.DeepCopy()
+		}
+	}
+	return out
+}
+
 // RecordObservedCapacity feeds back the real capacity of a running node so
 // the catalog self-corrects (the static table entries for flavors never seen
-// yet — L and XL in particular — are derived estimates).
+// yet — L and XL in particular — are derived estimates). Only the resources
+// that generalize across a flavor's homogeneous VMs are kept; per-node
+// extended resources must never enter the flavor catalog.
 func (p *Provider) RecordObservedCapacity(flavor string, capacity, allocatable corev1.ResourceList) {
 	if capacity.Cpu().IsZero() || capacity.Memory().IsZero() {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.observed[flavor] = observedCapacity{capacity: capacity.DeepCopy(), allocatable: allocatable.DeepCopy()}
+	p.observed[flavor] = observedCapacity{capacity: filterGeneralizable(capacity), allocatable: filterGeneralizable(allocatable)}
 }
 
 // snapshotFlavors copies the current catalog under a short read lock. Copying
