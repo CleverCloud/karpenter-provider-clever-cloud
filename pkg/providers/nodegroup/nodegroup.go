@@ -466,8 +466,10 @@ func (p *Provider) Delete(ctx context.Context, name string) error {
 
 // nodeGroupLabels computes the node labels carried by the NodeGroup so that
 // they are present on the node as soon as it joins, before Karpenter's
-// registration sync. Keys rejected by the Clever Cloud API (reserved
-// prefixes) are filtered out: Karpenter applies those at registration anyway.
+// registration sync. Keys the NodeGroup payload cannot carry are filtered out:
+// for NodeClaim labels Karpenter applies those at registration anyway, while
+// NodeClass labels have no such fallback — which is why the nodeclass
+// controller rejects up front, with the same rule, anything filtered here.
 func nodeGroupLabels(nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.CleverNodeClass) map[string]string {
 	labels := map[string]string{}
 	for k, v := range nodeClass.Spec.Labels {
@@ -483,24 +485,15 @@ func nodeGroupLabels(nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.CleverNode
 	return labels
 }
 
-// isNodeGroupLabelAllowed mirrors the CEL validation of the NodeGroup CRD:
-// reserved prefixes are rejected, and values must match the (restrictive)
-// upstream pattern. Anything filtered here still reaches the node through
-// Karpenter's registration sync.
+// isNodeGroupLabelAllowed admits exactly the labels the shared rule accepts
+// (v1alpha1.ValidateNodeClassLabel): reserved prefixes, kubernetes.io/ domains
+// owned by Karpenter's sync, and label syntax the apiserver would refuse on
+// the Node. It filters rather than errors — NodeClaim labels carry Karpenter's
+// own reserved keys (node.kubernetes.io/instance-type, ...) by design and
+// still reach the node through the registration sync. NodeClass labels have
+// NO such fallback: a dropped key is simply gone, which is why the nodeclass
+// controller rejects them up front with the same rule instead of ever letting
+// this filter fire.
 func isNodeGroupLabelAllowed(key, value string) bool {
-	for _, prefix := range []string{"kubernetes.io/", "node.kubernetes.io/", "clever-cloud.com/"} {
-		if strings.HasPrefix(key, prefix) {
-			return false
-		}
-	}
-	// Domain-prefixed variants of reserved kubernetes.io labels (e.g.
-	// topology.kubernetes.io/zone) pass upstream validation but are owned by
-	// Karpenter's sync; keep the NodeGroup payload minimal and predictable.
-	if strings.Contains(key, "kubernetes.io/") {
-		return false
-	}
-	if len(value) > 63 {
-		return false
-	}
-	return true
+	return v1alpha1.ValidateNodeClassLabel(key, value) == nil
 }

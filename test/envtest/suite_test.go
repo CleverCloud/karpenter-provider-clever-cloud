@@ -272,6 +272,21 @@ func TestNodeClassValidation(t *testing.T) {
 		t.Fatalf("expected an Invalid admission error, got: %v", err)
 	}
 
+	// Subdomained kubernetes.io/ keys are dropped by the NodeGroup label
+	// filter, and a NodeClass label has no other path to the node — the CEL
+	// rule must reject them at admission instead of letting the label go
+	// missing silently.
+	subdomain := &v1alpha1.CleverNodeClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "subdomain-labels"},
+		Spec:       v1alpha1.CleverNodeClassSpec{Labels: map[string]string{"app.kubernetes.io/name": "web"}},
+	}
+	if err := kubeClient.Create(ctx, subdomain); err == nil {
+		_ = kubeClient.Delete(ctx, subdomain)
+		t.Fatalf("a subdomained kubernetes.io/ label key must be rejected at admission by the CRD CEL rule")
+	} else if !apierrors.IsInvalid(err) {
+		t.Fatalf("expected an Invalid admission error, got: %v", err)
+	}
+
 	notReady := &v1alpha1.CleverNodeClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "long-label-value"},
 		Spec:       v1alpha1.CleverNodeClassSpec{Labels: map[string]string{"team": strings.Repeat("x", 64)}},
