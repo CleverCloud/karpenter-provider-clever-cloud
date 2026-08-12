@@ -208,6 +208,52 @@ func TestRecordObservedCapacityIgnoresZero(t *testing.T) {
 	}
 }
 
+func TestRecordObservedCapacityDropsExtendedResources(t *testing.T) {
+	// Extended resources come from per-node software (device plugins,
+	// hugepages), not from the flavor's hardware: one plugin-equipped node
+	// reporting them must not make the whole flavor advertise them, or
+	// karpenter provisions fresh plugin-less nodes for pods that request
+	// them — the pod stays Pending and the node sits empty and billed.
+	p := instancetype.NewProvider("par", nil, nil)
+	capacity, allocatable := observedL(t)
+	gpu := corev1.ResourceName("nvidia.com/gpu")
+	hugepages := corev1.ResourceName("hugepages-2Mi")
+	capacity[gpu] = resource.MustParse("1")
+	capacity[hugepages] = resource.MustParse("512Mi")
+	allocatable[gpu] = resource.MustParse("1")
+	allocatable[hugepages] = resource.MustParse("512Mi")
+
+	p.RecordObservedCapacity("L", capacity, allocatable)
+
+	it, err := p.Get("L")
+	if err != nil {
+		t.Fatalf("Get(L): %v", err)
+	}
+	for _, name := range []corev1.ResourceName{gpu, hugepages} {
+		if _, ok := it.Capacity[name]; ok {
+			t.Errorf("observed per-node resource %s leaked into the flavor's capacity", name)
+		}
+		if q, ok := it.Allocatable()[name]; ok && !q.IsZero() {
+			t.Errorf("observed per-node resource %s leaked into the flavor's allocatable: %s", name, q.String())
+		}
+	}
+	// The cpu/memory correction must still apply alongside the filtering.
+	if it.Capacity.Memory().Cmp(*capacity.Memory()) != 0 {
+		t.Errorf("expected observed memory capacity %s, got %s", capacity.Memory(), it.Capacity.Memory())
+	}
+	if it.Capacity.Cpu().Cmp(*capacity.Cpu()) != 0 {
+		t.Errorf("expected observed cpu capacity %s, got %s", capacity.Cpu(), it.Capacity.Cpu())
+	}
+	for _, listed := range p.List() {
+		if listed.Name != "L" {
+			continue
+		}
+		if _, ok := listed.Capacity[gpu]; ok {
+			t.Errorf("observed per-node resource %s leaked into List() output", gpu)
+		}
+	}
+}
+
 func TestNewProviderNilFlavorsUsesDefault(t *testing.T) {
 	p := instancetype.NewProvider("par", nil, nil)
 	if got := len(p.List()); got != len(instancetype.DefaultFlavors) {
