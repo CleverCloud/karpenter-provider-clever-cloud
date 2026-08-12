@@ -587,6 +587,34 @@ func TestCreateRefusesUnknownReadiness(t *testing.T) {
 	}
 }
 
+// TestCreateRefusesTerminatingNodeClass pins the deletion-convergence guard.
+// Deleting a CleverNodeClass never changes its readiness conditions, so a
+// terminating NodeClass still reads Ready=True; launching from it creates a
+// real hourly-billed VM whose NodeClaim then makes the nodeclass finalizer
+// requeue forever — deletion never converges.
+func TestCreateRefusesTerminatingNodeClass(t *testing.T) {
+	nodeClass := readyNodeClass("default")
+	nodeClass.Finalizers = []string{v1alpha1.TerminationFinalizer}
+	cp, kubeClient := newTestProvider(t, nodeClass)
+	// The finalizer keeps the object around with a DeletionTimestamp, exactly
+	// the state the nodeclass controller holds while NodeClaims still exist.
+	if err := kubeClient.Delete(context.Background(), nodeClass); err != nil {
+		t.Fatalf("deleting nodeclass: %v", err)
+	}
+
+	nodeClaim := testNodeClaim("default-term1")
+	_, err := cp.Create(context.Background(), nodeClaim)
+	if err == nil {
+		t.Fatal("expected an error for a terminating NodeClass")
+	}
+	if !corecloudprovider.IsNodeClassNotReadyError(err) {
+		t.Fatalf("expected NodeClassNotReadyError, got %T: %v", err, err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: nodeClaim.Name}, &ngv1.NodeGroup{}); err == nil {
+		t.Error("expected no nodegroup to be created from a terminating nodeclass")
+	}
+}
+
 // TestIsDriftedIgnoresForeignHashVersions is the fleet-roll guard. A NodeGroup
 // stamped by an older generation of Hash() carries a value that is not
 // comparable to the current one; comparing them anyway would report drift on
