@@ -94,6 +94,12 @@ raw-manifest: ## Regenerate deploy/karpenter.yaml from the Helm chart (never edi
 
 .PHONY: sync-chart-crds
 sync-chart-crds: ## Sync deploy/crds into both Helm charts (crds/ dir + templated CRD chart)
+	@# Prune before copying: an add-only sync strands a CRD that a karpenter
+	@# bump renamed or dropped — regeneration never touches the orphan again,
+	@# so the CI drift gate can't see it and both charts ship it forever (and
+	@# karpenter-crd would delete it on uninstall). Pruning turns an upstream
+	@# removal into a deletion diff CI catches.
+	rm -f charts/karpenter/crds/*.yaml charts/karpenter-crd/templates/*.yaml
 	cp deploy/crds/*.yaml charts/karpenter/crds/
 	for f in deploy/crds/*.yaml; do \
 		awk '{print} /^  annotations:$$/{ \
