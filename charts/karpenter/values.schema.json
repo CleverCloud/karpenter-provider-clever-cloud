@@ -1,12 +1,61 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "title": "karpenter chart values (partial schema)",
-  "description": "Validates the settings.flavors overrides at helm install/upgrade time, before a typo reaches the controller. Everything else is intentionally unconstrained.",
+  "description": "Validates the settings.flavors overrides and the boolean toggles at helm install/upgrade time, before a typo reaches the controller. The booleans need typing because the templates gate on Go-template truthiness, where any non-empty string is true: a quoted \"false\" (--set-string, or a quoted values file) would render the exact opposite of its intent. Everything else is intentionally unconstrained.",
   "type": "object",
   "properties": {
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": {
+          "type": "boolean",
+          "description": "Create the service account."
+        }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Create the PodDisruptionBudget."
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Expose the metrics endpoint through a ClusterIP service."
+        }
+      }
+    },
     "settings": {
       "type": "object",
       "properties": {
+        "disableLeaderElection": {
+          "type": "boolean",
+          "description": "Disable leader election. The string \"false\" would still disable it — two active controllers with replicas>1."
+        },
+        "featureGates": {
+          "type": "object",
+          "properties": {
+            "nodeRepair": {
+              "type": "boolean",
+              "description": "Enable Karpenter's NodeRepair feature gate."
+            }
+          }
+        },
+        "pricing": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the dynamic price/flavor refresher. The string \"false\" would render PRICING_REFRESH_ENABLED=\"true\"."
+            }
+          }
+        },
         "flavors": {
           "type": "array",
           "items": {
