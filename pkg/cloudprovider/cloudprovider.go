@@ -106,7 +106,20 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		}
 		return nil, err
 	}
-	log.FromContext(ctx).WithValues("NodeGroup", ng.Name, "flavor", instanceType.Name).Info("created nodegroup")
+	// The returned claim must describe the machine that exists, not the one
+	// requested: on the AlreadyExists adoption path the group's immutable
+	// flavor can differ from the one resolved by THIS attempt (a retry after a
+	// transient error, with the original flavor since refused or re-priced),
+	// and a claim built from the requested flavor would carry a capacity and
+	// price no running node has — nothing downstream ever corrects it.
+	if ng.Spec.Flavor != instanceType.Name {
+		log.FromContext(ctx).WithValues("NodeGroup", ng.Name, "flavor", ng.Spec.Flavor, "requestedFlavor", instanceType.Name).Info(
+			"adopted an existing nodegroup whose flavor differs from the one resolved for this attempt; describing the existing flavor")
+		if instanceType, err = c.resolveNodeGroupInstanceType(ctx, ng); err != nil {
+			return nil, err
+		}
+	}
+	log.FromContext(ctx).WithValues("NodeGroup", ng.Name, "flavor", ng.Spec.Flavor).Info("created nodegroup")
 	return c.buildNodeClaim(ng, instanceType), nil
 }
 

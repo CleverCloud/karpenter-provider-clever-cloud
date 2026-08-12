@@ -644,6 +644,66 @@ func TestIsDriftedIgnoresForeignHashVersions(t *testing.T) {
 	}
 }
 
+// TestCreateAdoptionDescribesTheExistingFlavor pins the adoption truth
+// contract: nodegroup.Provider.Create is idempotent, and on AlreadyExists it
+// adopts a group owned by the same NodeClaim whose immutable flavor can differ
+// from the one resolved by THIS attempt (retry after a transient error, with
+// the original flavor since refused or re-priced). The returned claim must
+// describe the machine that exists — building it from the freshly resolved
+// flavor would hand the scheduler a capacity and price no running node has,
+// and nothing downstream ever corrects it.
+func TestCreateAdoptionDescribesTheExistingFlavor(t *testing.T) {
+	nodeClaim := testNodeClaim("default-adopt")
+	// The existing group carries the full ownership proof Create's adoption
+	// path requires (managed label, nodeclaim label, NodeClaim owner
+	// reference), a flavor resolveInstanceType would NOT pick for this claim
+	// (2XS is the cheapest fit), and is already accepted upstream so the
+	// acceptance poll returns immediately.
+	existing := &ngv1.NodeGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nodeClaim.Name,
+			Labels: map[string]string{
+				v1alpha1.ManagedLabelKey:   "true",
+				v1alpha1.NodeClaimLabelKey: nodeClaim.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "karpenter.sh/v1",
+				Kind:       "NodeClaim",
+				Name:       nodeClaim.Name,
+				UID:        nodeClaim.UID,
+			}},
+		},
+		Spec: ngv1.NodeGroupSpec{Flavor: "S", NodeCount: 1},
+		Status: ngv1.NodeGroupStatus{
+			Conditions: []ngv1.NodeGroupCondition{{Type: ngv1.ConditionTypeReady, Status: corev1.ConditionTrue, Reason: "Synced"}},
+			Phase:      ngv1.PhaseSynced,
+		},
+	}
+	cp, _, itp := newTestProviderWithCatalog(t, readyNodeClass("default"), existing)
+
+	created, err := cp.Create(context.Background(), nodeClaim)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got := created.Labels[corev1.LabelInstanceTypeStable]; got != "S" {
+		t.Errorf("instance-type label = %q, want the existing group's flavor S, not the freshly resolved one", got)
+	}
+	want, err := itp.Get("S")
+	if err != nil {
+		t.Fatalf("Get(S): %v", err)
+	}
+	for name, wantQty := range want.Capacity {
+		if gotQty := created.Status.Capacity[name]; gotQty.Cmp(wantQty) != 0 {
+			t.Errorf("capacity[%s] = %v, want S's %v", name, gotQty.String(), wantQty.String())
+		}
+	}
+	for name, wantQty := range want.Allocatable() {
+		if gotQty := created.Status.Allocatable[name]; gotQty.Cmp(wantQty) != 0 {
+			t.Errorf("allocatable[%s] = %v, want S's %v", name, gotQty.String(), wantQty.String())
+		}
+	}
+}
+
 // markRefused simulates the Clever Cloud operator refusing the NodeGroup for a
 // reason that is not the organisation quota.
 func markRefused(t *testing.T, kubeClient client.Client, name, reason string) <-chan struct{} {
