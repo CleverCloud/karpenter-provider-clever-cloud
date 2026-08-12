@@ -702,6 +702,47 @@ func TestRefusalStaysTerminalWhenCleanupFails(t *testing.T) {
 	}
 }
 
+// TestQuotaRefusalStaysTerminalWhenCleanupFails is the quota twin of
+// TestRefusalStaysTerminalWhenCleanupFails: the cleanup Delete freeing the
+// rejected reservation runs on the poll's own 15s context, so a rejection
+// observed late enough fails it with a wrapped context.DeadlineExceeded.
+// Returning that error would make wait.Interrupted match, waitForAcceptance
+// return (false, nil), and Create report optimistic success for a group the
+// quota engine has already rejected — burning the 15-minute registration TTL
+// with the reservation never freed. Any other Delete error would replace the
+// typed ErrQuotaExceeded with a plain one, so cloudprovider.Create would no
+// longer map it to an InsufficientCapacityError.
+func TestQuotaRefusalStaysTerminalWhenCleanupFails(t *testing.T) {
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
+				return fmt.Errorf("deleting nodegroup: %w", context.DeadlineExceeded)
+			},
+		}).
+		Build()
+	provider := nodegroup.NewProvider(kubeClient, &fakeRecorder{})
+	nodeClaim := testNodeClaim("default-quota")
+	rejectionsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_quota_rejections_total")
+
+	done := rejectOnceCreated(t, kubeClient, nodeClaim.Name, "Quota exceeded: RAM max reached")
+	_, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XS")
+	<-done
+
+	var quotaErr *nodegroup.ErrQuotaExceeded
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("a failed cleanup must not downgrade the quota rejection to success; got %T: %v", err, err)
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_quota_rejections_total") - rejectionsBefore; delta != 1 {
+		t.Errorf("quota_rejections_total delta = %v, want 1", delta)
+	}
+	// The backoff must still be armed: the next create fails fast without
+	// touching the API.
+	if _, err := provider.Create(context.Background(), testNodeClaim("default-after"), testNodeClass("default"), "2XS"); !errors.As(err, &quotaErr) {
+		t.Errorf("expected a fast quota-backoff failure after the rejection, got %T: %v", err, err)
+	}
+}
+
 // TestAdoptionReleasesTheAdoptedGroupsFlavor pins which flavor the hold is
 // released on. Create is idempotent: on AlreadyExists it adopts the existing
 // group, whose spec.flavor is immutable upstream and can differ from the one

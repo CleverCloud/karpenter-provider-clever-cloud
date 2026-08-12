@@ -396,9 +396,18 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bo
 			// Free the rejected reservation immediately so it does not
 			// starve other NodeGroups in the org. Deleted directly (not via
 			// p.Delete) because removing a rejected group frees no real
-			// capacity and must not clear the quota backoff.
+			// capacity and must not clear the quota backoff — and best-effort,
+			// never replacing the rejection: this Delete runs on the poll's
+			// own 15s context, so a rejection observed late enough would fail
+			// it with a wrapped context.DeadlineExceeded; wait.Interrupted
+			// would then match, waitForAcceptance would return (false, nil),
+			// and Create would report optimistic success for a group the quota
+			// engine has already rejected — the claim would burn the 15-minute
+			// registration TTL with the reservation never freed. The typed
+			// error wins; the leftover group is reclaimed by the GC sweep.
 			if err := p.kubeClient.Delete(ctx, &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: name}}); err != nil && !apierrors.IsNotFound(err) {
-				return false, fmt.Errorf("cleaning up quota-rejected nodegroup, %w", err)
+				log.FromContext(ctx).WithValues("NodeGroup", name).Error(err,
+					"could not delete the quota-rejected nodegroup; the garbage collector will reclaim it")
 			}
 			return false, &ErrQuotaExceeded{Message: msg}
 		}
