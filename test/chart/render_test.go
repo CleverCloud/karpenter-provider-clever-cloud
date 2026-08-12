@@ -66,8 +66,11 @@ func repoRoot(t *testing.T) string {
 	return filepath.Dir(filepath.Dir(wd))
 }
 
-// helmTemplate renders charts/karpenter with the given --set overrides.
-func helmTemplate(t *testing.T, sets ...string) string {
+// helmTemplateArgs renders charts/karpenter with the given raw helm arguments
+// and returns the combined output together with the error instead of failing
+// the test, so a caller can assert that a render is REFUSED (values.schema.json
+// violations surface as a `helm template` error).
+func helmTemplateArgs(t *testing.T, extra ...string) (string, error) {
 	t.Helper()
 	if _, err := exec.LookPath("helm"); err != nil {
 		if os.Getenv(requireHelmEnv) != "" {
@@ -76,15 +79,23 @@ func helmTemplate(t *testing.T, sets ...string) string {
 		t.Skipf("helm not on PATH; run 'make test-chart' to require it")
 	}
 	args := []string{"template", "karpenter", filepath.Join(repoRoot(t), "charts", "karpenter")}
+	args = append(args, extra...)
+	out, err := exec.Command("helm", args...).CombinedOutput()
+	return string(out), err
+}
+
+// helmTemplate renders charts/karpenter with the given --set overrides.
+func helmTemplate(t *testing.T, sets ...string) string {
+	t.Helper()
+	var extra []string
 	for _, s := range sets {
-		args = append(args, "--set", s)
+		extra = append(extra, "--set", s)
 	}
-	cmd := exec.Command("helm", args...)
-	out, err := cmd.CombinedOutput()
+	out, err := helmTemplateArgs(t, extra...)
 	if err != nil {
-		t.Fatalf("helm %s: %v\n%s", strings.Join(args, " "), err, out)
+		t.Fatalf("helm template %s: %v\n%s", strings.Join(extra, " "), err, out)
 	}
-	return string(out)
+	return out
 }
 
 // controllerPodSpec extracts the controller Deployment's pod spec from a
@@ -114,6 +125,75 @@ func controllerPodSpec(t *testing.T, manifest string) corev1.PodSpec {
 	}
 	t.Fatal("no Deployment found in the rendered chart")
 	return corev1.PodSpec{}
+}
+
+// controllerEnv returns the named env var from the controller container, or
+// nil when it is not rendered.
+func controllerEnv(spec corev1.PodSpec, name string) *corev1.EnvVar {
+	for _, c := range spec.Containers {
+		if c.Name != "controller" {
+			continue
+		}
+		for i := range c.Env {
+			if c.Env[i].Name == name {
+				return &c.Env[i]
+			}
+		}
+	}
+	return nil
+}
+
+// TestBooleanValuesRejectStringForms pins the values.schema.json type guard.
+// The templates gate on Go-template truthiness, where any non-empty string is
+// true: the STRING "false" (--set-string, or a quoted values file) in
+// settings.pricing.enabled rendered PRICING_REFRESH_ENABLED="true" — the exact
+// opposite of intent — and the string "false" in settings.disableLeaderElection
+// with replicas>1 would run two active controllers. Every boolean the templates
+// consume must be typed in the schema so the string form is refused at
+// install/upgrade/template time.
+func TestBooleanValuesRejectStringForms(t *testing.T) {
+	for _, path := range []string{
+		"settings.pricing.enabled",
+		"settings.disableLeaderElection",
+		"settings.featureGates.nodeRepair",
+		"podDisruptionBudget.enabled",
+		"service.enabled",
+		"serviceAccount.create",
+	} {
+		t.Run(path, func(t *testing.T) {
+			out, err := helmTemplateArgs(t, "--set-string", path+"=false")
+			if err == nil {
+				t.Fatalf("rendering with the STRING %s=false must fail values.schema.json validation, "+
+					"but it rendered successfully — Go-template truthiness would treat it as true", path)
+			}
+			if !strings.Contains(out, "schema") {
+				t.Errorf("expected a values.schema.json violation for %s, got:\n%s", path, out)
+			}
+		})
+	}
+}
+
+// TestPricingEnabledGatesEnvVar pins both halves of the pricing gate contract:
+// the default (true) must render PRICING_REFRESH_ENABLED="true" — the binary
+// defaults the gate to false, so losing the env var would silently disable the
+// refresher the chart promises — and the real boolean false must drop the env
+// var entirely so the binary's safe default takes over (the chart never renders
+// PRICING_REFRESH_ENABLED="false"; that shape is why the binary default must
+// stay false).
+func TestPricingEnabledGatesEnvVar(t *testing.T) {
+	t.Run("default renders the gate on", func(t *testing.T) {
+		env := controllerEnv(controllerPodSpec(t, helmTemplate(t)), "PRICING_REFRESH_ENABLED")
+		if env == nil || env.Value != "true" {
+			t.Fatalf(`default values must render PRICING_REFRESH_ENABLED="true", got %+v`, env)
+		}
+	})
+
+	t.Run("boolean false drops the env var", func(t *testing.T) {
+		env := controllerEnv(controllerPodSpec(t, helmTemplate(t, "settings.pricing.enabled=false")), "PRICING_REFRESH_ENABLED")
+		if env != nil {
+			t.Fatalf("settings.pricing.enabled=false must not render PRICING_REFRESH_ENABLED at all, got %+v", env)
+		}
+	})
 }
 
 // TestDefaultPlacementIsTopologyIndependent is the regression lock: the
