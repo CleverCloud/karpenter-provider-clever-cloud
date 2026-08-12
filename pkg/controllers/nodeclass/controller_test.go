@@ -141,6 +141,58 @@ func TestReconcileRejectsLongLabelValues(t *testing.T) {
 	}
 }
 
+// TestReconcileRejectsUndeliverableLabels pins the classes of labels that used
+// to validate cleanly and then go missing or fail downstream: subdomained
+// kubernetes.io/ keys are dropped by the NodeGroup label filter and a NodeClass
+// label has no other path to the node, while malformed keys or values are
+// refused by the apiserver when the label lands on the Node — either way the
+// NodeClass must not go Ready, and the condition must say why.
+func TestReconcileRejectsUndeliverableLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		labels      map[string]string
+		wantMessage string
+	}{
+		{
+			name:        "subdomained kubernetes.io key",
+			labels:      map[string]string{"app.kubernetes.io/name": "web"},
+			wantMessage: "kubernetes.io/ domain",
+		},
+		{
+			name:        "topology.kubernetes.io key",
+			labels:      map[string]string{"topology.kubernetes.io/region": "par"},
+			wantMessage: "kubernetes.io/ domain",
+		},
+		{
+			name:        "key with invalid syntax",
+			labels:      map[string]string{"bad key": "x"},
+			wantMessage: "not a valid label key",
+		},
+		{
+			name:        "value with a space",
+			labels:      map[string]string{"team": "not valid"},
+			wantMessage: "not a valid label value",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, kubeClient := newTestController(t, testNodeClass("default", tc.labels))
+
+			reconcileNodeClass(t, c, "default")
+
+			cond := getNodeClass(t, kubeClient, "default").StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded)
+			if !cond.IsFalse() {
+				t.Fatalf("expected ValidationSucceeded false, got %+v", cond)
+			}
+			if cond.Reason != "ValidationFailed" {
+				t.Errorf("unexpected reason %q", cond.Reason)
+			}
+			if !strings.Contains(cond.Message, tc.wantMessage) {
+				t.Errorf("condition message %q does not contain %q", cond.Message, tc.wantMessage)
+			}
+		})
+	}
+}
+
 func TestReconcileRecoversAfterFix(t *testing.T) {
 	c, kubeClient := newTestController(t, testNodeClass("default", map[string]string{"kubernetes.io/role": "worker"}))
 

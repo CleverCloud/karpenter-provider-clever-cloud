@@ -22,7 +22,6 @@ import (
 	"context"
 	goerrors "errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -198,18 +197,17 @@ func (c *Controller) finalize(ctx context.Context, nodeClass *v1alpha1.CleverNod
 	return reconcile.Result{}, nil
 }
 
-// validate rejects NodeClass labels that the Clever Cloud NodeGroup API would
-// refuse, so misconfiguration surfaces on the NodeClass instead of at node
-// launch.
+// validate rejects NodeClass labels the NodeGroup payload cannot deliver —
+// keys its filter drops, or syntax the apiserver would refuse on the Node — so
+// misconfiguration surfaces on the NodeClass instead of a label silently never
+// reaching any node. The rule itself lives in v1alpha1.ValidateNodeClassLabel,
+// shared with the NodeGroup label filter: anything that filter would drop must
+// be rejected here, because NodeClass labels have no registration-sync
+// fallback.
 func validate(nodeClass *v1alpha1.CleverNodeClass) error {
 	for k, v := range nodeClass.Spec.Labels {
-		for _, prefix := range []string{"kubernetes.io/", "node.kubernetes.io/", "clever-cloud.com/"} {
-			if strings.HasPrefix(k, prefix) {
-				return fmt.Errorf("label key %q uses reserved prefix %q", k, prefix)
-			}
-		}
-		if len(v) > 63 {
-			return fmt.Errorf("label %q value exceeds 63 characters", k)
+		if err := v1alpha1.ValidateNodeClassLabel(k, v); err != nil {
+			return err
 		}
 	}
 	return nil

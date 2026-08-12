@@ -29,10 +29,16 @@ import (
 type CleverNodeClassSpec struct {
 	// Labels are additional node labels applied through the Clever Cloud
 	// NodeGroup, making them visible on nodes as soon as they join the
-	// cluster (before Karpenter registration completes).
-	// Keys must not use the kubernetes.io/, node.kubernetes.io/ or
-	// clever-cloud.com/ prefixes (rejected by the Clever Cloud API).
-	// +kubebuilder:validation:XValidation:message="label keys with reserved prefixes (kubernetes.io/, node.kubernetes.io/, clever-cloud.com/) are not allowed",rule="self.all(k, !k.startsWith('kubernetes.io/') && !k.startsWith('node.kubernetes.io/') && !k.startsWith('clever-cloud.com/'))"
+	// cluster (before Karpenter registration completes). The NodeGroup is the
+	// ONLY path these labels take to the node, so keys must not use the
+	// clever-cloud.com/ prefix (rejected by the Clever Cloud API) or any
+	// kubernetes.io/ domain (filtered from the NodeGroup payload — including
+	// subdomains like app.kubernetes.io/ or topology.kubernetes.io/), and
+	// ValidateNodeClassLabel is the single owner of the full rule. The CEL
+	// rule below covers what CEL can express (contains subsumes both
+	// kubernetes.io/ prefixes of the older rule); label syntax degrades to
+	// ValidationSucceeded=False on the nodeclass controller.
+	// +kubebuilder:validation:XValidation:message="label keys in the kubernetes.io/ domain or with the reserved prefix clever-cloud.com/ are not allowed",rule="self.all(k, !k.contains('kubernetes.io/') && !k.startsWith('clever-cloud.com/'))"
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
 }
