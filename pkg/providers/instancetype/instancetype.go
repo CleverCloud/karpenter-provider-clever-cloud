@@ -265,15 +265,18 @@ func LoadFlavorsOrDegrade(path string) []FlavorOverride {
 }
 
 // ParseFlavorOverrides unmarshals a YAML list of partial flavor overrides and
-// validates it. Each entry must have a non-empty, unique name; any field that
-// is set must satisfy its bound (cpu > 0, memoryKi > 0, priceHourly >= 0). A
-// name outside the static sizing seed introduces a new flavor and must set
-// all three fields — without the price bound an unpriced new flavor would
-// enter the catalogue at 0 EUR/h and win every cheapest-first decision. The
-// list must not be empty.
+// validates it. Unknown or duplicate keys fail parsing (strict mode): every
+// field here is optional, so a mistyped key ("price" for "priceHourly") would
+// otherwise decode into an all-nil override that passes every bound below —
+// a silent no-op instead of the operator's intended pin. Each entry must have
+// a non-empty, unique name; any field that is set must satisfy its bound
+// (cpu > 0, memoryKi > 0, priceHourly >= 0). A name outside the static sizing
+// seed introduces a new flavor and must set all three fields — without the
+// price bound an unpriced new flavor would enter the catalogue at 0 EUR/h and
+// win every cheapest-first decision. The list must not be empty.
 func ParseFlavorOverrides(data []byte) ([]FlavorOverride, error) {
 	var overrides []FlavorOverride
-	if err := yaml.Unmarshal(data, &overrides); err != nil {
+	if err := yaml.UnmarshalStrict(data, &overrides); err != nil {
 		return nil, fmt.Errorf("unmarshaling flavor overrides: %w", err)
 	}
 	if len(overrides) == 0 {
