@@ -55,7 +55,8 @@ const (
 
 	// quotaBackoff is how long Create fails fast after a quota rejection
 	// instead of churning create/delete cycles against the Clever Cloud API.
-	// Any NodeGroup deletion clears the backoff since it frees capacity.
+	// Deleting a NodeGroup that may hold capacity clears the backoff; deleting
+	// one the operator refused and that never synced does not (see Delete).
 	quotaBackoff = time.Minute
 )
 
@@ -311,7 +312,7 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 			metrics.NodeGroupVanished.Inc(nil)
 			// The documented cause is the quota engine reclaiming an accepted
 			// group: arm the backoff so retries fail fast instead of looping
-			// create→vanish against the API. Any deletion clears it.
+			// create→vanish against the API. Freed capacity clears it.
 			p.recordQuotaRejection("an accepted nodegroup was reclaimed upstream (vanish); capacity is likely exhausted")
 			p.recorder.Publish(events.Event{
 				InvolvedObject: nodeClaim,
@@ -554,10 +555,74 @@ func (p *Provider) List(ctx context.Context) ([]ngv1.NodeGroup, error) {
 
 // Delete removes a NodeGroup; the Clever Cloud operator finalizer tears down
 // the VM and the Node object (~40s observed). Deletions free quota, so the
-// quota backoff is reset.
-func (p *Provider) Delete(ctx context.Context, name string) error {
-	p.clearQuotaRejection()
-	return p.kubeClient.Delete(ctx, &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: name}})
+// quota backoff is reset — except when the operator refused that very group
+// (a quota rejection or any other terminal refusal, ngv1.NodeGroup.IsRefused)
+// and it never synced: its VM never came up, so it held no capacity, and
+// clearing the backoff on its removal would send the next Create straight back
+// into an exhausted quota — whichever claim's rejection armed it. The
+// acceptance poll deletes the groups it sees refused directly, bypassing this
+// method, for the same reason. This removal is what karpenter-core's
+// termination runs after the nodegroupstatus controller fails a launch the
+// operator refused late, and what the GC runs on a refused group the
+// acceptance poll could not free. A Ready group always clears it: its VM holds
+// capacity whatever its later reconciles report.
+func (p *Provider) Delete(ctx context.Context, ng *ngv1.NodeGroup) error {
+	if ng.IsSynced() || !ng.IsRefused() {
+		p.clearQuotaRejection()
+	}
+	return p.kubeClient.Delete(ctx, &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: ng.Name}})
+}
+
+// RecordLateRefusal records a refusal the node-group operator published after
+// Create's acceptance poll had returned, the way Create records one it sees
+// within the poll, so that the re-plan that follows lands somewhere else. The
+// nodegroupstatus controller calls it once it has deleted the launched
+// NodeClaim of the refused group. A quota rejection arms the quota backoff; any
+// other refusal holds the flavor out of provisioning. Each is counted, and
+// published on the NodeClaim, under the same metric and event reason as a
+// refusal seen within the poll. A group that is not refused is ignored.
+func (p *Provider) RecordLateRefusal(nodeClaim *karpv1.NodeClaim, ng *ngv1.NodeGroup) {
+	if ng.IsQuotaExceeded() {
+		msg := ""
+		if cond := ng.GetCondition(ngv1.ConditionTypeReconcileFailed); cond != nil {
+			msg = cond.Message
+		}
+		p.recordQuotaRejection(msg)
+		metrics.NodeGroupQuotaRejections.Inc(nil)
+		p.recorder.Publish(events.Event{
+			InvolvedObject: nodeClaim,
+			Type:           corev1.EventTypeWarning,
+			Reason:         "NodeGroupQuotaExceeded",
+			Message: fmt.Sprintf("The organisation quota rejected NodeGroup %s after its launch (%s); the NodeClaim was deleted so karpenter re-plans instead of waiting out the registration TTL, and new launches fail fast for up to %s (freed capacity clears it)",
+				ng.Name, DescribeFailure(ngv1.ReasonQuotaExceeded, msg), quotaBackoff),
+			DedupeValues: []string{nodeClaim.Name},
+		})
+		return
+	}
+	reason, message, refused := ng.Refusal()
+	if !refused {
+		return
+	}
+	p.recordFlavorRejection(ng.Spec.Flavor)
+	metrics.NodeGroupRejections.Inc(nil)
+	p.recorder.Publish(events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeWarning,
+		Reason:         "NodeGroupRejected",
+		Message: fmt.Sprintf("Clever Cloud refused flavor %s for NodeGroup %s after its launch (%s); the NodeClaim was deleted so karpenter re-plans instead of waiting out the registration TTL, and that flavor is held out of provisioning for %s so the scheduler relaxes to another one",
+			ng.Spec.Flavor, ng.Name, DescribeFailure(reason, message), flavorBackoff),
+		DedupeValues: []string{nodeClaim.Name},
+	})
+}
+
+// DescribeFailure renders an operator condition's reason and message for an
+// event or a log line; the message can be empty (live: quota rejections no
+// longer carry one).
+func DescribeFailure(reason, message string) string {
+	if message == "" {
+		return reason
+	}
+	return reason + ": " + message
 }
 
 // nodeGroupLabels computes the node labels carried by the NodeGroup so that

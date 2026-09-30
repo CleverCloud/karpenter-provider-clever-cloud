@@ -615,7 +615,7 @@ func TestQuotaBackoffFailsFastUntilDelete(t *testing.T) {
 	}
 
 	// Deleting a NodeGroup frees capacity and clears the backoff.
-	if err := provider.Delete(context.Background(), existing.Name); err != nil {
+	if err := provider.Delete(context.Background(), existing); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	third := testNodeClaim("default-quot3")
@@ -624,6 +624,117 @@ func TestQuotaBackoffFailsFastUntilDelete(t *testing.T) {
 	<-done
 	if err != nil {
 		t.Fatalf("expected Create to succeed after capacity freed, got %v", err)
+	}
+}
+
+// quotaRejectedStatus is the live shape of a quota rejection: the operator's
+// first status write, with an empty message.
+func quotaRejectedStatus() ngv1.NodeGroupStatus {
+	return ngv1.NodeGroupStatus{
+		Phase:      ngv1.PhaseQuotaExceeded,
+		Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReconcileFailed, ngv1.ReasonQuotaExceeded, "")},
+	}
+}
+
+func TestDeleteKeepsTheQuotaBackoffForARefusedGroup(t *testing.T) {
+	// A group the quota engine rejected held no capacity. Deleting it, as
+	// karpenter-core's termination does once the nodegroupstatus controller
+	// has failed its launch, must leave armed the backoff its rejection armed.
+	rejected := ownedNodeGroup("default-late1", "2XS", quotaRejectedStatus())
+	// Nor did a group the operator refused for any other reason before it
+	// synced. Deleting it must not disarm a backoff another claim's quota
+	// rejection armed: the next Create would go back into the exhausted quota.
+	refused := ownedNodeGroup("default-late2", "M", ngv1.NodeGroupStatus{
+		Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReconcileFailed, "FlavorUnavailable", "flavor M is not available")},
+	})
+	// A running group whose later scale-up the quota refused is still Ready:
+	// its VM holds capacity, and deleting it frees that capacity.
+	scaled := ownedNodeGroup("default-run01", "2XS", ngv1.NodeGroupStatus{
+		Phase: ngv1.PhaseQuotaExceeded,
+		Conditions: []ngv1.NodeGroupCondition{
+			condTrue(ngv1.ConditionTypeReady, "Synced", ""),
+			condTrue(ngv1.ConditionTypeReconcileFailed, ngv1.ReasonQuotaExceeded, ""),
+		},
+	})
+	provider, kubeClient := newTestProvider(t, rejected, refused, scaled)
+	nodeClass := testNodeClass("default")
+
+	provider.RecordLateRefusal(testNodeClaim(rejected.Name), rejected)
+	if err := provider.Delete(context.Background(), rejected); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: rejected.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
+		t.Errorf("expected the rejected nodegroup deleted, got %v", err)
+	}
+	var quotaErr *nodegroup.ErrQuotaExceeded
+	if _, err := provider.Create(context.Background(), testNodeClaim("default-next1"), nodeClass, "2XS"); !errors.As(err, &quotaErr) {
+		t.Fatalf("expected the backoff to survive the deletion of the group the quota rejected, got %T: %v", err, err)
+	}
+
+	if err := provider.Delete(context.Background(), refused); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: refused.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
+		t.Errorf("expected the refused nodegroup deleted, got %v", err)
+	}
+	if _, err := provider.Create(context.Background(), testNodeClaim("default-next3"), nodeClass, "2XS"); !errors.As(err, &quotaErr) {
+		t.Fatalf("expected the backoff to survive the deletion of a group refused before it synced, got %T: %v", err, err)
+	}
+
+	if err := provider.Delete(context.Background(), scaled); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	next := testNodeClaim("default-next2")
+	done := acceptOnceCreated(t, kubeClient, next.Name)
+	if _, err := provider.Create(context.Background(), next, nodeClass, "2XS"); err != nil {
+		t.Fatalf("expected deleting a Ready group to clear the backoff, got %v", err)
+	}
+	<-done
+}
+
+func TestRecordLateRefusal(t *testing.T) {
+	quota := ownedNodeGroup("default-lateq", "XS", quotaRejectedStatus())
+	refused := ownedNodeGroup("default-later", "M", ngv1.NodeGroupStatus{
+		Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReconcileFailed, "FlavorUnavailable", "flavor M is not available")},
+	})
+	transient := ownedNodeGroup("default-latet", "S", upstreamErrorStatus(false))
+	provider, _, recorder := newTestProviderWithRecorder(t)
+	quotaBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_quota_rejections_total")
+	rejectionsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total")
+
+	// Not a refusal: ignored.
+	provider.RecordLateRefusal(testNodeClaim(transient.Name), transient)
+	if len(recorder.reasons()) != 0 || len(provider.RejectedFlavors()) != 0 {
+		t.Fatalf("a transient failure must record nothing, got events %v and hold-outs %v", recorder.reasons(), provider.RejectedFlavors())
+	}
+
+	provider.RecordLateRefusal(testNodeClaim(refused.Name), refused)
+	if _, held := provider.RejectedFlavors()["M"]; !held || len(provider.RejectedFlavors()) != 1 {
+		t.Errorf("expected exactly the refused flavor held out, got %v", provider.RejectedFlavors())
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total") - rejectionsBefore; delta != 1 {
+		t.Errorf("rejections_total delta = %v, want 1", delta)
+	}
+	rejectedEvents := recorder.eventsWithReason("NodeGroupRejected")
+	if len(rejectedEvents) != 1 || !strings.Contains(rejectedEvents[0].Message, "FlavorUnavailable: flavor M is not available") ||
+		!strings.Contains(rejectedEvents[0].Message, "after its launch") {
+		t.Errorf("unexpected NodeGroupRejected events %+v", rejectedEvents)
+	}
+
+	provider.RecordLateRefusal(testNodeClaim(quota.Name), quota)
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_quota_rejections_total") - quotaBefore; delta != 1 {
+		t.Errorf("quota_rejections_total delta = %v, want 1", delta)
+	}
+	quotaEvents := recorder.eventsWithReason("NodeGroupQuotaExceeded")
+	if len(quotaEvents) != 1 || quotaEvents[0].Type != corev1.EventTypeWarning {
+		t.Errorf("unexpected NodeGroupQuotaExceeded events %+v", quotaEvents)
+	}
+	var quotaErr *nodegroup.ErrQuotaExceeded
+	if _, err := provider.Create(context.Background(), testNodeClaim("default-next3"), testNodeClass("default"), "2XS"); !errors.As(err, &quotaErr) {
+		t.Errorf("expected the late quota rejection to arm the backoff, got %T: %v", err, err)
+	}
+	if len(provider.RejectedFlavors()) != 1 {
+		t.Errorf("a quota rejection must not hold its flavor out, got %v", provider.RejectedFlavors())
 	}
 }
 
@@ -666,7 +777,7 @@ func TestDeleteRemovesNodeGroup(t *testing.T) {
 	}
 	provider, kubeClient := newTestProvider(t, ng)
 
-	if err := provider.Delete(context.Background(), ng.Name); err != nil {
+	if err := provider.Delete(context.Background(), ng); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: ng.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
@@ -674,7 +785,7 @@ func TestDeleteRemovesNodeGroup(t *testing.T) {
 	}
 	// NotFound is surfaced, not swallowed: the caller maps it to karpenter's
 	// NodeClaimNotFoundError.
-	if err := provider.Delete(context.Background(), ng.Name); !apierrors.IsNotFound(err) {
+	if err := provider.Delete(context.Background(), ng); !apierrors.IsNotFound(err) {
 		t.Errorf("expected NotFound on second delete, got %v", err)
 	}
 }

@@ -163,7 +163,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		if alive {
 			continue
 		}
-		if err := c.nodeGroupProvider.Delete(ctx, ng.Name); err != nil {
+		if err := c.nodeGroupProvider.Delete(ctx, ng); err != nil {
 			if apierrors.IsNotFound(err) {
 				// Someone else (owner-reference cascade, operator) deleted it
 				// between List and Delete — not this safety net's work.

@@ -62,6 +62,9 @@ func TestIsQuotaExceededByPhase(t *testing.T) {
 	if !ng.IsQuotaExceeded() {
 		t.Error("expected IsQuotaExceeded to be true on QuotaExceeded phase alone")
 	}
+	if !ng.IsRefused() {
+		t.Error("expected IsRefused to be true on QuotaExceeded phase alone")
+	}
 }
 
 func TestIsQuotaExceededByCondition(t *testing.T) {
@@ -224,6 +227,9 @@ func TestReconcileFailureClassification(t *testing.T) {
 			}
 			if refused && (reason != tt.wantReason || message != "msg-"+tt.wantReason) {
 				t.Errorf("Refusal() = (%q, %q), want (%q, %q)", reason, message, tt.wantReason, "msg-"+tt.wantReason)
+			}
+			if got := ng.IsRefused(); got != tt.wantRefused {
+				t.Errorf("IsRefused() = %v, want %v", got, tt.wantRefused)
 			}
 			reason, message, transient := ng.TransientFailure()
 			if transient != tt.wantTransient {

@@ -150,7 +150,7 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		// Deletion already in flight; Karpenter polls until NotFound.
 		return nil
 	}
-	if err := c.nodeGroupProvider.Delete(ctx, name); err != nil {
+	if err := c.nodeGroupProvider.Delete(ctx, ng); err != nil {
 		if apierrors.IsNotFound(err) {
 			return cloudprovider.NewNodeClaimNotFoundError(err)
 		}

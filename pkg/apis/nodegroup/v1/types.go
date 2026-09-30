@@ -178,6 +178,18 @@ func (in *NodeGroup) Refusal() (reason, message string, refused bool) {
 	return cond.Reason, cond.Message, true
 }
 
+// IsRefused reports whether the operator refused the group for good: the quota
+// engine rejected it (IsQuotaExceeded, which also matches on the phase alone),
+// or it carries any other terminal ReconcileFailed reason (Refusal). Like both,
+// it does not outrank IsSynced.
+func (in *NodeGroup) IsRefused() bool {
+	if in.IsQuotaExceeded() {
+		return true
+	}
+	_, _, refused := in.Refusal()
+	return refused
+}
+
 // TransientFailure returns the reason and message of a ReconcileFailed=True
 // condition whose reason the operator retries on its own
 // (transientFailureReasons), and whether one is present. It is not a refusal:
