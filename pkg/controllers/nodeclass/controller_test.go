@@ -20,10 +20,12 @@ import (
 	"context"
 	"errors"
 	"github.com/awslabs/operatorpkg/status"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -51,12 +53,28 @@ import (
 
 func newTestController(t *testing.T, objs ...client.Object) (*nodeclass.Controller, client.Client) {
 	t.Helper()
+	ctrl, kubeClient, _ := newTestControllerWithRecorder(t, objs...)
+	return ctrl, kubeClient
+}
+
+func newTestControllerWithRecorder(t *testing.T, objs ...client.Object) (*nodeclass.Controller, client.Client, *fakeRecorder) {
+	t.Helper()
 	kubeClient := fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(objs...).
 		WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
 		Build()
-	return nodeclass.NewController(kubeClient), kubeClient
+	recorder := &fakeRecorder{}
+	return nodeclass.NewController(kubeClient, recorder), kubeClient, recorder
+}
+
+// fakeRecorder captures published events for assertions.
+type fakeRecorder struct {
+	events []events.Event
+}
+
+func (r *fakeRecorder) Publish(evts ...events.Event) {
+	r.events = append(r.events, evts...)
 }
 
 func testNodeClass(name string, labels map[string]string) *v1alpha1.CleverNodeClass {
@@ -149,34 +167,18 @@ func TestReconcileRejectsLongLabelValues(t *testing.T) {
 }
 
 // TestReconcileRejectsUndeliverableLabels pins the classes of labels that used
-// to validate cleanly and then go missing or fail downstream: subdomained
-// kubernetes.io/ keys are dropped by the NodeGroup label filter and a NodeClass
-// label has no other path to the node, while malformed keys or values are
-// refused by the apiserver when the label lands on the Node — either way the
-// NodeClass must not go Ready, and the condition must say why.
+// to validate cleanly and then fail downstream: a malformed value on a key the
+// NodeGroup payload carries is refused by the NodeGroup CRD, and a malformed
+// key by the apiserver when the label lands on the Node — the NodeClass must
+// not go Ready, and the condition must say why. In the domains an upgrade
+// otherwise tolerates (TestReconcileKeepsLegacyLabelsReady), what v0.12.0
+// refused itself stays fatal too: it cannot have provisioned.
 func TestReconcileRejectsUndeliverableLabels(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		labels      map[string]string
 		wantMessage string
 	}{
-		{
-			name:        "subdomained kubernetes.io key",
-			labels:      map[string]string{"app.kubernetes.io/name": "web"},
-			wantMessage: "kubernetes.io/ domain",
-		},
-		{
-			name:        "topology.kubernetes.io key",
-			labels:      map[string]string{"topology.kubernetes.io/region": "par"},
-			wantMessage: "kubernetes.io/ domain",
-		},
-		{
-			// Not undeliverable but worse: it reached the node at join and
-			// told karpenter-core the node was initialized before it was.
-			name:        "karpenter.sh key",
-			labels:      map[string]string{"karpenter.sh/initialized": "true"},
-			wantMessage: "karpenter.sh domain",
-		},
 		{
 			name:        "key with invalid syntax",
 			labels:      map[string]string{"bad key": "x"},
@@ -186,6 +188,16 @@ func TestReconcileRejectsUndeliverableLabels(t *testing.T) {
 			name:        "value with a space",
 			labels:      map[string]string{"team": "not valid"},
 			wantMessage: "not a valid label value",
+		},
+		{
+			name:        "subdomained kubernetes.io key with a value over 63 characters",
+			labels:      map[string]string{"app.kubernetes.io/name": strings.Repeat("a", 64)},
+			wantMessage: "kubernetes.io/ domain",
+		},
+		{
+			name:        "karpenter.sh key with a value over 63 characters",
+			labels:      map[string]string{"karpenter.sh/capacity-type": strings.Repeat("a", 64)},
+			wantMessage: "karpenter.sh domain",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -225,6 +237,126 @@ func TestReconcileRecoversAfterFix(t *testing.T) {
 	nodeClass = getNodeClass(t, kubeClient, "default")
 	if !nodeClass.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).IsTrue() {
 		t.Errorf("expected ValidationSucceeded true after fix, got %+v", nodeClass.Status.Conditions)
+	}
+}
+
+// TestReconcileKeepsLegacyLabelsReady is the upgrade guard for keys v0.12.0
+// accepted and the shared rule now rejects: subdomained kubernetes.io/ keys
+// (v0.12.0 refused the kubernetes.io/ and node.kubernetes.io/ prefixes only)
+// and the karpenter.sh domain. A NodeClass carrying one went
+// ValidationSucceeded=False on upgrade, then NotReady, and Create refused
+// every launch from it: provisioning stopped for every NodePool using it, for
+// a key that had never reached a node (or, for karpenter.sh, no longer does).
+// It must stay Ready, and say what it ignores — in a condition that does not
+// gate readiness, and in a Warning event on the NodeClass. Label syntax does
+// not matter there: v0.12.0 never checked it, and dropped a subdomained
+// kubernetes.io/ key before its value could fail anything, so
+// app.kubernetes.io/part-of: "My Platform" provisioned under v0.12.0.
+func TestReconcileKeepsLegacyLabelsReady(t *testing.T) {
+	for _, tc := range []struct{ key, value string }{
+		{"app.kubernetes.io/part-of", "true"},
+		{"topology.kubernetes.io/zone", "true"},
+		{"karpenter.sh/initialized", "true"},
+		{"compatibility.karpenter.sh/x", "true"},
+		{"app.kubernetes.io/part-of", "My Platform"},
+		{"app.kubernetes.io/name", "a/b"},
+		{"karpenter.sh/bad key", "x"},
+		{"karpenter.sh/capacity-type", "not valid"},
+	} {
+		key := tc.key
+		t.Run(key+"="+tc.value, func(t *testing.T) {
+			ctrl, kubeClient, recorder := newTestControllerWithRecorder(t,
+				testNodeClass("default", map[string]string{"team": "data", key: tc.value}))
+
+			reconcileNodeClass(t, ctrl, "default")
+
+			nodeClass := getNodeClass(t, kubeClient, "default")
+			if !nodeClass.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).IsTrue() {
+				t.Errorf("expected ValidationSucceeded true, got %+v", nodeClass.Status.Conditions)
+			}
+			if !nodeClass.StatusConditions().Root().IsTrue() {
+				t.Errorf("a NodeClass carrying legacy key %s must stay Ready, got %+v", key, nodeClass.Status.Conditions)
+			}
+			ignored := nodeClass.StatusConditions().Get(v1alpha1.ConditionTypeLabelsIgnored)
+			if !ignored.IsTrue() {
+				t.Fatalf("expected LabelsIgnored true, got %+v", nodeClass.Status.Conditions)
+			}
+			if !strings.Contains(ignored.Message, key) || strings.Contains(ignored.Message, "team") {
+				t.Errorf("LabelsIgnored message %q must name %s and only the ignored keys", ignored.Message, key)
+			}
+			// No NodeGroup carries an older hash generation: removing the key
+			// drifts nothing, and the condition may say so.
+			if ignored.Reason != "LegacyLabelKeys" || !strings.Contains(ignored.Message, "Remove them: no node drifts for it") {
+				t.Errorf("LabelsIgnored = %s %q, want reason LegacyLabelKeys advising drift-free removal", ignored.Reason, ignored.Message)
+			}
+			if len(recorder.events) != 1 {
+				t.Fatalf("expected one event, got %+v", recorder.events)
+			}
+			event := recorder.events[0]
+			if event.Type != corev1.EventTypeWarning || event.Reason != "LabelsIgnored" || !strings.Contains(event.Message, key) {
+				t.Errorf("expected a Warning LabelsIgnored event naming %s, got %+v", key, event)
+			}
+			if event.InvolvedObject.(*v1alpha1.CleverNodeClass).Name != "default" {
+				t.Errorf("the event must be on the NodeClass, got %+v", event.InvolvedObject)
+			}
+			// Deduplicated per NodeClass, reason and key set: the status write
+			// this reconcile makes re-triggers it, and must not repeat the
+			// event.
+			if !slices.Equal(event.DedupeValues, []string{"default", "LegacyLabelKeys", key}) || event.DedupeTimeout == 0 {
+				t.Errorf("event must be deduplicated per NodeClass, reason and key set, got values %v, timeout %v",
+					event.DedupeValues, event.DedupeTimeout)
+			}
+		})
+	}
+}
+
+// TestReconcileReportsLegacyLabelsNextToFatalOnes: tolerating a legacy key
+// must not hide a label that stays fatal, nor the other way round.
+func TestReconcileReportsLegacyLabelsNextToFatalOnes(t *testing.T) {
+	ctrl, kubeClient := newTestController(t, testNodeClass("default", map[string]string{
+		"app.kubernetes.io/part-of": "shop",
+		"team":                      "not valid",
+	}))
+
+	reconcileNodeClass(t, ctrl, "default")
+
+	nodeClass := getNodeClass(t, kubeClient, "default")
+	validation := nodeClass.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded)
+	if !validation.IsFalse() || !strings.Contains(validation.Message, "not a valid label value") {
+		t.Errorf("expected ValidationSucceeded false on the invalid value, got %+v", validation)
+	}
+	if nodeClass.StatusConditions().Root().IsTrue() {
+		t.Errorf("expected the NodeClass not to be Ready, got %+v", nodeClass.Status.Conditions)
+	}
+	if ignored := nodeClass.StatusConditions().Get(v1alpha1.ConditionTypeLabelsIgnored); !ignored.IsTrue() ||
+		!strings.Contains(ignored.Message, "app.kubernetes.io/part-of") {
+		t.Errorf("expected LabelsIgnored true naming the legacy key, got %+v", ignored)
+	}
+}
+
+// TestReconcileClearsLabelsIgnoredOnceRemoved: removing the legacy keys is the
+// documented way out, and must leave no stale warning behind.
+func TestReconcileClearsLabelsIgnoredOnceRemoved(t *testing.T) {
+	ctrl, kubeClient, recorder := newTestControllerWithRecorder(t,
+		testNodeClass("default", map[string]string{"team": "data", "karpenter.sh/capacity-type": "on-demand"}))
+	reconcileNodeClass(t, ctrl, "default")
+
+	nodeClass := getNodeClass(t, kubeClient, "default")
+	nodeClass.Spec.Labels = map[string]string{"team": "data"}
+	if err := kubeClient.Update(context.Background(), nodeClass); err != nil {
+		t.Fatalf("updating nodeclass: %v", err)
+	}
+	reconcileNodeClass(t, ctrl, "default")
+
+	nodeClass = getNodeClass(t, kubeClient, "default")
+	if cond := nodeClass.StatusConditions().Get(v1alpha1.ConditionTypeLabelsIgnored); cond != nil {
+		t.Errorf("LabelsIgnored must be removed with the keys, got %+v", cond)
+	}
+	if !nodeClass.StatusConditions().Root().IsTrue() {
+		t.Errorf("expected Ready true, got %+v", nodeClass.Status.Conditions)
+	}
+	if len(recorder.events) != 1 {
+		t.Errorf("expected no event once the keys are gone, got %+v", recorder.events)
 	}
 }
 
@@ -294,7 +426,7 @@ func TestReconcileNotReadyWhenNodeGroupAPIUnserved(t *testing.T) {
 			},
 		}).
 		Build()
-	ctrl := nodeclass.NewController(kubeClient)
+	ctrl := nodeclass.NewController(kubeClient, noopRecorder{})
 
 	result, err := ctrl.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "default"}})
 	if err != nil {
@@ -333,7 +465,7 @@ func TestReconcileRequeuesOnStatusConflict(t *testing.T) {
 		}).
 		Build()
 
-	result := reconcileNodeClass(t, nodeclass.NewController(kubeClient), "default")
+	result := reconcileNodeClass(t, nodeclass.NewController(kubeClient, noopRecorder{}), "default")
 	if result.RequeueAfter != time.Second {
 		t.Errorf("RequeueAfter = %v, want 1s after a status conflict", result.RequeueAfter)
 	}
@@ -345,6 +477,16 @@ func TestReconcileRequeuesOnStatusConflict(t *testing.T) {
 const (
 	v1StampTeamData    = "3789529822245891689"  // labels: {team: data}
 	v1StampEmptyLabels = "14514438007709706818" // labels: {}
+)
+
+// Stamps written by v0.12.0 (generation v2), pinned the same way. v2 hashed
+// every label, delivered or not.
+const (
+	v2StampTeamData = "3789529822245891689" // labels: {team: data}
+	// labels: {team: data, app.kubernetes.io/part-of: shop}
+	v2StampTeamDataPartOf = "16335349422164111380"
+	// labels: {team: data, karpenter.sh/capacity-type: on-demand}
+	v2StampTeamDataCapacityType = "14653552794626866276"
 )
 
 // stampedNodeGroup is a managed NodeGroup of the given NodeClass as a
@@ -421,6 +563,16 @@ func TestReconcileMigratesHashOnlyWhenNodeClassUnchanged(t *testing.T) {
 		{name: "edited during the upgrade", labels: map[string]string{"team": "ml"}, stamp: v1StampTeamData, wantDrift: true},
 		{name: "edited during the upgrade, explicit v1", labels: map[string]string{"team": "ml"}, stamp: v1StampTeamData, version: "v1", wantDrift: true},
 		{name: "labels added to labels: {}", labels: map[string]string{"team": "data"}, stamp: v1StampEmptyLabels, wantDrift: true},
+		{name: "v2, unchanged", labels: map[string]string{"team": "data"}, stamp: v2StampTeamData, version: "v2"},
+		// v0.12.0 accepted these keys and v2 hashed them; v3 leaves them out.
+		// The unchanged NodeClass must migrate without drift all the same.
+		{name: "v2 with a legacy kubernetes.io key, unchanged", version: "v2",
+			labels: map[string]string{"team": "data", "app.kubernetes.io/part-of": "shop"}, stamp: v2StampTeamDataPartOf},
+		{name: "v2 with a legacy karpenter.sh key, unchanged", version: "v2",
+			labels: map[string]string{"team": "data", "karpenter.sh/capacity-type": "on-demand"}, stamp: v2StampTeamDataCapacityType},
+		{name: "v2, edited during the upgrade", labels: map[string]string{"team": "ml"}, stamp: v2StampTeamData, version: "v2", wantDrift: true},
+		{name: "v2 with a legacy key, delivered label edited during the upgrade", version: "v2",
+			labels: map[string]string{"team": "ml", "app.kubernetes.io/part-of": "shop"}, stamp: v2StampTeamDataPartOf, wantDrift: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			nodeClass := testNodeClass("default", tc.labels)
@@ -451,6 +603,254 @@ func TestReconcileMigratesHashOnlyWhenNodeClassUnchanged(t *testing.T) {
 				t.Errorf("IsDrifted = %q after migrating an unchanged NodeClass: the upgrade would replace every node", reason)
 			}
 		})
+	}
+}
+
+// TestRemovingALegacyLabelDriftsNoNode is the way out of the upgrade trap,
+// end to end. A NodeClass admitted by v0.12.0 with a key the shared rule now
+// rejects backs nodes stamped by v0.12.0 (v2, which hashed that key) and nodes
+// launched since (v3, which does not). Removing the key — what the
+// LabelsIgnored warning asks for — changes nothing any NodeGroup carries, so
+// it must drift none of them: when the hash covered the raw labels, it
+// replaced the whole fleet.
+func TestRemovingALegacyLabelDriftsNoNode(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		key     string
+		value   string
+		v2Stamp string
+	}{
+		{name: "kubernetes.io subdomain", key: "app.kubernetes.io/part-of", value: "shop", v2Stamp: v2StampTeamDataPartOf},
+		{name: "karpenter.sh", key: "karpenter.sh/capacity-type", value: "on-demand", v2Stamp: v2StampTeamDataCapacityType},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			legacy := testNodeClass("default", map[string]string{"team": "data", tc.key: tc.value})
+			fromV012 := stampedNodeGroup("default-v0120", "default", tc.v2Stamp, "v2")
+			sinceUpgrade := stampedNodeGroup("default-since", "default", legacy.Hash(), v1alpha1.NodeClassHashVersion)
+			ctrl, kubeClient := newTestController(t, legacy, fromV012, sinceUpgrade,
+				testNodeClaim(fromV012.Name, "default"), testNodeClaim(sinceUpgrade.Name, "default"))
+
+			// The upgrade: the controller keeps the NodeClass Ready and
+			// migrates the v0.12.0 group.
+			reconcileNodeClass(t, ctrl, "default")
+			nodeClass := getNodeClass(t, kubeClient, "default")
+			if !nodeClass.StatusConditions().Root().IsTrue() {
+				t.Fatalf("expected the NodeClass to stay Ready, got %+v", nodeClass.Status.Conditions)
+			}
+			if v := getNodeGroup(t, kubeClient, fromV012.Name).Annotations[v1alpha1.NodeClassHashVersionAnnotationKey]; v != v1alpha1.NodeClassHashVersion {
+				t.Fatalf("the v0.12.0 group was not migrated: hash version %q", v)
+			}
+			// The advice the operator acts on, written after that migration.
+			if cond := nodeClass.StatusConditions().Get(v1alpha1.ConditionTypeLabelsIgnored); cond.Reason != "LegacyLabelKeys" ||
+				!strings.Contains(cond.Message, "Remove them: no node drifts for it") {
+				t.Fatalf("expected LabelsIgnored to advise drift-free removal once every group is migrated, got %+v", cond)
+			}
+
+			// The way out: remove the key.
+			nodeClass.Spec.Labels = map[string]string{"team": "data"}
+			if err := kubeClient.Update(context.Background(), nodeClass); err != nil {
+				t.Fatalf("updating nodeclass: %v", err)
+			}
+			reconcileNodeClass(t, ctrl, "default")
+			for _, ng := range []*ngv1.NodeGroup{fromV012, sinceUpgrade} {
+				if reason := isDrifted(t, kubeClient, ng.Name); reason != "" {
+					t.Errorf("nodegroup %s: IsDrifted = %q after removing %s, which the NodeGroup payload does not carry: "+
+						"the whole fleet would be replaced for an identical NodeGroup spec", ng.Name, reason, tc.key)
+				}
+			}
+
+			// A delivered label still drifts: the hash did not go blind.
+			nodeClass = getNodeClass(t, kubeClient, "default")
+			nodeClass.Spec.Labels = map[string]string{"team": "ml"}
+			if err := kubeClient.Update(context.Background(), nodeClass); err != nil {
+				t.Fatalf("updating nodeclass: %v", err)
+			}
+			for _, ng := range []*ngv1.NodeGroup{fromV012, sinceUpgrade} {
+				if reason := isDrifted(t, kubeClient, ng.Name); reason != cloudprovider.NodeClassDrifted {
+					t.Errorf("nodegroup %s: IsDrifted = %q after editing a delivered label, want %q", ng.Name, reason, cloudprovider.NodeClassDrifted)
+				}
+			}
+		})
+	}
+}
+
+// TestRemovingALegacyLabelBeforeTheMigrationDrifts pins the conservative side
+// of the upgrade order. A key removed before the upgraded controller
+// re-stamped the NodeGroups v0.12.0 built (before the upgrade, in the same
+// change as the upgrade, or while v0.12.0 still runs) leaves those groups with
+// a v2 stamp of labels that included the key. v3's equivalence cannot be
+// enumerated backwards, so nothing proves that stamp describes the current
+// spec: the group keeps it and its node drifts, a replacement rather than a
+// hidden edit. That is why LabelsIgnored, the README and docs/observability.md
+// say to remove the keys only once the migration is done.
+func TestRemovingALegacyLabelBeforeTheMigrationDrifts(t *testing.T) {
+	cleaned := testNodeClass("default", map[string]string{"team": "data"})
+	fromV012 := stampedNodeGroup("default-v0120", "default", v2StampTeamDataPartOf, "v2")
+	ctrl, kubeClient := newTestController(t, cleaned, fromV012, testNodeClaim(fromV012.Name, "default"))
+
+	reconcileNodeClass(t, ctrl, "default")
+
+	if got := getNodeGroup(t, kubeClient, fromV012.Name); !equality.Semantic.DeepEqual(got.Annotations, fromV012.Annotations) {
+		t.Errorf("the v2 stamp of a NodeClass that lost a key since was rewritten: %v, want %v", got.Annotations, fromV012.Annotations)
+	}
+	if reason := isDrifted(t, kubeClient, fromV012.Name); reason != cloudprovider.NodeClassDrifted {
+		t.Errorf("IsDrifted = %q, want %q", reason, cloudprovider.NodeClassDrifted)
+	}
+	if cond := getNodeClass(t, kubeClient, "default").StatusConditions().Get(v1alpha1.ConditionTypeLabelsIgnored); cond != nil {
+		t.Errorf("no key is left to report, got %+v", cond)
+	}
+}
+
+// TestLabelsIgnoredWaitsForTheHashMigration pins the advice LabelsIgnored gives
+// against what removing the keys does. A NodeGroup still stamped by v0.12.0
+// (v2) carries a hash of the ignored keys, so removing them drifts it. The
+// migration runs before the condition is written, and the condition promises
+// drift-free removal only when no such NodeGroup is left: not while one keeps
+// its v2 stamp because its NodeClaim is already Drifted, its NodeClass changed
+// since it was built, or the controller could not write it, and not when the
+// NodeGroups could not even be listed.
+func TestLabelsIgnoredWaitsForTheHashMigration(t *testing.T) {
+	legacy := map[string]string{"team": "data", "app.kubernetes.io/part-of": "shop"}
+	nodeGroupWriteFails := interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*ngv1.NodeGroup); ok {
+				return errors.New("nodegroup write failed")
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	}
+	// The API probe (Limit 1, no selector) succeeds; the migration's list of
+	// the NodeClass's groups fails.
+	nodeGroupsUnlisted := interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			listOpts := (&client.ListOptions{}).ApplyOptions(opts)
+			if _, ok := list.(*ngv1.NodeGroupList); ok && listOpts.LabelSelector != nil {
+				return errors.New("nodegroup list failed")
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	}
+	for _, tc := range []struct {
+		name             string
+		labels           map[string]string
+		nodeClaimDrifted bool
+		funcs            interceptor.Funcs
+		wantErr          bool
+		wantAdvice       string
+	}{
+		{name: "nodeclaim already drifted", labels: legacy, nodeClaimDrifted: true, wantAdvice: "drifts the 1 NodeGroup(s)"},
+		{name: "nodeclass edited since the group was built", labels: map[string]string{"team": "ml", "app.kubernetes.io/part-of": "shop"},
+			wantAdvice: "drifts the 1 NodeGroup(s)"},
+		{name: "nodegroup write fails", labels: legacy, funcs: nodeGroupWriteFails, wantErr: true, wantAdvice: "drifts the 1 NodeGroup(s)"},
+		{name: "nodegroups cannot be listed", labels: legacy, funcs: nodeGroupsUnlisted, wantErr: true, wantAdvice: "could not be listed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ng := stampedNodeGroup("default-v0120", "default", v2StampTeamDataPartOf, "v2")
+			nodeClaim := testNodeClaim(ng.Name, "default")
+			if tc.nodeClaimDrifted {
+				nodeClaim.StatusConditions().SetTrue(karpv1.ConditionTypeDrifted)
+			}
+			kubeClient := fake.NewClientBuilder().
+				WithScheme(scheme.Scheme).
+				WithObjects(testNodeClass("default", tc.labels), ng, nodeClaim).
+				WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
+				WithInterceptorFuncs(tc.funcs).
+				Build()
+			recorder := &fakeRecorder{}
+
+			result, err := nodeclass.NewController(kubeClient, recorder).Reconcile(context.Background(),
+				reconcile.Request{NamespacedName: types.NamespacedName{Name: "default"}})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Reconcile error = %v, want error: %v", err, tc.wantErr)
+			}
+			// Nothing about the NodeClass changes when the node is replaced or
+			// its NodeClaim condition clears: the controller rechecks itself.
+			if !tc.wantErr && result.RequeueAfter != time.Minute {
+				t.Errorf("RequeueAfter = %v, want 1m while a NodeGroup is not migrated", result.RequeueAfter)
+			}
+			cond := getNodeClass(t, kubeClient, "default").StatusConditions().Get(v1alpha1.ConditionTypeLabelsIgnored)
+			if !cond.IsTrue() || cond.Reason != "HashMigrationPending" {
+				t.Fatalf("expected LabelsIgnored true with reason HashMigrationPending, got %+v", cond)
+			}
+			if strings.Contains(cond.Message, "no node drifts") || !strings.Contains(cond.Message, tc.wantAdvice) {
+				t.Errorf("LabelsIgnored message %q must not promise drift-free removal, and must say %q", cond.Message, tc.wantAdvice)
+			}
+			if len(recorder.events) != 1 || recorder.events[0].Message != cond.Message {
+				t.Errorf("expected one event carrying the condition's advice, got %+v", recorder.events)
+			}
+			if v := getNodeGroup(t, kubeClient, ng.Name).Annotations[v1alpha1.NodeClassHashVersionAnnotationKey]; v != "v2" {
+				t.Fatalf("the group was migrated (hash version %q): the case does not exercise a pending migration", v)
+			}
+
+			// The advice is right: removing the key now drifts the group.
+			nodeClass := getNodeClass(t, kubeClient, "default")
+			delete(nodeClass.Spec.Labels, "app.kubernetes.io/part-of")
+			if err := kubeClient.Update(context.Background(), nodeClass); err != nil {
+				t.Fatalf("updating nodeclass: %v", err)
+			}
+			if reason := isDrifted(t, kubeClient, ng.Name); reason != cloudprovider.NodeClassDrifted {
+				t.Errorf("IsDrifted = %q after removing the key, want %q", reason, cloudprovider.NodeClassDrifted)
+			}
+		})
+	}
+}
+
+// TestLabelsIgnoredAdvisesRemovalOnceMigrated: once the pending NodeGroup is
+// re-stamped, the same condition advises drift-free removal, the event says
+// so too (the new advice is not swallowed by the previous one's dedupe), and
+// removing the key then drifts nothing.
+func TestLabelsIgnoredAdvisesRemovalOnceMigrated(t *testing.T) {
+	ng := stampedNodeGroup("default-v0120", "default", v2StampTeamDataPartOf, "v2")
+	writeFails := true
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(testNodeClass("default", map[string]string{"team": "data", "app.kubernetes.io/part-of": "shop"}),
+			ng, testNodeClaim(ng.Name, "default")).
+		WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if _, ok := obj.(*ngv1.NodeGroup); ok && writeFails {
+					return errors.New("nodegroup write failed")
+				}
+				return cl.Patch(ctx, obj, patch, opts...)
+			},
+		}).
+		Build()
+	recorder := &fakeRecorder{}
+	ctrl := nodeclass.NewController(kubeClient, recorder)
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "default"}}
+
+	if _, err := ctrl.Reconcile(context.Background(), req); err == nil {
+		t.Fatal("expected the failed nodegroup write to fail the reconcile, so that it is retried")
+	}
+	if cond := getNodeClass(t, kubeClient, "default").StatusConditions().Get(v1alpha1.ConditionTypeLabelsIgnored); cond.Reason != "HashMigrationPending" {
+		t.Fatalf("expected reason HashMigrationPending while the write fails, got %+v", cond)
+	}
+
+	writeFails = false
+	if result := reconcileNodeClass(t, ctrl, "default"); result != (reconcile.Result{}) {
+		t.Errorf("unexpected result %+v once nothing is pending", result)
+	}
+	if v := getNodeGroup(t, kubeClient, ng.Name).Annotations[v1alpha1.NodeClassHashVersionAnnotationKey]; v != v1alpha1.NodeClassHashVersion {
+		t.Fatalf("the group was not migrated: hash version %q", v)
+	}
+	cond := getNodeClass(t, kubeClient, "default").StatusConditions().Get(v1alpha1.ConditionTypeLabelsIgnored)
+	if cond.Reason != "LegacyLabelKeys" || !strings.Contains(cond.Message, "Remove them: no node drifts for it") {
+		t.Fatalf("expected LabelsIgnored to advise drift-free removal once migrated, got %+v", cond)
+	}
+	if len(recorder.events) != 2 || recorder.events[1].Message != cond.Message ||
+		slices.Equal(recorder.events[0].DedupeValues, recorder.events[1].DedupeValues) {
+		t.Errorf("expected a second event with the new advice and its own dedupe key, got %+v", recorder.events)
+	}
+
+	nodeClass := getNodeClass(t, kubeClient, "default")
+	nodeClass.Spec.Labels = map[string]string{"team": "data"}
+	if err := kubeClient.Update(context.Background(), nodeClass); err != nil {
+		t.Fatalf("updating nodeclass: %v", err)
+	}
+	reconcileNodeClass(t, ctrl, "default")
+	if reason := isDrifted(t, kubeClient, ng.Name); reason != "" {
+		t.Errorf("IsDrifted = %q after removing the key as advised", reason)
 	}
 }
 
@@ -508,7 +908,7 @@ func TestReconcileLeavesCurrentGenerationGroupsAlone(t *testing.T) {
 		}).
 		Build()
 
-	reconcileNodeClass(t, nodeclass.NewController(kubeClient), "default")
+	reconcileNodeClass(t, nodeclass.NewController(kubeClient, noopRecorder{}), "default")
 
 	if nodeClaimReads != 0 || nodeGroupWrites != 0 {
 		t.Errorf("current-generation NodeGroups were migrated: %d nodeclaim reads, %d nodegroup writes, want none",

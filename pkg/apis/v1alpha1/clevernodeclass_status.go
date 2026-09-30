@@ -29,6 +29,15 @@ const (
 	// on anything but a CKE cluster the NodeClass must not go Ready, so the
 	// failure surfaces here instead of at the first Create.
 	ConditionTypeNodeGroupAPIServed = "NodeGroupAPIServed"
+	// ConditionTypeLabelsIgnored is true while spec.labels carries keys that
+	// v0.12.0 accepted and the current rule rejects (IsLegacyNodeClassLabel):
+	// they are not delivered to nodes, and the message names them. Its reason
+	// says whether removing them drifts nodes: LegacyLabelKeys once no
+	// NodeGroup of the NodeClass carries an older hash generation (which
+	// hashed them), HashMigrationPending while some still do. It is
+	// informational — deliberately not a readiness dependent, so such a
+	// NodeClass keeps provisioning — and it is removed once the keys are.
+	ConditionTypeLabelsIgnored = "LabelsIgnored"
 )
 
 // CleverNodeClassStatus contains the resolved state of the CleverNodeClass

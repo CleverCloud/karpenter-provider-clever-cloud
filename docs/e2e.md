@@ -27,7 +27,12 @@ What it pins down:
   exercises this), everything CEL cannot express degrades to
   `ValidationSucceeded=False`; the readiness conditions (including the
   NodeGroup API probe against real discovery) and the termination finalizer
-  blocking deletion while a NodeClaim references the class.
+  blocking deletion while a NodeClaim references the class. A NodeClass
+  admitted under v0.12.0's narrower CEL rule (installed for the test) with keys
+  the current rule rejects: validation ratcheting admits every write that
+  leaves `spec.labels` alone, the controller keeps it Ready with
+  `LabelsIgnored`, an edit of `spec.labels` that keeps such a key is refused,
+  and removing it is admitted.
 - **providerid stamping** through a real watch: managed worker nodes get
   `clevercloud://<nodegroup>`, unmanaged ones are left alone.
 

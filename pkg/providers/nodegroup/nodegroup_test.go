@@ -370,6 +370,13 @@ func TestCreateFiltersReservedNodeGroupLabels(t *testing.T) {
 			t.Errorf("nodegroup label %s = %q, want %q", k, got, v)
 		}
 	}
+	// The stamped hash describes what the NodeClass put in the payload, not
+	// its raw labels: dropping a filtered key later must not drift the node.
+	delivered := testNodeClass("default")
+	delivered.Spec.Labels = map[string]string{"team": "data"}
+	if got := ng.Annotations[v1alpha1.NodeClassHashLabelKey]; got != delivered.Hash() {
+		t.Errorf("nodeclass hash annotation = %q, want %q (the hash of the delivered labels only)", got, delivered.Hash())
+	}
 }
 
 // TestCreateKeepsKarpenterLabelsOutOfTheNodeGroup pins the payload against the

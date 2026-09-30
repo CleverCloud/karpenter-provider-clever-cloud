@@ -37,7 +37,7 @@ func NewControllers(kubeClient client.Client, uncached client.Reader, recorder e
 	return []controller.Controller{
 		providerid.NewController(kubeClient, uncached),
 		garbagecollection.NewController(kubeClient, uncached, nodeGroupProvider, recorder),
-		nodeclass.NewController(kubeClient),
+		nodeclass.NewController(kubeClient, recorder),
 		instancetypecapacity.NewController(kubeClient, instanceTypeProvider),
 	}
 }
