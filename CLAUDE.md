@@ -15,9 +15,10 @@ make test-envtest  # controllers against a real kube-apiserver (setup-envtest do
 make e2e         # full suite against a live CKE cluster (E2E_CONTEXT required — docs/e2e.md)
 make generate    # controller-gen: deepcopy + CleverNodeClass CRD → deploy/crds, then sync into both Helm charts
 make vet         # go vet ./...
-make lint        # golangci-lint v2 (config in .golangci.yml, runs via go run — no install needed)
+make lint        # golangci-lint v2 via go run (config in .golangci.yml, no install needed), on the Go toolchain go.mod pins like CI
 make vulncheck   # govulncheck pinned by GOVULNCHECK_VERSION, run under go.mod's go directive (fetches vuln.go.dev)
 make chart-lint  # helm lint + template both charts
+make test-chart  # go test ./test/chart/... — the controller placement guard (fails, not skips, without helm)
 make chart-package  # helm package both charts into dist/ (TAG=v<semver>; chart version = TAG without the v)
 make raw-manifest   # regenerate deploy/karpenter.yaml from charts/karpenter (never edit it by hand)
 make run         # build + run locally against current kubeconfig (DISABLE_LEADER_ELECTION=true)
@@ -97,7 +98,7 @@ Unit tests use the controller-runtime fake client (see `pkg/cloudprovider/cloudp
 
 ## CI
 
-PRs run `make vet`, `make build`, `make chart-lint`, a generated-files drift check (`make generate raw-manifest` must produce no diff), `make test`, `go test -race ./pkg/... ./cmd/...`, `make test-envtest`, golangci-lint (`ci-lint.yaml` — same version as `make lint`), CodeQL and `make vulncheck` (`codeql-analysis.yaml`, also daily — govulncheck is a separate job so a vulnerability finding can never skip CodeQL), and a git-hygiene gate (`git.yaml`: every commit message must be a Conventional Commit, no `fixup!`/`squash!` commits). Pushing a `v*` tag builds the image, pushes it to ghcr.io, and publishes both Helm charts as OCI artifacts to `oci://ghcr.io/<owner>/<repo>/charts/{karpenter,karpenter-crd}` (chart version = tag without the `v` prefix, appVersion = tag — the in-repo `Chart.yaml` versions are placeholders overridden at package time, but the release fails fast if they lag the tag: bump both files and run `make raw-manifest` in the release commit). Commit conventions are documented in CONTRIBUTING.md.
+PRs run `make vet`, `make build`, `make chart-lint`, `make test-chart`, a generated-files drift check (`make generate raw-manifest` must produce no diff), `make test`, `go test -race ./pkg/... ./cmd/...`, `make test-envtest`, golangci-lint (`ci-lint.yaml` — same version as `make lint`, which also runs it on the go.mod toolchain CI uses: a newer local Go's standard library can change findings or crash the analyzers), CodeQL and `make vulncheck` (`codeql-analysis.yaml`, also daily — govulncheck is a separate job so a vulnerability finding can never skip CodeQL), and a git-hygiene gate (`git.yaml`: every commit message must be a Conventional Commit, no `fixup!`/`squash!` commits). Pushing a `v*` tag builds the image, pushes it to ghcr.io, and publishes both Helm charts as OCI artifacts to `oci://ghcr.io/<owner>/<repo>/charts/{karpenter,karpenter-crd}` (chart version = tag without the `v` prefix, appVersion = tag — the in-repo `Chart.yaml` versions are placeholders overridden at package time, but the release fails fast if they lag the tag: bump both files and run `make raw-manifest` in the release commit). Commit conventions are documented in CONTRIBUTING.md.
 
 ## Operational constraints that shape the code
 

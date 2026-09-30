@@ -8,9 +8,9 @@ belongs upstream in [kubernetes-sigs/karpenter](https://github.com/kubernetes-si
 
 ## Development environment
 
-You need Go (the version pinned in [go.mod](go.mod)), `make`, and — for chart or deployment work —
-`helm` and `kubectl`. A ready-to-use [devcontainer](.devcontainer/) is included. Run `make help`
-for the list of targets.
+You need Go (the version pinned in [go.mod](go.mod) or newer), `make`, `helm` (the chart checks
+and the generated-manifest check below render the charts), and `kubectl` for deployment work. Run
+`make help` for the list of targets.
 
 The `go` directive in go.mod names one exact patch release: CI installs that release, and the
 [Dockerfile](Dockerfile) builder image is pinned to the same tag, because the golang image never
@@ -26,17 +26,28 @@ reported issue.
 
 ## Local validation chain
 
-Before opening a pull request, the local validation chain must be green:
+Before opening a pull request, the local validation chain must be green. It mirrors the build,
+test, lint and vulnerability gates CI runs on every pull request:
 
 ```sh
-make vet         # go vet
-make lint        # golangci-lint (see .golangci.yml)
+make vet
+make lint          # golangci-lint (see .golangci.yml)
 make build
 make test
-make generate    # must leave the tree clean — CI fails if it produces a diff
-make chart-lint  # when touching charts/ or deploy/
-make vulncheck   # govulncheck under the go.mod toolchain (fetches vuln.go.dev)
+go test -race ./pkg/... ./cmd/...
+make test-envtest  # controllers against a real kube-apiserver (downloads the envtest binaries)
+make chart-lint
+make test-chart    # go test ./test/chart/... — fails instead of skipping when helm is missing
+make vulncheck     # govulncheck under the go.mod toolchain (fetches vuln.go.dev)
+make generate raw-manifest && git status --porcelain  # on a committed tree: must print nothing
 ```
+
+`make lint` runs golangci-lint on the Go toolchain go.mod pins — the one CI lints with — whatever
+Go you have installed: a newer local Go changes the standard library the analyzers load, which
+can change the findings or crash them. The first run fetches that toolchain through the module
+proxy, like any module. `make generate raw-manifest` regenerates the CRDs, both chart copies and
+[deploy/karpenter.yaml](deploy/karpenter.yaml) from their sources; CI fails if it leaves a diff, so
+commit whatever it changes.
 
 `make vulncheck` reads the current vulnerability database, so it can turn red on an unchanged
 tree the day an advisory is published (CI also runs it daily, beside CodeQL). Fix such a finding
@@ -96,7 +107,7 @@ pushed to it):
    moves with it), fix any API breakage, then run `make generate` — it refreshes the vendored
    `karpenter.sh_*.yaml` CRDs from the module and syncs both chart copies. Review the CRD diff
    for schema changes users would see.
-3. Build and fix API breakages, run the full validation chain including `go test -race ./pkg/...`.
+3. Build and fix API breakages, then run the full [local validation chain](#local-validation-chain).
 4. Skim the karpenter-core release notes for behavior changes in provisioning, disruption, or the
    CloudProvider contract; call them out in the commit body.
 5. Remind users in the release notes that the `karpenter-crd` chart must be upgraded before the

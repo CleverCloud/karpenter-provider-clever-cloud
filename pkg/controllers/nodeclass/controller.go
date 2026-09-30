@@ -87,7 +87,12 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if !equality.Semantic.DeepEqual(stored, nodeClass) {
 		if err := c.kubeClient.Status().Patch(ctx, nodeClass, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 			if errors.IsConflict(err) {
-				return reconcile.Result{Requeue: true}, nil
+				// The NodeClass moved on since the informer handed it over;
+				// the newer version's watch event re-triggers this reconcile
+				// anyway, so this is only a backstop. A fixed second rather
+				// than the rate limiter's 5ms first step, which would mostly
+				// re-read the same stale cache and conflict again.
+				return reconcile.Result{RequeueAfter: time.Second}, nil
 			}
 			return reconcile.Result{}, client.IgnoreNotFound(err)
 		}
