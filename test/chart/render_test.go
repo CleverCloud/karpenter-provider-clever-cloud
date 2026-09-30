@@ -183,8 +183,8 @@ var removedPricingEnv = []string{
 }
 
 // legacyPricingValues is the settings.pricing block earlier releases shipped
-// and documented, with every key set: `helm upgrade --reuse-values` carries it
-// into an upgrade verbatim.
+// and documented, with every key set: an upgrade carries it verbatim when it
+// comes from an old values file or is reused from the previous release.
 const legacyPricingValues = `settings:
   pricing:
     enabled: true
@@ -197,7 +197,7 @@ const legacyPricingValues = `settings:
 
 // TestLegacyPricingValuesAreIgnored pins the upgrade path from a release that
 // still had the pricing refresher: its values must keep rendering (the schema
-// tolerates unknown keys, so --reuse-values does not fail the upgrade) and
+// tolerates unknown keys, so an upgrade still carrying them does not fail) and
 // must not bring back any of the removed env vars, in the chart or in the
 // raw manifest generated from it.
 func TestLegacyPricingValuesAreIgnored(t *testing.T) {

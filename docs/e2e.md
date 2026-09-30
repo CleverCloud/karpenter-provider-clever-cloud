@@ -70,6 +70,23 @@ E2E_CONTEXT=<kubeconfig-context> make e2e
 | `E2E_ARTIFACTS` | no | `$TMPDIR/karpenter-e2e` | controller log + pinned kubeconfig destination. |
 | `E2E_KEEP` | no | — | skip cleanup, for debugging a failed run. Everything left behind **bills hourly**. |
 
+**The target cluster must not be running the provider itself.** The suite
+starts its own controller with leader election disabled
+(`DISABLE_LEADER_ELECTION=true`), so an installed release does not stand by
+as a follower: both controllers act at once, provision for the same pending
+pods (extra billed VMs, the org quota reached early), and the scenarios,
+which assert on the suite controller's metrics, can fail whenever the
+in-cluster one does the work — the run stops testing the working tree alone.
+Scale an installed release down for the run and back to its own replica
+count afterwards (the chart's `replicas` value may be above 1):
+
+```sh
+replicas=$(kubectl --context <kubeconfig-context> -n karpenter get deployment/karpenter -o jsonpath='{.spec.replicas}')
+kubectl --context <kubeconfig-context> -n karpenter scale deployment/karpenter --replicas=0
+E2E_CONTEXT=<kubeconfig-context> make e2e
+kubectl --context <kubeconfig-context> -n karpenter scale deployment/karpenter --replicas="$replicas"
+```
+
 ### Scenarios (serial — they share the org quota)
 
 1. **Provision** — 2 pending pods → running pods; every NodeClaim
@@ -94,9 +111,9 @@ E2E_CONTEXT=<kubeconfig-context> make e2e
    once the workload is gone **nothing leaks** — the historical failure mode
    of the beta quota engine.
 
-A full green run takes ~25–35 minutes and transiently creates a handful of
-small VMs plus one or two XL (the quota scenario); everything is destroyed
-before the suite exits.
+A full green run takes about 10 minutes (599 s measured on 2026-09-30) and
+transiently creates a handful of small VMs plus one or two XL (the quota
+scenario); everything is destroyed before the suite exits.
 
 ### Cleanup guarantees
 

@@ -74,23 +74,36 @@ kubectl apply -f examples/v1/general-purpose.yaml
 # CRDs first (if installed)
 helm upgrade karpenter-crd \
   oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/karpenter-crd \
-  --version <version> -n karpenter
+  --version <version> --namespace karpenter --reset-then-reuse-values
 helm upgrade karpenter \
   oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/karpenter \
-  --version <version> -n karpenter --reuse-values
-helm uninstall karpenter -n karpenter   # CRDs, NodePools and NodeClasses are kept
+  --version <version> --namespace karpenter --reset-then-reuse-values
+helm uninstall karpenter --namespace karpenter   # CRDs, NodePools and NodeClasses are kept
 ```
+
+`--reset-then-reuse-values` (Helm ≥ 3.14) takes the new chart's defaults and
+re-applies only the values you set yourself. Never upgrade with
+`--reuse-values`: it replaces the new chart's defaults with the previous
+release's, so a default the new release changes silently never takes effect
+(v0.12.0's placement fix never reaches a `--reuse-values` upgrade from
+v0.11.0, whose controller stays `Pending` on `DEDICATED_COMPUTE` and
+`DISTRIBUTED`). An explicit values file (`-f` alone, with no reuse or reset
+flag) works as well, provided it holds every value you have customized and
+nothing else: Helm then reuses none of the previous release's values, so
+anything set earlier and missing from the file is dropped, and a full copy of
+an older `values.yaml` pins every default the same way.
 
 The controller talks to nothing but the cluster's Kubernetes API: it needs no
 Clever Cloud API token and no egress beyond the API server. Earlier releases
-had a `settings.pricing` block (a dynamic pricing refresher, since removed); a
-`--reuse-values` upgrade that still carries it renders fine and the values are
-ignored. The opposite holds for `priceHourly`, which `settings.flavors`
-entries no longer accept: a reused entry that still carries it makes the
-upgrade above fail schema validation (`additional properties 'priceHourly' not
-allowed`). Pass the corrected list explicitly, since a list given with `-f` or
-`--set-json` replaces the reused one: `--set-json 'settings.flavors=[]'` drops
-the overrides (see the
+had a `settings.pricing` block (a dynamic pricing refresher, since removed); an
+upgrade that still carries it, from your values file or reused from the
+previous release, renders fine and the values are ignored. The opposite holds
+for `priceHourly`, which `settings.flavors` entries no longer accept: an entry
+that still carries it, from your values file or reused from the previous
+release, makes the upgrade above fail schema validation (`additional
+properties 'priceHourly' not allowed`). Pass the corrected list explicitly,
+since a list given with `-f` or `--set-json` replaces the reused one:
+`--set-json 'settings.flavors=[]'` drops the overrides (see the
 [upgrade notes](../../docs/getting-started/installation.md#upgrading)).
 
 Before uninstalling for good, scale your Karpenter-backed workloads down

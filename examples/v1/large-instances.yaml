@@ -2,9 +2,11 @@
 # (M and up), excluding the small ones. Fewer, bigger nodes reduce the
 # per-node daemonset overhead for dense workloads.
 #
-# NOTE: with the default organisation quota (40 vCPU / 40 GB RAM including
-# the control plane), L (24 GB) and XL (32 GB) workers usually cannot fit —
-# ask Clever Cloud support for a quota raise before relying on them.
+# NOTE: this pool needs quota headroom beyond the default organisation quota
+# (40 vCPU / 40 GB RAM including the control plane). A 3-node S control plane
+# alone leaves 16 vCPU / 4 GB for workers, not enough memory for any flavor
+# listed here (M 16 GB, L 24 GB, XL 32 GB): ask Clever Cloud support for a
+# quota raise before relying on it.
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
@@ -22,9 +24,13 @@ spec:
         - key: node.kubernetes.io/instance-type
           operator: In
           values: ["M", "L", "XL"]
+  # Sized to admit every flavor listed above, not to fit the default quota:
+  # Karpenter never launches a flavor whose capacity exceeds the pool's
+  # remaining limits, so a 16Gi memory limit would silently shut L and XL out
+  # and leave this pool launching M only.
   limits:
-    cpu: "16"
-    memory: 16Gi
+    cpu: "32"
+    memory: 64Gi
   disruption:
     consolidationPolicy: WhenEmptyOrUnderutilized
     consolidateAfter: 30s

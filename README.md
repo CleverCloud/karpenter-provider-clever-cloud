@@ -24,8 +24,10 @@ ghcr.io.
 ## Install
 
 To deploy the provider you will need a running CKE cluster (Kubernetes ≥ 1.34), the `kubectl` command with
-cluster-admin access and `helm`. The step-by-step
-[installation guide](docs/getting-started/installation.md) covers CRD handling, verification, upgrades and uninstall.
+cluster-admin access and `helm` ≥ 3.14. The step-by-step
+[installation guide](docs/getting-started/installation.md) covers CRD handling, verification, upgrades and uninstall —
+upgrade with `--reset-then-reuse-values`, never `--reuse-values`, which keeps the previous release's chart defaults, so
+a default the new release changes silently never takes effect.
 
 > **Warning:** Do not enable CKE's own `autoscalingEnabled` on the cluster alongside this provider — two autoscalers
 > will fight over the same NodeGroups.
@@ -234,7 +236,7 @@ spec:
 ```
 
 Size `limits` against your organisation quota: the default org quota is 40 vCPU / 40 GB RAM **including the control
-plane** (a 3-node `S` control plane consumes 24 GB of it).
+plane** (a 3-node `S` control plane consumes 24 vCPU / 36 GB of it, leaving 16 vCPU / 4 GB for workers).
 
 ### CleverNodeClass
 
@@ -322,6 +324,12 @@ such a rule limited nothing. Its replicas beyond the first keep running where th
 older nodes are gone (or labelled by hand) a replica that has to be rescheduled stays Pending, and
 Karpenter cannot launch a node for it. Key such a rule on `kubernetes.io/hostname` to keep one replica
 per node.
+
+## Observability
+
+The controller serves Prometheus metrics on `:8080/metrics`, exposed by the chart's `karpenter` Service, and publishes
+Kubernetes Events on the NodeClaims and NodeGroups it acts on. The [observability runbook](docs/observability.md) lists
+every provider metric and event, what each one means and what to do when it moves, with suggested alert expressions.
 
 ## License
 
