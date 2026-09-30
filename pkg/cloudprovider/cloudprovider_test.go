@@ -648,10 +648,12 @@ func TestGetEnrichesSynthesizedTypeWithObservedCapacity(t *testing.T) {
 	}
 
 	// A live node reports real capacity; the synthesized type picks it up.
-	itp.RecordObservedCapacity("CUSTOM",
+	if _, err := itp.RecordObservedCapacity("CUSTOM",
 		corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6"), corev1.ResourceMemory: resource.MustParse("8Gi")},
 		corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6"), corev1.ResourceMemory: resource.MustParse("7Gi")},
-	)
+	); err != nil {
+		t.Fatalf("RecordObservedCapacity: %v", err)
+	}
 	claim, err = cp.Get(context.Background(), "clevercloud://default-cust1")
 	if err != nil {
 		t.Fatalf("Get after observation: %v", err)

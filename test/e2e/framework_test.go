@@ -344,15 +344,28 @@ func (f *framework) eventually(ctx context.Context, timeout time.Duration, what 
 }
 
 // metric returns the summed value of a provider metric across its label
-// variants, scraped from the out-of-cluster controller's endpoint.
+// variants, scraped from the out-of-cluster controller's endpoint — 0 when the
+// scrape fails or the series is absent, which suits the polling callers that
+// retry. A check that asserts 0 must use scrapeMetric, or a dead endpoint
+// passes it.
 func (f *framework) metric(name string) float64 {
+	f.t.Helper()
+	total, _, _ := f.scrapeMetric(name)
+	return total
+}
+
+// scrapeMetric is metric with its failure modes: an error when the endpoint
+// cannot be scraped, and found=false when it exposes no series of name.
+func (f *framework) scrapeMetric(name string) (total float64, found bool, err error) {
 	f.t.Helper()
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", f.metricsPort))
 	if err != nil {
-		return 0
+		return 0, false, err
 	}
 	defer resp.Body.Close()
-	var total float64
+	if resp.StatusCode != http.StatusOK {
+		return 0, false, fmt.Errorf("GET /metrics: %s", resp.Status)
+	}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for scanner.Scan() {
@@ -371,9 +384,10 @@ func (f *framework) metric(name string) float64 {
 		v, err := strconv.ParseFloat(fields[len(fields)-1], 64)
 		if err == nil {
 			total += v
+			found = true
 		}
 	}
-	return total
+	return total, found, scanner.Err()
 }
 
 // hasEvent reports whether an event with the given reason exists for the

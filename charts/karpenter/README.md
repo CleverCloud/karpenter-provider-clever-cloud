@@ -62,7 +62,7 @@ kubectl apply -f examples/v1/general-purpose.yaml
 | `settings.disableLeaderElection` | `false` | For single-replica dev setups |
 | `settings.batchMaxDuration` / `batchIdleDuration` | `10s` / `1s` | Pod batching windows |
 | `settings.featureGates.nodeRepair` | `false` | Enable node auto-repair |
-| `settings.flavors` | `[]` | Per-flavor overrides overlaid on the built-in catalogue (`name` required; `cpu`/`memoryKi` optional). No price field: prices are derived from cpu and memoryKi, so pin every flavor the same way or none, and a leftover `priceHourly` fails schema validation. Empty = built-in catalogue unchanged. Mounted via a ConfigMap; overrides always win |
+| `settings.flavors` | `[]` | Per-flavor overrides overlaid on the built-in catalogue (`name` required; `cpu`/`memoryKi` optional). No price field: prices are derived from cpu and memoryKi, so pin every flavor the same way or none, and a leftover `priceHourly` fails schema validation. Empty = built-in catalogue unchanged. Mounted via a ConfigMap; overrides always win. Nodes of the controller's own NodeGroups then correct memory within 10% of the entry (same cpu required; prices do not follow); a pin further off is served as-is and its nodes are counted as refused reports |
 | `controller.resources` | 200m/256Mi, limit 512Mi | Controller container resources |
 | `controller.env` | `[]` | Extra environment variables |
 | `service.enabled` | `true` | ClusterIP service exposing `/metrics` |

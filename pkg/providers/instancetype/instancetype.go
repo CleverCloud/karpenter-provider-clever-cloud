@@ -17,14 +17,15 @@ limitations under the License.
 // Package instancetype exposes the Clever Kubernetes Engine node flavors as
 // Karpenter instance types.
 //
-// Capacity figures for 2XS/XS/S/M were measured on live CKE nodes
-// (status.capacity); L and XL are derived from the documented specs
-// (https://www.clever.cloud/developers/doc/kubernetes/) using the same
-// kernel-visible-memory ratio as the measured flavors. Offering prices are
-// not a currency: they are a unitless cost relative to the smallest flavor,
-// derived from each flavor's cpu and memory (RelativePrice). The served
-// catalogue is this static seed with the operator's settings.flavors overrides
-// on top: nothing is fetched from a Clever Cloud endpoint at runtime.
+// Capacity figures for every flavor were measured on live CKE nodes
+// (status.capacity on 2026-09-30: Kubernetes 1.37.0, kernel 7.2.8). The
+// kernel-visible memory moves with the platform's node image, so nodes of this
+// provider's NodeGroups keep correcting it at runtime, within bounds
+// (RecordObservedCapacity). Offering prices are not a currency: they are a
+// unitless cost relative to the smallest flavor, derived from each flavor's cpu
+// and memory (RelativePrice). The served catalogue is this static seed with the
+// operator's settings.flavors overrides on top: nothing is fetched from a
+// Clever Cloud endpoint at runtime.
 package instancetype
 
 import (
@@ -54,6 +55,14 @@ const (
 	// RelativePrice. They sum to 1, so the reference flavor costs exactly 1.
 	cpuPriceWeight    = 1.0 / 3
 	memoryPriceWeight = 2.0 / 3
+
+	// observedTolerance is how far a node's reported memory, ephemeral
+	// storage and pod capacity, and every allocatable figure, may stray from
+	// what its flavor's catalogue entry advertises before
+	// RecordObservedCapacity refuses the report (cpu capacity must be equal). The VMs of a flavor are
+	// identical, and the two node images measured so far differ by at most
+	// 5.3%; a report beyond 10% does not describe a VM of that flavor.
+	observedTolerance = 0.10
 )
 
 // Flavor describes one Clever Cloud node flavor.
@@ -71,9 +80,10 @@ type Flavor struct {
 }
 
 // Sizing is the static per-flavor seed: vCPU count and kernel-visible memory
-// (KiB). Both price the flavor through RelativePrice. The capacity advertised
-// for a flavor also self-corrects at runtime via RecordObservedCapacity; the
-// price does not follow, so it stays stable for the controller's lifetime.
+// (KiB). Both price the flavor through RelativePrice. MemoryKi additionally
+// self-corrects at runtime, within bounds, via RecordObservedCapacity (CPU
+// must match it exactly); the price does not follow, so it stays stable for
+// the controller's lifetime.
 type Sizing struct {
 	CPU      int64
 	MemoryKi int64
@@ -87,14 +97,18 @@ var (
 		Name string
 		Sizing
 	}{
-		{"2XS", Sizing{CPU: 4, MemoryKi: 3911884}},
-		{"XS", Sizing{CPU: 6, MemoryKi: 7937580}},
-		{"S", Sizing{CPU: 8, MemoryKi: 11957148}},
-		{"M", Sizing{CPU: 10, MemoryKi: 15988992}},
-		// L and XL capacities are estimated from documented specs (24/32 GB)
-		// applying the measured kernel-visible ratio of the M flavor.
-		{"L", Sizing{CPU: 12, MemoryKi: 23983488}},
-		{"XL", Sizing{CPU: 16, MemoryKi: 31977984}},
+		// MemoryKi is status.capacity.memory measured on one live node of each
+		// flavor on 2026-09-30 (Kubernetes 1.37.0, kernel 7.2.8). The previous
+		// values came from an older node image — L and XL extrapolated from M —
+		// and nodes of the current one expose 4.4-5.0% less than they said.
+		// Until a node of a flavor reports, karpenter packs pods against this
+		// table: an overstated entry launches nodes the pods do not fit on.
+		{"2XS", Sizing{CPU: 4, MemoryKi: 3715344}},
+		{"XS", Sizing{CPU: 6, MemoryKi: 7553664}},
+		{"S", Sizing{CPU: 8, MemoryKi: 11385832}},
+		{"M", Sizing{CPU: 10, MemoryKi: 15229256}},
+		{"L", Sizing{CPU: 12, MemoryKi: 22896304}},
+		{"XL", Sizing{CPU: 16, MemoryKi: 30584176}},
 	}
 
 	// priceReference is the flavor every price is relative to: the smallest
@@ -169,7 +183,9 @@ type FlavorOverride struct {
 	MemoryKi *int64 `json:"memoryKi,omitempty"`
 }
 
-// observedCapacity is the live capacity reported by a node of a flavor.
+// observedCapacity is a capacity/allocatable pair for a flavor: what nodes of
+// it reported (in Provider.observed), or what its catalogue entry advertises
+// (reference).
 type observedCapacity struct {
 	capacity    corev1.ResourceList
 	allocatable corev1.ResourceList
@@ -186,7 +202,8 @@ type Provider struct {
 	// so List and Get read it without locking.
 	flavors []Flavor
 
-	// mu guards observed, the only state that changes at runtime.
+	// mu guards observed, the only state that changes at runtime: per
+	// flavor, the smallest figures its nodes reported (RecordObservedCapacity).
 	mu       sync.RWMutex
 	observed map[string]observedCapacity
 }
@@ -377,18 +394,151 @@ func filterGeneralizable(list corev1.ResourceList) corev1.ResourceList {
 	return out
 }
 
-// RecordObservedCapacity feeds back the real capacity of a running node so
-// the catalog self-corrects (the static table entries for flavors never seen
-// yet — L and XL in particular — are derived estimates). Only the resources
-// that generalize across a flavor's homogeneous VMs are kept; per-node
-// extended resources must never enter the flavor catalog.
-func (p *Provider) RecordObservedCapacity(flavor string, capacity, allocatable corev1.ResourceList) {
+// ErrImplausibleCapacity is returned by RecordObservedCapacity for a report
+// that cannot come from a VM of the flavor it is recorded for. The catalogue
+// keeps what it served before.
+var ErrImplausibleCapacity = errors.New("implausible observed capacity")
+
+// RecordObservedCapacity feeds back what a running node of flavor reports, so
+// the catalogue follows the capacity the platform really delivers: the
+// kernel-visible memory moves with the node image, and a seed measured on
+// another image makes karpenter pack pods no real node can hold. Only the
+// resources that generalize across a flavor's homogeneous VMs are kept;
+// per-node extended resources never enter the catalogue. A report without
+// cpu or memory (a node that has not posted its status yet) is ignored.
+//
+// The caller vouches for the flavor — the node must belong to a NodeGroup
+// this provider created with it — but not for the figures: a kubelet can
+// rewrite its own Node's status, and whatever is recorded here becomes the
+// flavor's capacity for the whole cluster. So a report is refused (an error
+// wrapping ErrImplausibleCapacity) unless it could describe a VM of the
+// flavor's catalogue entry (checkObservation), and accepted reports are
+// aggregated per resource by MINIMUM: the catalogue never promises more than
+// the smallest node of the flavor delivered, whatever order nodes report in,
+// and no node can raise a figure another one lowered. The minimum lasts for
+// the process lifetime — a node's departure does not raise it back, a
+// restart re-learns it from the nodes then running.
+//
+// A flavor with no catalogue entry and no sizing seed (an override-only
+// flavor whose override was removed while its nodes still run) has nothing to
+// bound a report against: it is recorded after the consistency checks alone,
+// and only ever enriches Synthesize, which never provisions or prices.
+//
+// memoryDeviation is the report's memory capacity relative to the catalogue
+// entry (observed/catalogue - 1, 0 without an entry), so the caller can
+// surface a catalogue that no longer matches the platform.
+func (p *Provider) RecordObservedCapacity(flavor string, capacity, allocatable corev1.ResourceList) (memoryDeviation float64, err error) {
 	if capacity.Cpu().IsZero() || capacity.Memory().IsZero() {
-		return
+		return 0, nil
+	}
+	observed := observedCapacity{capacity: filterGeneralizable(capacity), allocatable: filterGeneralizable(allocatable)}
+	if ref, ok := p.reference(flavor); ok {
+		if err := checkObservation(ref, observed); err != nil {
+			return 0, fmt.Errorf("%w for flavor %q: %v", ErrImplausibleCapacity, flavor, err)
+		}
+		memoryDeviation = deviation(observed.capacity[corev1.ResourceMemory], ref.capacity[corev1.ResourceMemory])
+	} else if err := checkConsistent(observed); err != nil {
+		return 0, fmt.Errorf("%w for flavor %q: %v", ErrImplausibleCapacity, flavor, err)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.observed[flavor] = observedCapacity{capacity: filterGeneralizable(capacity), allocatable: filterGeneralizable(allocatable)}
+	prev := p.observed[flavor]
+	p.observed[flavor] = observedCapacity{
+		capacity:    minMerge(prev.capacity, observed.capacity),
+		allocatable: minMerge(prev.allocatable, observed.allocatable),
+	}
+	return memoryDeviation, nil
+}
+
+// reference is what the catalogue itself advertises for flavor before any
+// node of it has reported: the served entry (built-in seed plus overrides —
+// an operator's pin moves the bounds with it), else the sizing seed of a known
+// flavor the catalogue does not serve (what Synthesize describes it with).
+func (p *Provider) reference(flavor string) (observedCapacity, bool) {
+	f, ok := p.served(flavor)
+	if !ok {
+		s, seeded := SizingByName[flavor]
+		if !seeded {
+			return observedCapacity{}, false
+		}
+		f = Flavor{Name: flavor, CPU: s.CPU, MemoryKi: s.MemoryKi}
+	}
+	capacity, overhead := staticCapacity(f)
+	return observedCapacity{capacity: capacity, allocatable: resources.Subtract(capacity, overhead.Total())}, true
+}
+
+// checkObservation accepts a report only when it could describe a VM of the
+// catalogue entry ref: the same cpu capacity (the vCPU count is the flavor's
+// identity, a node image does not change it), every other figure — capacity
+// and allocatable alike — within observedTolerance of the entry's, and the
+// consistency checks. Resources are checked in a fixed order so the error
+// names the same one for the same report.
+func checkObservation(ref, obs observedCapacity) error {
+	if err := checkConsistent(obs); err != nil {
+		return err
+	}
+	for _, name := range generalizableResources {
+		got, ok := obs.capacity[name]
+		if !ok {
+			continue // not reported: the entry's own figure stays in force
+		}
+		want := ref.capacity[name]
+		if name == corev1.ResourceCPU {
+			if got.Cmp(want) != 0 {
+				return fmt.Errorf("cpu capacity %s, the catalogue entry has %s", got.String(), want.String())
+			}
+		} else if math.Abs(deviation(got, want)) > observedTolerance {
+			return fmt.Errorf("%s capacity %s is more than %.0f%% off the catalogue entry's %s", name, got.String(), observedTolerance*100, want.String())
+		}
+		got, want = obs.allocatable[name], ref.allocatable[name]
+		if math.Abs(deviation(got, want)) > observedTolerance {
+			return fmt.Errorf("%s allocatable %s is more than %.0f%% off the catalogue entry's %s", name, got.String(), observedTolerance*100, want.String())
+		}
+	}
+	return nil
+}
+
+// checkConsistent rejects a report whose capacity and allocatable do not
+// describe the same resources, or whose allocatable exceeds its capacity. The
+// served overhead is capacity minus allocatable: either shape would turn it
+// negative and advertise more than the node has.
+func checkConsistent(obs observedCapacity) error {
+	for _, name := range generalizableResources {
+		c, hasCapacity := obs.capacity[name]
+		a, hasAllocatable := obs.allocatable[name]
+		if hasCapacity != hasAllocatable {
+			return fmt.Errorf("%s is reported in only one of capacity and allocatable", name)
+		}
+		if hasCapacity && a.Cmp(c) > 0 {
+			return fmt.Errorf("%s allocatable %s exceeds its capacity %s", name, a.String(), c.String())
+		}
+	}
+	return nil
+}
+
+// deviation is got relative to want (got/want - 1), +Inf for a zero want so a
+// figure the entry does not have is never within tolerance.
+func deviation(got, want resource.Quantity) float64 {
+	w := want.AsApproximateFloat64()
+	if w == 0 {
+		return math.Inf(1)
+	}
+	return got.AsApproximateFloat64()/w - 1
+}
+
+// minMerge returns, per resource, the smaller of the two lists' figures; a
+// resource only one list has is taken from it. Neither input is modified.
+func minMerge(prev, next corev1.ResourceList) corev1.ResourceList {
+	out := make(corev1.ResourceList, len(generalizableResources))
+	for name, q := range prev {
+		out[name] = q.DeepCopy()
+	}
+	for name, q := range next {
+		if cur, ok := out[name]; !ok || q.Cmp(cur) < 0 {
+			out[name] = q.DeepCopy()
+		}
+	}
+	return out
 }
 
 // List returns the full instance type catalog. Karpenter mutates the returned
@@ -402,6 +552,16 @@ func (p *Provider) List() []*cloudprovider.InstanceType {
 	return its
 }
 
+// served returns the catalogue entry for a flavor name.
+func (p *Provider) served(flavor string) (Flavor, bool) {
+	for _, f := range p.flavors {
+		if f.Name == flavor {
+			return f, true
+		}
+	}
+	return Flavor{}, false
+}
+
 // ErrUnknownFlavor is returned by Get for a flavor absent from the served
 // catalogue. Callers that degrade on it (CloudProvider.Get/List) must match
 // with errors.Is so a future second failure class cannot be silently
@@ -410,10 +570,8 @@ var ErrUnknownFlavor = errors.New("unknown flavor")
 
 // Get returns the instance type for a flavor name, or an error if unknown.
 func (p *Provider) Get(flavor string) (*cloudprovider.InstanceType, error) {
-	for _, f := range p.flavors {
-		if f.Name == flavor {
-			return p.newInstanceType(f), nil
-		}
+	if f, ok := p.served(flavor); ok {
+		return p.newInstanceType(f), nil
 	}
 	// A running NodeGroup referencing a flavor the catalogue no longer
 	// carries is served a synthesized type and rolled by drift — count the
@@ -448,8 +606,28 @@ func (p *Provider) Synthesize(flavor string) *cloudprovider.InstanceType {
 	return it
 }
 
+// staticCapacity is what a catalogue entry advertises before any node of its
+// flavor has reported: its own cpu and memory, the disk and pod capacity every
+// flavor shares, and the measured overhead.
+func staticCapacity(f Flavor) (corev1.ResourceList, *cloudprovider.InstanceTypeOverhead) {
+	capacity := corev1.ResourceList{
+		corev1.ResourceCPU:              *resource.NewQuantity(f.CPU, resource.DecimalSI),
+		corev1.ResourceMemory:           *resource.NewQuantity(f.MemoryKi*1024, resource.BinarySI),
+		corev1.ResourceEphemeralStorage: ephemeralStorage,
+		corev1.ResourcePods:             maxPods,
+	}
+	overhead := &cloudprovider.InstanceTypeOverhead{
+		KubeReserved: corev1.ResourceList{
+			corev1.ResourceMemory: kubeReservedMemory,
+		},
+		EvictionThreshold: corev1.ResourceList{
+			corev1.ResourceEphemeralStorage: evictionEphemeralThreshold,
+		},
+	}
+	return capacity, overhead
+}
+
 func (p *Provider) newInstanceType(f Flavor) *cloudprovider.InstanceType {
-	memory := resource.NewQuantity(f.MemoryKi*1024, resource.BinarySI)
 	// Both topology labels are declared here, in the requirements AND in the
 	// offering. The platform puts neither on its nodes and karpenter-core
 	// never turns a well-known requirement into a label itself, so the
@@ -475,20 +653,7 @@ func (p *Provider) newInstanceType(f Flavor) *cloudprovider.InstanceType {
 		scheduling.NewRequirement(v1alpha1.InstanceCPULabelKey, corev1.NodeSelectorOpIn, fmt.Sprint(f.CPU)),
 		scheduling.NewRequirement(v1alpha1.InstanceMemoryLabelKey, corev1.NodeSelectorOpIn, fmt.Sprint(f.MemoryKi)),
 	)
-	capacity := corev1.ResourceList{
-		corev1.ResourceCPU:              *resource.NewQuantity(f.CPU, resource.DecimalSI),
-		corev1.ResourceMemory:           *memory,
-		corev1.ResourceEphemeralStorage: ephemeralStorage,
-		corev1.ResourcePods:             maxPods,
-	}
-	overhead := &cloudprovider.InstanceTypeOverhead{
-		KubeReserved: corev1.ResourceList{
-			corev1.ResourceMemory: kubeReservedMemory,
-		},
-		EvictionThreshold: corev1.ResourceList{
-			corev1.ResourceEphemeralStorage: evictionEphemeralThreshold,
-		},
-	}
+	capacity, overhead := staticCapacity(f)
 	p.mu.RLock()
 	if obs, ok := p.observed[f.Name]; ok {
 		capacity = lo.Assign(capacity, obs.capacity)

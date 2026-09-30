@@ -267,6 +267,32 @@ func TestProviderIDRoundTrip(t *testing.T) {
 	}
 }
 
+func TestNodeGroupOfNode(t *testing.T) {
+	for _, tc := range []struct {
+		node   string
+		want   string
+		wantOK bool
+	}{
+		{"default-abc12-node0", "default-abc12", true},
+		{"default-abc12-node1", "default-abc12", true},
+		{"default-abc12-node12", "default-abc12", true},
+		// Only the last suffix is the node index: a group may itself be
+		// named like a node.
+		{"pool-node0-node3", "pool-node0", true},
+		{"default-abc12", "", false},
+		{"default-abc12-node", "", false},
+		{"default-abc12-nodex", "", false},
+		{"default-abc12-node0a", "", false},
+		{"-node0", "", false},
+		{"", "", false},
+	} {
+		got, ok := nodegroup.NodeGroupOfNode(tc.node)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("NodeGroupOfNode(%q) = %q, %v; want %q, %v", tc.node, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
 func TestIsManaged(t *testing.T) {
 	cases := []struct {
 		name   string

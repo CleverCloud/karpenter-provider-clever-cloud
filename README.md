@@ -151,18 +151,20 @@ The controller is configured through environment variables, all set by the helm 
 
 ### Flavor catalogue
 
-The controller ships a built-in catalogue (`2XS`…`XL`) with measured/estimated capacities; it
-fetches nothing at runtime. `settings.flavors` lets you **overlay per-flavor overrides** on top of
-that built-in catalogue — the chart renders it into a ConfigMap mounted at
-`/etc/karpenter/flavors/flavors.yaml` and points `FLAVORS_CONFIG_PATH` at it. Every field except
-`name` is optional: set only what you want to pin, the rest fall through to the built-in value.
+The controller ships a built-in catalogue (`2XS`…`XL`) with capacities measured on live CKE nodes
+(2026-09-30, Kubernetes 1.37, kernel 7.2.8); it fetches nothing at runtime. `settings.flavors` lets
+you **overlay per-flavor overrides** on top of that built-in catalogue — the chart renders it into a
+ConfigMap mounted at `/etc/karpenter/flavors/flavors.yaml` and points `FLAVORS_CONFIG_PATH` at it.
+Every field except `name` is optional: set only what you want to pin, the rest fall through to the
+built-in value.
 
 ```yaml
 settings:
   flavors:
     # name is required, as accepted by the NodeGroup API (uppercase). This pins every flavor's
-    # memoryKi to the kernel-visible memory its nodes report on the current CKE image, known
-    # before one has run; cpu keeps its built-in value.
+    # memoryKi to the kernel-visible memory its nodes report, known before one has run; cpu keeps
+    # its built-in value. The values shown are the built-in ones (measured 2026-09-30): replace
+    # them with what your nodes report (status.capacity.memory) once Clever Cloud's node image moves.
     - { name: 2XS, memoryKi: 3715344 }
     - { name: XS, memoryKi: 7553664 }
     - { name: S, memoryKi: 11385832 }
@@ -173,9 +175,28 @@ settings:
 
 A name outside the built-in catalogue adds a flavor and must set both `cpu` and `memoryKi`; the
 NodeGroup API only accepts `2XS`…`XL` today, though, so in practice overrides adjust those six.
-`cpu`/`memoryKi` self-correct at runtime from observed node capacity, so they only need to be
-close enough for the scheduler to pick a flavor. Overrides always win. Leave `settings.flavors`
-empty to use the built-in catalogue unchanged.
+Overrides always win over the built-in values. Leave `settings.flavors` empty to use the built-in
+catalogue unchanged.
+
+At runtime the catalogue follows the capacity real nodes report, because the memory the kernel
+exposes moves with Clever Cloud's node image. A kubelet can rewrite its own node's labels and
+status, so a report is only trusted within bounds:
+
+- it must come from a node of a NodeGroup this controller created, carrying that NodeGroup's
+  flavor. The node's group is the one its **name** designates (CKE names a group's nodes
+  `<nodegroup>-node<N>`, and a kubelet cannot rename its node), so nodes of fixed nodegroups
+  and of the control plane are never used, whatever their labels claim;
+- its `cpu` must equal the catalogue entry's (built-in or overridden), and its memory, disk and
+  pod figures must be within 10% of it;
+- the smallest accepted node of a flavor wins, so the catalogue never promises more than the
+  smallest node of that flavor delivered.
+
+A `memoryKi` override is therefore corrected by nodes within 10% of it, and served as-is
+otherwise. What a compromised node of a karpenter NodeGroup can still do is move its own
+flavor's figures by up to 10%. Every refused report is counted in
+`karpenter_clevercloud_instancetype_observed_capacity_rejections_total` (see
+[docs/observability.md](docs/observability.md)). The runtime correction changes the capacity
+karpenter packs pods against, never a flavor's price.
 
 **Prices are relative, not a currency.** Karpenter only compares and adds up offering prices, to
 launch the cheapest flavor that fits and to consolidate onto cheaper capacity, so every flavor is
@@ -187,7 +208,7 @@ price = 1/3 × cpu / cpu(2XS) + 2/3 × memoryKi / memoryKi(2XS)      (2XS = 1.0)
 
 | Flavor | 2XS | XS | S | M | L | XL |
 |---|---|---|---|---|---|---|
-| Price | 1.0 | 1.8527 | 2.7044 | 3.5582 | 5.0873 | 6.783 |
+| Price | 1.0 | 1.8554 | 2.7097 | 3.566 | 5.1084 | 6.8212 |
 
 Memory weighs twice as much as cpu because that is how CKE's public worker prices are built (a GB of
 memory costs as much as two vCPUs). With these weights and the built-in sizing, whenever CKE bills
@@ -197,10 +218,12 @@ never swaps nodes for capacity that really costs more.
 There is no price to configure: an override's price is derived from its resulting `cpu` and
 `memoryKi`, so pinning a flavor's memory also reprices it, still relative to the built-in `2XS`.
 The guarantee above then only holds while the pinned values stay proportionate across flavors.
-Pinning all six the same way, as in the example, keeps it; pinning one alone can break it. Pinned
-alone to its value above, `M` makes two `M` nodes look cheaper than an `XS` and an `L`, which CKE
-bills less, and `XL` makes merging four small nodes into one `XL` look like a saving although
-that `XL` really costs more. Pin every flavor the same way, or none.
+Pinning all six the same way, as the example does, keeps it; pinning one alone can break it. Pinned
+alone 5% below its built-in memory, `XL` makes merging four small nodes (three `2XS` and an `M`)
+into one `XL` look like a saving although that `XL` really costs more; pinned alone to what the
+previous node image reported (about 5% more), it looks dearer than an `XS` and an `L` together,
+which CKE bills more, so merging those two into one `XL`, a real saving, is never made. Pin every
+flavor the same way, or none.
 
 The price-based figures karpenter-core reports (the `karpenter_nodepools_cost_total` metric,
 `savings: $…` in disruption logs and events) use this unit too, whatever their label says, and so

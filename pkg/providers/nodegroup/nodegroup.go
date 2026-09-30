@@ -192,6 +192,29 @@ func ParseProviderID(providerID string) (string, error) {
 	return name, nil
 }
 
+// NodeGroupOfNode returns the NodeGroup a node belongs to according to its
+// name: Clever Cloud names the nodes of a group "<nodegroup>-node<N>" (node0
+// for the single node of a group this provider creates, node1 onwards when
+// the group is resized). Unlike the clever-cloud.com/nodegroup label, which a
+// kubelet can rewrite on its own Node, the name is bound to the kubelet's
+// credential by the node authorizer, so it is what ties a node to a group
+// when the node's word must not be taken. ok is false for a name without the
+// suffix.
+func NodeGroupOfNode(nodeName string) (string, bool) {
+	i := strings.LastIndex(nodeName, nodeNameInfix)
+	if i <= 0 {
+		return "", false
+	}
+	index := nodeName[i+len(nodeNameInfix):]
+	if index == "" || strings.Trim(index, "0123456789") != "" {
+		return "", false
+	}
+	return nodeName[:i], true
+}
+
+// nodeNameInfix separates a NodeGroup's name from the index of its node.
+const nodeNameInfix = "-node"
+
 // IsManaged reports whether the NodeGroup was created by this provider.
 func IsManaged(ng *ngv1.NodeGroup) bool {
 	return ng.Labels[v1alpha1.ManagedLabelKey] == "true"

@@ -189,6 +189,24 @@ var (
 		},
 		nil,
 	)
+
+	// ObservedCapacityRejections counts node capacity reports the
+	// instance-type catalogue refused. A kubelet can rewrite its own Node's
+	// labels and status, and an accepted report sets the flavor's capacity
+	// for the whole cluster, so a report only counts when it comes from a node
+	// whose name places it in the managed NodeGroup its labels claim, carries
+	// that NodeGroup's flavor, and fits the flavor's catalogue entry (cpu
+	// exactly, everything else within 10%).
+	ObservedCapacityRejections = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "instancetype",
+			Name:      "observed_capacity_rejections_total",
+			Help:      "Node capacity reports refused by the instance-type catalogue: a node claiming a managed NodeGroup it is not a node of, a flavor label contradicting that NodeGroup, or figures a VM of that flavor cannot report. The catalogue keeps its previous value.",
+		},
+		nil,
+	)
 )
 
 // init pre-seeds the unlabeled series so they exist from the first scrape:
@@ -205,4 +223,5 @@ func init() {
 	GCReapedNodeGroups.Add(0, nil)
 	GCRefusedNodeGroups.Set(0, nil)
 	UnknownFlavorLookups.Add(0, nil)
+	ObservedCapacityRejections.Add(0, nil)
 }
