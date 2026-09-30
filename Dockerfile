@@ -1,4 +1,11 @@
-FROM golang:1.26 AS builder
+# Pinned to the patch release of the go directive in go.mod, which is also the
+# toolchain CI tests and scans with. The golang images set GOTOOLCHAIN=local,
+# so this tag alone decides which standard library ships in the binary; a
+# floating tag would build with whatever release is current on release day.
+# Nothing bumps this pin automatically: move it together with the go directive
+# on every Go patch release (cmd/controller's TestImageBuilderMatchesGoDirective
+# fails when the two diverge).
+FROM golang:1.26.8 AS builder
 ARG VERSION=dev
 WORKDIR /workspace
 COPY go.mod go.sum ./
