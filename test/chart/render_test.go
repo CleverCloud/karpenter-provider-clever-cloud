@@ -278,17 +278,23 @@ func TestPlacementRemainsValuesDriven(t *testing.T) {
 // TestDefaultTolerationsDoNotReachManagedNodes guards the one taint the
 // provider relies on for correctness: NodeGroups are created with
 // karpenter.sh/unregistered:NoExecute to close the race between node readiness
-// and Karpenter's label sync. Tolerating it would let the controller land on a
-// node that is still being adopted.
+// and Karpenter's label sync. A node only gets karpenter.sh/nodepool, which the
+// affinity keys on, when karpenter-core registers it, so until then — and for
+// good on the extra node of an externally resized NodeGroup, which never
+// registers — that taint is the only thing keeping the controller off it.
+// Tolerating it would let the controller land on a node that is still being
+// adopted, or on one deleted together with its group.
 func TestDefaultTolerationsDoNotReachManagedNodes(t *testing.T) {
 	spec := controllerPodSpec(t, helmTemplate(t))
 	for _, tol := range spec.Tolerations {
 		if strings.HasPrefix(tol.Key, "karpenter.sh/") {
-			t.Errorf("default tolerations must not tolerate %q: Karpenter-managed nodes are excluded "+
-				"by affinity, and tolerating its own taints reopens the adoption race", tol.Key)
+			t.Errorf("default tolerations must not tolerate %q: until registration (and for good on a resized "+
+				"NodeGroup's extra node) Karpenter-managed nodes lack karpenter.sh/nodepool, so the affinity does not "+
+				"exclude them and the karpenter.sh/unregistered taint is the only guard", tol.Key)
 		}
 		if tol.Key == "" && tol.Operator == corev1.TolerationOpExists {
-			t.Error("default tolerations must not tolerate everything (empty key with operator Exists)")
+			t.Error("default tolerations must not tolerate everything (empty key with operator Exists): " +
+				"that includes karpenter.sh/unregistered, the only guard before registration")
 		}
 	}
 }

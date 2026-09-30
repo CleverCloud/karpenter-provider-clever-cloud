@@ -479,6 +479,14 @@ func (p *Provider) Delete(ctx context.Context, name string) error {
 // for NodeClaim labels Karpenter applies those at registration anyway, while
 // NodeClass labels have no such fallback — which is why the nodeclass
 // controller rejects up front, with the same rule, anything filtered here.
+//
+// The payload is immutable and the platform applies it to every node of the
+// group, not only to the one this NodeClaim is for, which is why core's
+// karpenter.sh keys never go in it: karpenter.sh/nodepool on a node that never
+// gets a provider ID wedges karpenter-core's cluster-state sync (see
+// v1alpha1.ValidateNodeClassLabel). The registered node still receives them
+// through core's registration sync, and the karpenter.sh/unregistered taint
+// keeps pods off it until then.
 func nodeGroupLabels(nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.CleverNodeClass) map[string]string {
 	labels := map[string]string{}
 	for k, v := range nodeClass.Spec.Labels {
@@ -496,9 +504,10 @@ func nodeGroupLabels(nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.CleverNode
 
 // isNodeGroupLabelAllowed admits exactly the labels the shared rule accepts
 // (v1alpha1.ValidateNodeClassLabel): reserved prefixes, kubernetes.io/ domains
-// owned by Karpenter's sync, and label syntax the apiserver would refuse on
-// the Node. It filters rather than errors — NodeClaim labels carry Karpenter's
-// own reserved keys (node.kubernetes.io/instance-type, ...) by design and
+// owned by Karpenter's sync, the karpenter.sh domain owned by karpenter-core,
+// and label syntax the apiserver would refuse on the Node. It filters rather
+// than errors — NodeClaim labels carry Karpenter's own reserved keys
+// (node.kubernetes.io/instance-type, karpenter.sh/nodepool, ...) by design and
 // still reach the node through the registration sync. NodeClass labels have
 // NO such fallback: a dropped key is simply gone, which is why the nodeclass
 // controller rejects them up front with the same rule instead of ever letting

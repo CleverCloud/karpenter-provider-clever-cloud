@@ -287,6 +287,30 @@ func TestNodeClassValidation(t *testing.T) {
 		t.Fatalf("expected an Invalid admission error, got: %v", err)
 	}
 
+	// The karpenter.sh domain, bare or subdomained, is karpenter-core's: a key
+	// of it on a node before registration misreports that node to core.
+	for _, key := range []string{"karpenter.sh/nodepool", "compatibility.karpenter.sh/x"} {
+		coreOwned := &v1alpha1.CleverNodeClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "karpenter-domain-labels"},
+			Spec:       v1alpha1.CleverNodeClassSpec{Labels: map[string]string{key: "x"}},
+		}
+		if err := kubeClient.Create(ctx, coreOwned); err == nil {
+			_ = kubeClient.Delete(ctx, coreOwned)
+			t.Fatalf("label key %q in the karpenter.sh domain must be rejected at admission by the CRD CEL rule", key)
+		} else if !apierrors.IsInvalid(err) {
+			t.Fatalf("expected an Invalid admission error for %q, got: %v", key, err)
+		}
+	}
+	// The provider's own domain is not karpenter-core's and stays admitted.
+	ownDomain := &v1alpha1.CleverNodeClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-domain-labels"},
+		Spec:       v1alpha1.CleverNodeClassSpec{Labels: map[string]string{"karpenter.clever-cloud.com/team": "data"}},
+	}
+	if err := kubeClient.Create(ctx, ownDomain); err != nil {
+		t.Fatalf("a label key in the provider's own domain must be admitted: %v", err)
+	}
+	t.Cleanup(func() { _ = kubeClient.Delete(ctx, ownDomain) })
+
 	notReady := &v1alpha1.CleverNodeClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "long-label-value"},
 		Spec:       v1alpha1.CleverNodeClassSpec{Labels: map[string]string{"team": strings.Repeat("x", 64)}},

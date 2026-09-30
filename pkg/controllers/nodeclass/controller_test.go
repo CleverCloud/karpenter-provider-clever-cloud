@@ -165,6 +165,13 @@ func TestReconcileRejectsUndeliverableLabels(t *testing.T) {
 			wantMessage: "kubernetes.io/ domain",
 		},
 		{
+			// Not undeliverable but worse: it reached the node at join and
+			// told karpenter-core the node was initialized before it was.
+			name:        "karpenter.sh key",
+			labels:      map[string]string{"karpenter.sh/initialized": "true"},
+			wantMessage: "karpenter.sh domain",
+		},
+		{
 			name:        "key with invalid syntax",
 			labels:      map[string]string{"bad key": "x"},
 			wantMessage: "not a valid label key",

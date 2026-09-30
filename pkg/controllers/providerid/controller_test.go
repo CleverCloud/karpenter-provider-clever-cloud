@@ -28,6 +28,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/providerid"
@@ -275,5 +277,135 @@ func TestReconcileConfirmsOwnershipUncached(t *testing.T) {
 	if got := getProviderID(t, stale, "ng1-node1"); got != "" {
 		t.Errorf("ng1-node1 was stamped %q off a stale cache while the API server already shows "+
 			"ng1-node0 owning that id: the ownership check must read uncached", got)
+	}
+}
+
+func getNode(t *testing.T, kubeClient client.Client, nodeName string) *corev1.Node {
+	t.Helper()
+	got := &corev1.Node{}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: nodeName}, got); err != nil {
+		t.Fatalf("getting node: %v", err)
+	}
+	return got
+}
+
+// legacyNodeLabels are the labels a node of a NodeGroup created before
+// karpenter.sh keys were filtered out of the payload joins with: the group's
+// immutable spec.labels still carry karpenter.sh/nodepool, and the platform
+// applies them to every node of the group.
+func legacyNodeLabels(nodeGroupName string) map[string]string {
+	return map[string]string{
+		v1alpha1.NodeGroupNodeLabelKey: nodeGroupName,
+		karpv1.NodePoolLabelKey:        "default",
+		"team":                         "data",
+	}
+}
+
+// TestReconcileStripsNodePoolLabelFromTheRefusedNode covers the NodeGroups
+// that predate the payload filter. The extra node of such a group, resized
+// from outside karpenter, joins with karpenter.sh/nodepool and is refused a
+// provider ID — and karpenter-core's cluster state ignores a node carrying
+// that label without a provider ID. Its first sync after a restart waits for
+// every node, so after the next controller restart nothing is provisioned or
+// disrupted, cluster-wide, until the resize is reverted (reproduced live: 4
+// minutes). The refused node must lose the label; nothing else may change.
+func TestReconcileStripsNodePoolLabelFromTheRefusedNode(t *testing.T) {
+	ng := managedNodeGroup("ng1")
+	ng.Spec.NodeCount = 2
+	kubeClient := newClient(
+		node("ng1-node0", legacyNodeLabels("ng1"), "clevercloud://ng1"),
+		node("ng1-node1", legacyNodeLabels("ng1"), ""),
+		ng,
+	)
+	c := providerid.NewController(kubeClient, kubeClient)
+	for _, name := range []string{"ng1-node0", "ng1-node1"} {
+		if _, err := c.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: name}}); err != nil {
+			t.Fatalf("Reconcile %s: %v", name, err)
+		}
+	}
+
+	refused := getNode(t, kubeClient, "ng1-node1")
+	if v, ok := refused.Labels[karpv1.NodePoolLabelKey]; ok {
+		t.Errorf("the refused node still carries %s=%s: with no provider id it keeps karpenter-core's "+
+			"cluster state from ever syncing after a restart", karpv1.NodePoolLabelKey, v)
+	}
+	if refused.Spec.ProviderID != "" {
+		t.Errorf("the refused node was stamped %q while ng1-node0 owns the id", refused.Spec.ProviderID)
+	}
+	for _, k := range []string{v1alpha1.NodeGroupNodeLabelKey, "team"} {
+		if _, ok := refused.Labels[k]; !ok {
+			t.Errorf("stripping the nodepool label removed %s too: %v", k, refused.Labels)
+		}
+	}
+	// The stamped node is karpenter's node: its nodepool label came from the
+	// registration sync and must stay.
+	if got := getNode(t, kubeClient, "ng1-node0").Labels[karpv1.NodePoolLabelKey]; got != "default" {
+		t.Errorf("the stamped node lost its %s label (got %q)", karpv1.NodePoolLabelKey, got)
+	}
+}
+
+// TestReconcileKeepsNodePoolLabelOnTheNodeItStamps pins the other side of the
+// strip: the single node of a legacy group is the one karpenter registers, so
+// it is stamped with the label left in place.
+func TestReconcileKeepsNodePoolLabelOnTheNodeItStamps(t *testing.T) {
+	kubeClient := newClient(node("ng1-node0", legacyNodeLabels("ng1"), ""), managedNodeGroup("ng1"))
+	if err := reconcileNode(t, kubeClient, "ng1-node0"); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	got := getNode(t, kubeClient, "ng1-node0")
+	if got.Spec.ProviderID != "clevercloud://ng1" {
+		t.Errorf("expected provider id %q, got %q", "clevercloud://ng1", got.Spec.ProviderID)
+	}
+	if got.Labels[karpv1.NodePoolLabelKey] != "default" {
+		t.Errorf("the stamped node lost its %s label: %v", karpv1.NodePoolLabelKey, got.Labels)
+	}
+}
+
+// TestReconcileNeverStripsNodesOfUnmanagedGroups: the label on a node of a
+// NodeGroup this provider does not manage is not ours to remove.
+func TestReconcileNeverStripsNodesOfUnmanagedGroups(t *testing.T) {
+	ng := unmanagedNodeGroup("ng1")
+	ng.Spec.NodeCount = 2
+	kubeClient := newClient(
+		node("ng1-node0", legacyNodeLabels("ng1"), "clevercloud://ng1"),
+		node("ng1-node1", legacyNodeLabels("ng1"), ""),
+		ng,
+	)
+	if err := reconcileNode(t, kubeClient, "ng1-node1"); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := getNode(t, kubeClient, "ng1-node1").Labels[karpv1.NodePoolLabelKey]; got != "default" {
+		t.Errorf("a node of an unmanaged nodegroup lost its %s label (got %q)", karpv1.NodePoolLabelKey, got)
+	}
+}
+
+// TestReconcileStampsAStrippedNodeOnceItsSiblingIsGone proves the strip does
+// not strand the node: when the node holding the id goes away, the stripped
+// survivor is stamped normally. karpenter-core's registration sync, which runs
+// while the NodeClaim is unregistered, then copies the NodeClaim's labels —
+// karpenter.sh/nodepool included — back onto it.
+func TestReconcileStampsAStrippedNodeOnceItsSiblingIsGone(t *testing.T) {
+	ng := managedNodeGroup("ng1")
+	ng.Spec.NodeCount = 2
+	owner := node("ng1-node0", legacyNodeLabels("ng1"), "clevercloud://ng1")
+	kubeClient := newClient(owner, node("ng1-node1", legacyNodeLabels("ng1"), ""), ng)
+	c := providerid.NewController(kubeClient, kubeClient)
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "ng1-node1"}}
+
+	if _, err := c.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := getNode(t, kubeClient, "ng1-node1").Labels[karpv1.NodePoolLabelKey]; ok {
+		t.Fatalf("expected the refused node to be stripped first")
+	}
+
+	if err := kubeClient.Delete(context.Background(), owner); err != nil {
+		t.Fatalf("deleting the owning node: %v", err)
+	}
+	if _, err := c.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := getProviderID(t, kubeClient, "ng1-node1"); got != "clevercloud://ng1" {
+		t.Errorf("expected the stripped survivor to be stamped once the id is free, got %q", got)
 	}
 }

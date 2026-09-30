@@ -44,9 +44,24 @@ func TestValidateNodeClassLabel(t *testing.T) {
 		// Empty is a valid label value everywhere (apiserver included); the
 		// rule must not invent a stricter contract than the Node accepts.
 		{name: "empty value", key: "team", value: ""},
-		// karpenter.sh/nodepool is stamped on every NodeClaim and must keep
-		// flowing through the NodeGroup filter, which shares this rule.
-		{name: "karpenter nodepool label", key: karpv1.NodePoolLabelKey, value: "default"},
+		// The provider's own domain is not karpenter-core's: it must not be
+		// caught by the karpenter.sh rule below.
+		{name: "provider domain label", key: "karpenter.clever-cloud.com/team", value: "data"},
+		// Only karpenter.sh itself and its subdomains are core's; a domain
+		// that merely ends in the same letters is someone else's.
+		{name: "look-alike domain", key: "notkarpenter.sh/team", value: "data"},
+		// karpenter.sh/nodepool is stamped on every NodeClaim, and the
+		// NodeGroup filter shares this rule: letting it through put it in the
+		// group's immutable spec.labels, which the platform applies to every
+		// node of the group — including the unstamped extra node of a resized
+		// group, which then kept karpenter-core's cluster state unsynced
+		// after every restart. The node gets it from core's registration sync.
+		{name: "karpenter nodepool label", key: karpv1.NodePoolLabelKey, value: "default", wantErr: "karpenter.sh domain"},
+		{name: "karpenter capacity-type label", key: karpv1.CapacityTypeLabelKey, value: karpv1.CapacityTypeOnDemand, wantErr: "karpenter.sh domain"},
+		// From a NodeClass, a lifecycle key would reach the node at join and
+		// tell core it is registered or initialized before it is.
+		{name: "karpenter lifecycle label", key: karpv1.NodeInitializedLabelKey, value: "true", wantErr: "karpenter.sh domain"},
+		{name: "karpenter.sh subdomain", key: "compatibility.karpenter.sh/x", value: "1", wantErr: "karpenter.sh domain"},
 		{name: "bare kubernetes.io prefix", key: "kubernetes.io/role", value: "worker", wantErr: "kubernetes.io/ domain"},
 		{name: "node.kubernetes.io prefix", key: "node.kubernetes.io/instance-type", value: "XS", wantErr: "kubernetes.io/ domain"},
 		// Subdomained kubernetes.io keys are dropped by the NodeGroup filter

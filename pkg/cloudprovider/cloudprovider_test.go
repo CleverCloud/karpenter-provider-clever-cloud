@@ -166,8 +166,11 @@ func TestCreatePicksCheapestCompatibleFlavor(t *testing.T) {
 	if len(ng.Spec.Taints) != 1 || ng.Spec.Taints[0].Key != karpv1.UnregisteredTaintKey {
 		t.Errorf("expected unregistered taint, got %+v", ng.Spec.Taints)
 	}
-	if ng.Spec.Labels[karpv1.NodePoolLabelKey] != "default" {
-		t.Errorf("expected nodepool label on nodegroup, got %+v", ng.Spec.Labels)
+	// The platform applies spec.labels to every node of the group; the
+	// nodepool label reaches the registered node through karpenter-core's
+	// registration sync instead (see clusterstate_test.go).
+	if v, ok := ng.Spec.Labels[karpv1.NodePoolLabelKey]; ok {
+		t.Errorf("nodegroup spec.labels must not carry %s (got %q)", karpv1.NodePoolLabelKey, v)
 	}
 }
 
