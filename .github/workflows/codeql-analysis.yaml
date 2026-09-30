@@ -18,13 +18,26 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/install-deps
-      - name: Run govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
       - uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
         with:
           languages: go
       - uses: github/codeql-action/autobuild@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
       - uses: github/codeql-action/analyze@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+  # govulncheck gets its own job so a finding cannot stop CodeQL: as a step
+  # ahead of codeql init it failed analyze-go first, which switched Go code
+  # scanning off for exactly as long as a known vulnerability stayed open. It
+  # shares this workflow's daily schedule, since new advisories are published
+  # against unchanged code.
+  govulncheck:
+    name: Govulncheck
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # actions/checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/install-deps
+      # The scanner version is pinned by GOVULNCHECK_VERSION in the Makefile.
+      - run: make vulncheck
   # Javascript is added here for evaluating Github Action vulnerabilities
   # https://github.blog/2023-08-09-four-tips-to-keep-your-github-actions-workflows-secure/#2-enable-code-scanning-for-workflows
   analyze-github-actions:

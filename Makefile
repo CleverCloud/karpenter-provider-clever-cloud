@@ -9,6 +9,9 @@ SHELL := /bin/bash
 CONTROLLER_GEN_VERSION ?= v0.20.1
 # Keep in sync with the version pinned in .github/workflows/ci-lint.yaml
 GOLANGCI_LINT_VERSION ?= v2.12.2
+# The one pin for govulncheck: CI runs `make vulncheck`. It freezes the scanner
+# only — every run still fetches the current vulnerability database.
+GOVULNCHECK_VERSION ?= v1.8.0
 # setup-envtest ships with controller-runtime; keep the major.minor in sync
 # with the sigs.k8s.io/controller-runtime version in go.mod.
 SETUP_ENVTEST_VERSION ?= v0.24.1
@@ -116,6 +119,16 @@ vet: ## Run go vet
 .PHONY: lint
 lint: ## Run golangci-lint (built from source on first run, then cached)
 	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run
+
+.PHONY: vulncheck
+vulncheck: ## Report known vulnerabilities reachable from the code (govulncheck; fetches vuln.go.dev)
+	@# govulncheck judges the standard library by the toolchain that runs it,
+	@# so pin that to go.mod's go directive — the version CI installs, builds
+	@# and tests with. Under a newer local Go the scan would read that
+	@# release's patched stdlib and pass while CI reports the advisories. The
+	@# assignment is its own statement for the reason given in test-envtest.
+	gover="$$(go list -m -f '{{.GoVersion}}')" && \
+		GOTOOLCHAIN="go$$gover" go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 .PHONY: image
 image: ## Build the container image

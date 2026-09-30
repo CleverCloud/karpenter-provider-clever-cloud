@@ -18,8 +18,9 @@ switches toolchains (`GOTOOLCHAIN=local`): its tag, not go.mod, decides which st
 ships in the image. Bump both together (Go patch releases carry the standard-library security
 fixes); a unit test in `cmd/controller` fails when they diverge. Nothing bumps them automatically:
 Dependabot does not raise the `go` directive for Go security releases, and a Dockerfile-only bump
-would fail that test by design. The trigger is the daily govulncheck run of the CodeQL workflow,
-which turns red as soon as a standard-library vulnerability reachable from this code is published.
+would fail that test by design. The trigger is the daily Govulncheck job of the CodeQL workflow
+(`make vulncheck`), which turns red as soon as a standard-library vulnerability reachable from this
+code is published.
 Move both pins to the latest patch release of the Go minor, not merely the first one that fixes the
 reported issue.
 
@@ -34,7 +35,14 @@ make build
 make test
 make generate    # must leave the tree clean — CI fails if it produces a diff
 make chart-lint  # when touching charts/ or deploy/
+make vulncheck   # govulncheck under the go.mod toolchain (fetches vuln.go.dev)
 ```
+
+`make vulncheck` reads the current vulnerability database, so it can turn red on an unchanged
+tree the day an advisory is published (CI also runs it daily, beside CodeQL). Fix such a finding
+in its own pull request: bump the affected module or, for a standard-library advisory, the `go`
+directive in [go.mod](go.mod) together with the Dockerfile builder tag (see
+[Development environment](#development-environment)).
 
 ## Commit messages
 
