@@ -47,8 +47,9 @@ var (
 	)
 
 	// NodeGroupQuotaRejections counts fresh upstream quota rejections (not
-	// the fail-fast hits on the cached backoff). Rejections are normal
-	// operation near the organisation quota ceiling.
+	// the fail-fast hits on the cached backoff), whether the acceptance poll
+	// saw them or the nodegroupstatus controller did after the launch.
+	// Rejections are normal operation near the organisation quota ceiling.
 	NodeGroupQuotaRejections = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
@@ -81,8 +82,10 @@ var (
 	// quota rejection these are not normal operation: the request was
 	// well-formed as far as this provider knows, and the flavor is held out of
 	// provisioning for a few minutes so the scheduler relaxes to another one.
-	// A failure the operator retries on its own (UpstreamError) is not a
-	// refusal and is not counted here.
+	// Refusals published after the acceptance poll, which the nodegroupstatus
+	// controller turns into a failed launch, count too. A failure the operator
+	// retries on its own (UpstreamError) is not a refusal and is not counted
+	// here.
 	NodeGroupRejections = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
@@ -90,6 +93,23 @@ var (
 			Subsystem: "nodegroup",
 			Name:      "rejections_total",
 			Help:      "NodeGroup creations refused by the node-group operator for a non-quota reason. The refused flavor is held out of provisioning briefly.",
+		},
+		nil,
+	)
+
+	// NodeGroupSyncOverdue is the number of launched NodeGroups the node-group
+	// operator has still not synced 5 minutes after their creation while their
+	// NodeClaim is still unregistered. A healthy launch syncs within about a
+	// minute; each group counted here is a launch stuck upstream, which would
+	// otherwise stay silent until karpenter-core's 15-minute registration
+	// timeout deletes the claim.
+	NodeGroupSyncOverdue = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: "nodegroup",
+			Name:      "sync_overdue",
+			Help:      "Launched NodeGroups the node-group operator has not synced 5 minutes after their creation while their NodeClaim is still unregistered. Non-zero means launches are stuck upstream.",
 		},
 		nil,
 	)
@@ -180,6 +200,7 @@ func init() {
 	NodeGroupRejections.Add(0, nil)
 	NodeGroupVanished.Add(0, nil)
 	NodeGroupExternalResizes.Set(0, nil)
+	NodeGroupSyncOverdue.Set(0, nil)
 	FlavorsConfigInvalid.Set(0, nil)
 	GCReapedNodeGroups.Add(0, nil)
 	GCRefusedNodeGroups.Set(0, nil)

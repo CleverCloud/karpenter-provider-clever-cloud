@@ -55,7 +55,9 @@ import (
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodeclass"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodegroupstatus"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/providerid"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
 var (
@@ -69,6 +71,11 @@ var (
 type noopRecorder struct{}
 
 func (noopRecorder) Publish(...events.Event) {}
+
+// discardRecorder drops events: this suite asserts on the objects themselves.
+type discardRecorder struct{}
+
+func (discardRecorder) Publish(...events.Event) {}
 
 func TestMain(m *testing.M) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
@@ -120,6 +127,11 @@ func TestMain(m *testing.M) {
 	}
 	if err := providerid.NewController(mgr.GetClient(), mgr.GetAPIReader()).Register(ctx, mgr); err != nil {
 		fmt.Printf("registering providerid controller: %v\n", err)
+		os.Exit(1)
+	}
+	nodeGroupProvider := nodegroup.NewProvider(mgr.GetClient(), discardRecorder{})
+	if err := nodegroupstatus.NewController(mgr.GetClient(), mgr.GetAPIReader(), nodeGroupProvider, discardRecorder{}).Register(ctx, mgr); err != nil {
+		fmt.Printf("registering nodegroup status controller: %v\n", err)
 		os.Exit(1)
 	}
 	go func() {
@@ -575,5 +587,115 @@ func TestProviderIDStamping(t *testing.T) {
 	}
 	if node.Spec.ProviderID != "" {
 		t.Errorf("unmanaged node providerID = %q, want empty", node.Spec.ProviderID)
+	}
+}
+
+// TestNodeGroupStatusFailsALateRefusal proves the nodegroupstatus controller's
+// watches against a real apiserver. The groups carry a quota rejection, and
+// their events are handled, before their NodeClaims turn Launched, so the
+// launch can only be picked up through the NodeClaim watch. The refused claim
+// is removed by a real delete carrying uid and resourceVersion preconditions,
+// and the Registered claim next to an identical refusal is never touched.
+func TestNodeGroupStatusFailsALateRefusal(t *testing.T) {
+	ctx := context.Background()
+	// The registered claim goes first, so that its update is already through
+	// the watch when the refused claim's deletion is observed.
+	launches := []struct {
+		name       string
+		registered bool
+	}{{"status-registered", true}, {"status-refused", false}}
+	for _, launch := range launches {
+		name := launch.name
+		nodeClaim := &karpv1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: karpv1.NodeClaimSpec{
+				NodeClassRef: &karpv1.NodeClassReference{Group: "karpenter.clever-cloud.com", Kind: "CleverNodeClass", Name: "default"},
+				Requirements: []karpv1.NodeSelectorRequirementWithMinValues{{
+					Key:      corev1.LabelInstanceTypeStable,
+					Operator: corev1.NodeSelectorOpExists,
+				}},
+			},
+		}
+		if err := kubeClient.Create(ctx, nodeClaim); err != nil {
+			t.Fatalf("creating nodeclaim %s: %v", name, err)
+		}
+		t.Cleanup(func() { _ = kubeClient.Delete(ctx, nodeClaim) })
+		group := &ngv1.NodeGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   name,
+				Labels: map[string]string{v1alpha1.ManagedLabelKey: "true", v1alpha1.NodeClaimLabelKey: name},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: name, UID: nodeClaim.UID},
+				},
+			},
+			Spec: ngv1.NodeGroupSpec{Flavor: "XS", NodeCount: 1},
+		}
+		if err := kubeClient.Create(ctx, group); err != nil {
+			t.Fatalf("creating nodegroup %s: %v", name, err)
+		}
+		t.Cleanup(func() { _ = kubeClient.Delete(ctx, group) })
+		// The operator's first status write on a rejected group (live shape).
+		group.Status = ngv1.NodeGroupStatus{
+			Phase: ngv1.PhaseQuotaExceeded,
+			Conditions: []ngv1.NodeGroupCondition{{
+				Type: ngv1.ConditionTypeReconcileFailed, Status: corev1.ConditionTrue, Reason: ngv1.ReasonQuotaExceeded,
+				LastTransitionTime: metav1.Now(),
+			}},
+		}
+		if err := kubeClient.Status().Update(ctx, group); err != nil {
+			t.Fatalf("writing nodegroup %s status: %v", name, err)
+		}
+	}
+	// Let the NodeGroup events be handled while no claim is Launched yet: the
+	// cache holds both refusals, then a margin for the reconciles to drain.
+	// From here on only the NodeClaim watch can bring the launches in.
+	for _, launch := range launches {
+		eventually(t, 10*time.Second, func(ctx context.Context) error {
+			ng := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(ctx, types.NamespacedName{Name: launch.name}, ng); err != nil {
+				return err
+			}
+			if !ng.IsQuotaExceeded() {
+				return fmt.Errorf("the cache does not hold nodegroup %s's refusal yet", launch.name)
+			}
+			return nil
+		})
+	}
+	time.Sleep(time.Second)
+	// Core records the launch once Create has returned, and one of the nodes
+	// registers.
+	for _, launch := range launches {
+		eventually(t, 10*time.Second, func(ctx context.Context) error {
+			nodeClaim := &karpv1.NodeClaim{}
+			if err := kubeClient.Get(ctx, types.NamespacedName{Name: launch.name}, nodeClaim); err != nil {
+				return err
+			}
+			nodeClaim.Status.ProviderID = nodegroup.ProviderID(launch.name)
+			nodeClaim.StatusConditions().SetTrue(karpv1.ConditionTypeLaunched)
+			if launch.registered {
+				nodeClaim.StatusConditions().SetTrue(karpv1.ConditionTypeRegistered)
+			}
+			return kubeClient.Status().Update(ctx, nodeClaim)
+		})
+	}
+
+	eventually(t, 10*time.Second, func(ctx context.Context) error {
+		err := kubeClient.Get(ctx, types.NamespacedName{Name: "status-refused"}, &karpv1.NodeClaim{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("the nodeclaim of the quota-rejected group is still present")
+	})
+	// Both claims went through the same watch, the registered one first: it
+	// must still be there.
+	nodeClaim := &karpv1.NodeClaim{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: "status-registered"}, nodeClaim); err != nil {
+		t.Fatalf("expected the registered nodeclaim to be kept: %v", err)
+	}
+	if !nodeClaim.DeletionTimestamp.IsZero() {
+		t.Error("expected the registered nodeclaim not to be deleted")
 	}
 }

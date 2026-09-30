@@ -397,6 +397,44 @@ func TestQuotaBackoffFailsFastUntilCapacityFreed(t *testing.T) {
 	<-done
 }
 
+func TestDeleteOfALateQuotaRejectionKeepsTheBackoff(t *testing.T) {
+	// The nodegroupstatus controller fails a launch the quota engine rejected
+	// after the acceptance poll by deleting its NodeClaim; karpenter-core's
+	// termination then calls Delete on the rejected group. That deletion
+	// frees no capacity, so the re-plan's next Create must still fail fast
+	// instead of hitting the exhausted quota again.
+	rejected := managedNodeGroup("default-late1", "XS")
+	rejected.Status = ngv1.NodeGroupStatus{
+		Phase:      ngv1.PhaseQuotaExceeded,
+		Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReconcileFailed, ngv1.ReasonQuotaExceeded, "")},
+	}
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(readyNodeClass("default"), rejected).
+		WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
+		Build()
+	ngp := nodegroup.NewProvider(kubeClient, noopRecorder{})
+	cp := cloudprovider.New(kubeClient, instancetype.NewProvider("par", nil, nil), ngp)
+
+	claim := testNodeClaim(rejected.Name)
+	claim.Status.ProviderID = nodegroup.ProviderID(rejected.Name)
+	ngp.RecordLateRefusal(claim, rejected)
+	if err := cp.Delete(context.Background(), claim); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: rejected.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected the rejected nodegroup deleted, got %v", err)
+	}
+
+	next := testNodeClaim("default-next1")
+	if _, err := cp.Create(context.Background(), next); !corecloudprovider.IsInsufficientCapacityError(err) {
+		t.Fatalf("expected a fast InsufficientCapacityError, got %v", err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: next.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected no nodegroup created during the quota backoff, got %v", err)
+	}
+}
+
 func TestDeleteAndGetLifecycle(t *testing.T) {
 	cp, kubeClient := newTestProvider(t, readyNodeClass("default"))
 	ng := &ngv1.NodeGroup{
