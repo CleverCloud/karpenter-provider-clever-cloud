@@ -8,7 +8,7 @@ SHELL := /bin/bash
 
 CONTROLLER_GEN_VERSION ?= v0.20.1
 # Keep in sync with the version pinned in .github/workflows/ci-lint.yaml
-GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT_VERSION ?= v2.14.0
 # The one pin for govulncheck: CI runs `make vulncheck`. It freezes the scanner
 # only — every run still fetches the current vulnerability database.
 GOVULNCHECK_VERSION ?= v1.8.0
@@ -117,8 +117,21 @@ vet: ## Run go vet
 	go vet ./...
 
 .PHONY: lint
-lint: ## Run golangci-lint (built from source on first run, then cached)
-	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run
+lint: ## Run golangci-lint on the Go toolchain go.mod pins, as CI does (built on first run, then cached)
+	@# CI lints on the toolchain actions/setup-go installs from go.mod, not on
+	@# the workstation's Go. A different local Go feeds the analyzers a
+	@# different standard library, which can change the findings or crash
+	@# them: golangci-lint v2.12.2's staticcheck panicked building IR for Go
+	@# 1.27's while CI, on 1.26, was green. The version is read from go.mod at
+	@# run time so it can never drift from the pin (GOWORK=off: under a local
+	@# go.work, `go list -m` prints every workspace module). `+auto` keeps
+	@# Go's own rule that a go.mod toolchain line, if one is added, selects a
+	@# newer toolchain, as it would in CI. The pinned toolchain is fetched
+	@# once through the module proxy and cached like any module. As in
+	@# test-envtest, the assignment is its own statement so that a failing
+	@# $$(...) aborts the recipe instead of being discarded.
+	version="$$(GOWORK=off go list -m -f '{{.GoVersion}}')" && \
+		GOTOOLCHAIN="go$$version+auto" go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run
 
 .PHONY: vulncheck
 vulncheck: ## Report known vulnerabilities reachable from the code (govulncheck; fetches vuln.go.dev)
@@ -126,8 +139,9 @@ vulncheck: ## Report known vulnerabilities reachable from the code (govulncheck;
 	@# so pin that to go.mod's go directive — the version CI installs, builds
 	@# and tests with. Under a newer local Go the scan would read that
 	@# release's patched stdlib and pass while CI reports the advisories. The
-	@# assignment is its own statement for the reason given in test-envtest.
-	gover="$$(go list -m -f '{{.GoVersion}}')" && \
+	@# assignment is its own statement for the reason given in test-envtest,
+	@# and GOWORK=off is there for the one given in lint.
+	gover="$$(GOWORK=off go list -m -f '{{.GoVersion}}')" && \
 		GOTOOLCHAIN="go$$gover" go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 .PHONY: image

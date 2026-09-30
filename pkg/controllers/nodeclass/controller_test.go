@@ -18,6 +18,7 @@ package nodeclass_test
 
 import (
 	"context"
+	"errors"
 	"github.com/awslabs/operatorpkg/status"
 	"strings"
 	"testing"
@@ -300,6 +301,28 @@ func TestReconcileNotReadyWhenNodeGroupAPIUnserved(t *testing.T) {
 	}
 	if nc.StatusConditions().Get(status.ConditionReady).IsTrue() {
 		t.Error("expected the NodeClass not to be Ready when the NodeGroup API is not served")
+	}
+}
+
+// TestReconcileRequeuesOnStatusConflict: a status write that lost an
+// optimistic-lock race is routine — retried shortly, never surfaced as a
+// reconcile error, and never dropped.
+func TestReconcileRequeuesOnStatusConflict(t *testing.T) {
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(testNodeClass("default", nil)).
+		WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(_ context.Context, _ client.Client, _ string, obj client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
+				return apierrors.NewConflict(schema.GroupResource{Group: "karpenter.clever-cloud.com", Resource: "clevernodeclasses"},
+					obj.GetName(), errors.New("the object has been modified"))
+			},
+		}).
+		Build()
+
+	result := reconcileNodeClass(t, nodeclass.NewController(kubeClient), "default")
+	if result.RequeueAfter != time.Second {
+		t.Errorf("RequeueAfter = %v, want 1s after a status conflict", result.RequeueAfter)
 	}
 }
 
