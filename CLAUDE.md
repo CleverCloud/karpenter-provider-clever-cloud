@@ -16,6 +16,7 @@ make e2e         # full suite against a live CKE cluster (E2E_CONTEXT required �
 make generate    # controller-gen: deepcopy + CleverNodeClass CRD → deploy/crds, then sync into both Helm charts
 make vet         # go vet ./...
 make lint        # golangci-lint v2 (config in .golangci.yml, runs via go run — no install needed)
+make vulncheck   # govulncheck pinned by GOVULNCHECK_VERSION, run under go.mod's go directive (fetches vuln.go.dev)
 make chart-lint  # helm lint + template both charts
 make chart-package  # helm package both charts into dist/ (TAG=v<semver>; chart version = TAG without the v)
 make raw-manifest   # regenerate deploy/karpenter.yaml from charts/karpenter (never edit it by hand)
@@ -29,7 +30,7 @@ Run `make generate` after any change to `pkg/apis/` (deepcopy), `pkg/apis/v1alph
 
 The chart CRD copies are generated too: `make generate` copies `deploy/crds/` verbatim into `charts/karpenter/crds/` and awk-templates them into `charts/karpenter-crd/templates/` (`sync-chart-crds`). Never edit those files by hand — CI fails if `make generate` produces a diff.
 
-The Go patch release is pinned twice and the two must match: the `go` directive in `go.mod` (what CI installs, tests and govulncheck-scans with) and the Dockerfile's `golang:<x.y.z>` builder tag (what the shipped binary is actually built with — the golang image runs with `GOTOOLCHAIN=local`). Bump both together, to the latest patch release of the minor; `TestImageBuilderMatchesGoDirective` (`cmd/controller`) fails otherwise. Nothing bumps them automatically — the daily govulncheck run in the CodeQL workflow is the trigger.
+The Go patch release is pinned twice and the two must match: the `go` directive in `go.mod` (what CI installs, tests and govulncheck-scans with) and the Dockerfile's `golang:<x.y.z>` builder tag (what the shipped binary is actually built with — the golang image runs with `GOTOOLCHAIN=local`). Bump both together, to the latest patch release of the minor; `TestImageBuilderMatchesGoDirective` (`cmd/controller`) fails otherwise. Nothing bumps them automatically — the daily Govulncheck job of the CodeQL workflow (`make vulncheck`) is the trigger.
 
 ## Architecture
 
@@ -96,7 +97,7 @@ Unit tests use the controller-runtime fake client (see `pkg/cloudprovider/cloudp
 
 ## CI
 
-PRs run `make vet`, `make build`, `make chart-lint`, a generated-files drift check (`make generate raw-manifest` must produce no diff), `make test`, `go test -race ./pkg/... ./cmd/...`, `make test-envtest`, golangci-lint (`ci-lint.yaml` — same version as `make lint`), and a git-hygiene gate (`git.yaml`: every commit message must be a Conventional Commit, no `fixup!`/`squash!` commits). Pushing a `v*` tag builds the image, pushes it to ghcr.io, and publishes both Helm charts as OCI artifacts to `oci://ghcr.io/<owner>/<repo>/charts/{karpenter,karpenter-crd}` (chart version = tag without the `v` prefix, appVersion = tag — the in-repo `Chart.yaml` versions are placeholders overridden at package time, but the release fails fast if they lag the tag: bump both files and run `make raw-manifest` in the release commit). Commit conventions are documented in CONTRIBUTING.md.
+PRs run `make vet`, `make build`, `make chart-lint`, a generated-files drift check (`make generate raw-manifest` must produce no diff), `make test`, `go test -race ./pkg/... ./cmd/...`, `make test-envtest`, golangci-lint (`ci-lint.yaml` — same version as `make lint`), CodeQL and `make vulncheck` (`codeql-analysis.yaml`, also daily — govulncheck is a separate job so a vulnerability finding can never skip CodeQL), and a git-hygiene gate (`git.yaml`: every commit message must be a Conventional Commit, no `fixup!`/`squash!` commits). Pushing a `v*` tag builds the image, pushes it to ghcr.io, and publishes both Helm charts as OCI artifacts to `oci://ghcr.io/<owner>/<repo>/charts/{karpenter,karpenter-crd}` (chart version = tag without the `v` prefix, appVersion = tag — the in-repo `Chart.yaml` versions are placeholders overridden at package time, but the release fails fast if they lag the tag: bump both files and run `make raw-manifest` in the release commit). Commit conventions are documented in CONTRIBUTING.md.
 
 ## Operational constraints that shape the code
 
