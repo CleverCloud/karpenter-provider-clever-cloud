@@ -63,7 +63,7 @@ func main() {
 	// The catalogue sizes the flavors a quota rejection makes unavailable: the
 	// rejected one and every flavor at least as large.
 	nodeGroupProvider := nodegroup.NewProvider(op.GetClient(), op.EventRecorder, instanceTypeProvider, op.Clock)
-	cleverCloudProvider := cloudprovider.New(op.GetClient(), instanceTypeProvider, nodeGroupProvider)
+	cleverCloudProvider := cloudprovider.New(op.GetClient(), op.GetAPIReader(), instanceTypeProvider, nodeGroupProvider)
 	// Innermost decorator so durations/errors measure the actual provider
 	// calls (karpenter_cloudprovider_* series), then the NodeOverlay layer.
 	metricsCloudProvider := coremetrics.Decorate(cleverCloudProvider)

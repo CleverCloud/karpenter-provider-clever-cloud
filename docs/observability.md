@@ -169,7 +169,15 @@ status write (its decision), not when the VM is up. It stretches to the full
 15 s window only when the operator does not answer, which
 `nodegroup_acceptance_timeouts_total` counts. Creations are serialized, so it
 also includes the wait behind the launches queued ahead: a burst of N
-launches adds up to N × 1–2 s.
+launches adds up to N × 1–2 s. What a launch creates is decided once it gets
+through that queue, not before: a launch whose flavor a launch ahead just had
+refused or quota-rejected falls to the next flavor, or fails as an
+`InsufficientCapacityError`, and a launch from a NodeClass deleted meanwhile
+fails as a `NodeClassNotReadyError`. A launch whose NodeClaim was deleted while
+it waited creates nothing and fails with an untyped error (the `error=""`
+series, plus a reconciler error log from karpenter-core), after which core
+finalizes the claim: a few of them are expected when a NodePool is deleted or
+scaled down during a burst of launches, and nothing needs doing.
 
 Also useful from karpenter-core: `karpenter_nodeclaims_disrupted_total{reason="registration_timeout"}`
 (NodeClaims that never registered — fires 15 minutes after each optimistic

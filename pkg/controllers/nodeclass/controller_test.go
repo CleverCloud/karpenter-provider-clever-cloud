@@ -532,7 +532,7 @@ func (noopRecorder) Publish(...events.Event) {}
 func isDrifted(t *testing.T, kubeClient client.Client, nodeGroupName string) corecloudprovider.DriftReason {
 	t.Helper()
 	itp := instancetype.NewProvider("par", nil, nil)
-	cp := cloudprovider.New(kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{}))
+	cp := cloudprovider.New(kubeClient, kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{}))
 	nodeClaim := testNodeClaim(nodeGroupName, "default")
 	nodeClaim.Status.ProviderID = nodegroup.ProviderID(nodeGroupName)
 	reason, err := cp.IsDrifted(context.Background(), nodeClaim)

@@ -54,7 +54,11 @@ const (
 )
 
 type CloudProvider struct {
-	kubeClient           client.Client
+	kubeClient client.Client
+	// apiReader reads from the API server, bypassing the informer cache:
+	// Create reads the NodeClaim and the NodeClass it launches from with it
+	// (see resolveLaunch).
+	apiReader            client.Reader
 	instanceTypeProvider *instancetype.Provider
 	nodeGroupProvider    *nodegroup.Provider
 	// warnedFlavors dedups the degradation log per flavor for this process
@@ -62,39 +66,29 @@ type CloudProvider struct {
 	warnedFlavors sync.Map
 }
 
-func New(kubeClient client.Client, instanceTypeProvider *instancetype.Provider, nodeGroupProvider *nodegroup.Provider) *CloudProvider {
+func New(kubeClient client.Client, apiReader client.Reader, instanceTypeProvider *instancetype.Provider, nodeGroupProvider *nodegroup.Provider) *CloudProvider {
 	return &CloudProvider{
 		kubeClient:           kubeClient,
+		apiReader:            apiReader,
 		instanceTypeProvider: instanceTypeProvider,
 		nodeGroupProvider:    nodeGroupProvider,
 	}
 }
 
 func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
-	nodeClass, err := c.resolveNodeClassFromNodeClaim(ctx, nodeClaim)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("resolving node class from nodeclaim, %w", err))
+	// What to launch is decided under the nodegroup provider's creation lock,
+	// right before the NodeGroup is created, never before the wait for it
+	// (see resolveLaunch): instanceType is the flavor resolved there, the one
+	// the NodeGroup is created with.
+	var instanceType *cloudprovider.InstanceType
+	ng, err := c.nodeGroupProvider.ResolveAndCreate(ctx, nodeClaim, func(ctx context.Context) (*v1alpha1.CleverNodeClass, string, error) {
+		nodeClass, resolved, err := c.resolveLaunch(ctx, nodeClaim)
+		if err != nil {
+			return nil, "", err
 		}
-		return nil, fmt.Errorf("resolving node class from nodeclaim, %w", err)
-	}
-	// Ready must be affirmatively True: an Unknown readiness (controller not
-	// yet reconciled, stale status) must not launch machines either.
-	if readiness := nodeClass.StatusConditions().Get(status.ConditionReady); !readiness.IsTrue() {
-		return nil, cloudprovider.NewNodeClassNotReadyError(errors.New(readiness.Message))
-	}
-	// Readiness conditions survive deletion untouched (the nodeclass finalize
-	// path only lists NodeClaims), so DeletionTimestamp is the only terminating
-	// signal here. Refusing lets karpenter-core delete the claim instead of
-	// launching a VM the nodeclass finalizer would then wait on indefinitely.
-	if !nodeClass.DeletionTimestamp.IsZero() {
-		return nil, cloudprovider.NewNodeClassNotReadyError(fmt.Errorf("nodeclass %s is terminating", nodeClass.Name))
-	}
-	instanceType, err := c.resolveInstanceType(nodeClaim)
-	if err != nil {
-		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("resolving instance type, %w", err))
-	}
-	ng, err := c.nodeGroupProvider.Create(ctx, nodeClaim, nodeClass, instanceType.Name)
+		instanceType = resolved
+		return nodeClass, resolved.Name, nil
+	})
 	if err != nil {
 		quotaErr := &nodegroup.ErrQuotaExceeded{}
 		rejectedErr := &nodegroup.ErrFlavorRejected{}
@@ -324,9 +318,84 @@ func (c *CloudProvider) GetSupportedNodeClasses() []status.Object {
 	return []status.Object{&v1alpha1.CleverNodeClass{}}
 }
 
+// resolveLaunch decides what Create launches for nodeClaim: the NodeClass the
+// NodeGroup is built from and the cheapest available flavor. It runs under the
+// nodegroup provider's creation lock, immediately before the NodeGroup is
+// created. Launches queue on that lock, each holding it until the operator's
+// decision on its group (15 s when the operator does not answer), and
+// anything checked before the wait can be stale once the lock is acquired.
+// Checked before it, a launch queued behind a refusal POSTed the flavor that
+// had just been refused (one more create, refuse and delete upstream); a
+// NodeClass that started terminating meanwhile still launched, and its
+// finalizer then waited on a machine created after its deletion; and a
+// NodeClaim deleted meanwhile still got its billed machine, since
+// karpenter-core only branches to finalize at the start of a reconcile, not
+// in the launch it is already running.
+//
+// The NodeClaim and the NodeClass are read from the API server, not the
+// informer cache: they are the last word before a billed machine and an
+// upstream quota reservation, and one GET each is nothing next to a launch.
+func (c *CloudProvider) resolveLaunch(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*v1alpha1.CleverNodeClass, *cloudprovider.InstanceType, error) {
+	if err := c.checkNodeClaimWanted(ctx, nodeClaim); err != nil {
+		return nil, nil, err
+	}
+	nodeClass, err := c.resolveNodeClassFromNodeClaim(ctx, nodeClaim)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("resolving node class from nodeclaim, %w", err))
+		}
+		return nil, nil, fmt.Errorf("resolving node class from nodeclaim, %w", err)
+	}
+	// Ready must be affirmatively True: an Unknown readiness (controller not
+	// yet reconciled, stale status) must not launch machines either.
+	if readiness := nodeClass.StatusConditions().Get(status.ConditionReady); !readiness.IsTrue() {
+		return nil, nil, cloudprovider.NewNodeClassNotReadyError(errors.New(readiness.Message))
+	}
+	// Readiness conditions survive deletion untouched (the nodeclass finalize
+	// path only lists NodeClaims), so DeletionTimestamp is the only terminating
+	// signal here. Refusing lets karpenter-core delete the claim instead of
+	// launching a VM the nodeclass finalizer would then wait on indefinitely.
+	if !nodeClass.DeletionTimestamp.IsZero() {
+		return nil, nil, cloudprovider.NewNodeClassNotReadyError(fmt.Errorf("nodeclass %s is terminating", nodeClass.Name))
+	}
+	instanceType, err := c.resolveInstanceType(nodeClaim)
+	if err != nil {
+		return nil, nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("resolving instance type, %w", err))
+	}
+	return nodeClass, instanceType, nil
+}
+
+// checkNodeClaimWanted fails the launch of a NodeClaim that is no longer
+// wanted: gone, replaced by another NodeClaim of the same name (whose UID the
+// NodeGroup's owner reference would not carry, so garbage collection would
+// reap the new group at once), or being deleted. The error is a plain one, on
+// purpose: an InsufficientCapacityError or a NodeClassNotReadyError would make
+// karpenter-core count a capacity or nodeclass disruption for a claim that is
+// going away anyway, while a plain error requeues the claim, whose next
+// reconcile finalizes it. Without a provider ID core deletes no NodeGroup:
+// this attempt created none, and a group an earlier attempt created carries
+// the claim's owner reference, which hands it to garbage collection.
+func (c *CloudProvider) checkNodeClaimWanted(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
+	live := &karpv1.NodeClaim{}
+	if err := c.apiReader.Get(ctx, types.NamespacedName{Name: nodeClaim.Name}, live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("nodeclaim %s no longer exists; not launching it", nodeClaim.Name)
+		}
+		return fmt.Errorf("getting nodeclaim, %w", err)
+	}
+	if live.UID != nodeClaim.UID {
+		return fmt.Errorf("nodeclaim %s was replaced by another nodeclaim of the same name (uid %s, launching for uid %s); not launching it",
+			nodeClaim.Name, live.UID, nodeClaim.UID)
+	}
+	if !live.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("nodeclaim %s is being deleted; not launching it", nodeClaim.Name)
+	}
+	return nil
+}
+
 func (c *CloudProvider) resolveNodeClassFromNodeClaim(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*v1alpha1.CleverNodeClass, error) {
 	nodeClass := &v1alpha1.CleverNodeClass{}
-	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaim.Spec.NodeClassRef.Name}, nodeClass); err != nil {
+	if err := c.apiReader.Get(ctx, types.NamespacedName{Name: nodeClaim.Spec.NodeClassRef.Name}, nodeClass); err != nil {
 		return nil, err
 	}
 	return nodeClass, nil
@@ -336,7 +405,9 @@ func (c *CloudProvider) resolveNodeClassFromNodeClaim(ctx context.Context, nodeC
 // satisfies the NodeClaim's scheduling requirements and resource requests. It
 // reads the catalogue GetInstanceTypes serves, so a flavor the scheduler sees
 // unavailable is never launched: a claim planned before a rejection covered
-// its cheapest option falls to the next one, or fails fast with none.
+// its cheapest option — including a rejection recorded while its launch
+// waited for the creation lock (see resolveLaunch) — falls to the next one, or
+// fails fast with none.
 func (c *CloudProvider) resolveInstanceType(nodeClaim *karpv1.NodeClaim) (*cloudprovider.InstanceType, error) {
 	requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
 	var best *cloudprovider.InstanceType

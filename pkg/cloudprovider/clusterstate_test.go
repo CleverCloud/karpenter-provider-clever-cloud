@@ -63,7 +63,7 @@ func newClusterStateProvider(t *testing.T) (*cloudprovider.CloudProvider, client
 		}).
 		Build()
 	itp := instancetype.NewProvider("par", nil, nil)
-	cp := cloudprovider.New(kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{}))
+	cp := cloudprovider.New(kubeClient, kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{}))
 	return cp, kubeClient
 }
 
