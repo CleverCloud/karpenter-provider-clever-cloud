@@ -81,6 +81,8 @@ var (
 	// quota rejection these are not normal operation: the request was
 	// well-formed as far as this provider knows, and the flavor is held out of
 	// provisioning for a few minutes so the scheduler relaxes to another one.
+	// A failure the operator retries on its own (UpstreamError) is not a
+	// refusal and is not counted here.
 	NodeGroupRejections = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{

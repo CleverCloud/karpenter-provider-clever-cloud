@@ -80,7 +80,9 @@ func (e *ErrQuotaExceeded) Error() string {
 // the NodeGroup for a reason that is not the organisation quota — a flavor the
 // cluster cannot provision, a spec it will not accept. It is terminal: waiting
 // for a group the operator has already refused only burns karpenter's
-// registration TTL, and retrying the same flavor reproduces it.
+// registration TTL, and retrying the same flavor reproduces it. A failure the
+// operator retries on its own (ngv1.NodeGroup.TransientFailure, e.g. a Clever
+// Cloud API error) is not a refusal and never produces this error.
 type ErrFlavorRejected struct {
 	Flavor  string
 	Reason  string
@@ -276,7 +278,13 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 		}
 		ng = existing
 	}
-	synced, err := p.waitForAcceptance(ctx, ng.Name)
+	synced, retried, err := p.waitForAcceptance(ctx, ng.Name)
+	// Before the error branches, not only on success: a group that vanished or
+	// was refused after the operator reported a transient failure must stay
+	// traceable to that platform incident.
+	if retried != nil {
+		p.publishTransientFailure(ctx, nodeClaim, ng.Name, retried, synced, err)
+	}
 	if err != nil {
 		quotaErr := &ErrQuotaExceeded{}
 		if errors.As(err, &quotaErr) {
@@ -351,6 +359,42 @@ func (p *Provider) publishQuotaEvent(nodeClaim *karpv1.NodeClaim, err error) {
 	})
 }
 
+// publishTransientFailure surfaces a transient failure the operator reported
+// during the acceptance poll, whatever ended the poll, Ready included; a
+// controller shutdown is not an outcome and publishes nothing. Nothing was
+// deleted or held out for it, but without this signal a launch riding out a
+// Clever Cloud API incident would look like an ordinary slow reconcile — or,
+// once the window closes, like a down operator — and a group that vanished or
+// was refused afterwards could not be tied back to the incident.
+//
+// The wording states only that the poll saw the failure, never that it is
+// still current or that it was resolved: a later poll may have seen it
+// cleared, and the operator can keep it set next to Ready. The outcome is what
+// ended the poll: accepted (Normal), not accepted in time, or failed.
+func (p *Provider) publishTransientFailure(ctx context.Context, nodeClaim *karpv1.NodeClaim, name string, failure *transientFailure, synced bool, pollErr error) {
+	eventType := corev1.EventTypeWarning
+	var outcome string
+	switch {
+	case pollErr != nil:
+		outcome = fmt.Sprintf("the launch then failed: %v", pollErr)
+	case synced:
+		eventType = corev1.EventTypeNormal
+		outcome = "the NodeGroup was then accepted within the poll window"
+	default:
+		outcome = fmt.Sprintf("the NodeGroup was not accepted within %s, so the launch proceeds optimistically (the registration TTL is the backstop)", quotaCheckTimeout)
+	}
+	log.FromContext(ctx).WithValues("NodeGroup", name, "reason", failure.reason, "message", failure.message, "outcome", outcome).Info(
+		"node-group operator reported a transient failure during the acceptance poll; not treated as a refusal")
+	p.recorder.Publish(events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           eventType,
+		Reason:         "NodeGroupTransientFailure",
+		Message: fmt.Sprintf("The node-group operator reported a transient failure on NodeGroup %s during the acceptance poll (%s: %s); it retries such failures on its own, so nothing was deleted or held out for it; %s",
+			name, failure.reason, failure.message, outcome),
+		DedupeValues: []string{nodeClaim.Name},
+	})
+}
+
 // ErrNodeGroupVanished is returned by Create when the NodeGroup disappeared
 // during the acceptance poll after having been observed once — the quota
 // engine reclaiming an accepted group is the documented cause. Failing the
@@ -358,16 +402,27 @@ func (p *Provider) publishQuotaEvent(nodeClaim *karpv1.NodeClaim, err error) {
 // registration TTL on a group that no longer exists.
 var ErrNodeGroupVanished = errors.New("nodegroup vanished during the acceptance poll")
 
+// transientFailure is a ReconcileFailed condition the operator retries on its
+// own (ngv1.NodeGroup.TransientFailure), as last seen by the acceptance poll.
+type transientFailure struct {
+	reason, message string
+}
+
 // waitForAcceptance polls the NodeGroup until the Clever Cloud operator
-// reports it Synced, rejects it on quota, or the timeout elapses. A timeout
-// returns (false, nil): the caller treats it as optimistic success but must
+// reports it Ready, refuses it, or the timeout elapses. A timeout returns
+// (false, _, nil): the caller treats it as optimistic success but must
 // surface it — it is the only signal distinguishing a down operator from
 // normal provisioning. A cancelled parent context (controller shutdown) is
 // NOT a timeout and returns its error, so shutdowns don't fake that signal.
-func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bool, error) {
+// The last transient failure the poll saw, if any, is returned alongside so
+// the caller can surface it whatever ended the poll, Ready included: it is not
+// a refusal, and does not end the poll. A shutdown returns none, for the same
+// reason it returns no timeout.
+func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bool, *transientFailure, error) {
 	ctx, cancel := context.WithTimeout(parentCtx, quotaCheckTimeout)
 	defer cancel()
 	seen := false
+	var retried *transientFailure
 	err := wait.PollUntilContextCancel(ctx, quotaCheckInterval, true, func(ctx context.Context) (bool, error) {
 		ng := &ngv1.NodeGroup{}
 		if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: name}, ng); err != nil {
@@ -383,6 +438,23 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bo
 			return false, err
 		}
 		seen = true
+		// Recorded first, before anything below can end the poll, Ready
+		// included: the operator keeps a transient failure set next to Ready
+		// (live), and the caller surfaces what the poll saw whatever ended it.
+		// Recorded after the Ready return, a failure first seen together with
+		// Ready would end the poll with nothing to surface.
+		if reason, message, transient := ng.TransientFailure(); transient {
+			retried = &transientFailure{reason: reason, message: message}
+		}
+		// Ready wins over every other condition. The operator reports several
+		// at once — live: Ready=True + ReconcileInProgress=True +
+		// ReconcileFailed=True(UpstreamError) on a group whose machine was up
+		// — and a Ready group is a booted VM. Checking a failure first would
+		// delete it as "refused": on the AlreadyExists adoption path, the VM
+		// this very claim launched on an earlier attempt.
+		if ng.IsSynced() {
+			return true, nil
+		}
 		if ng.IsQuotaExceeded() {
 			msg := ""
 			if cond := ng.GetCondition(ngv1.ConditionTypeReconcileFailed); cond != nil {
@@ -400,7 +472,7 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bo
 			// never replacing the rejection: this Delete runs on the poll's
 			// own 15s context, so a rejection observed late enough would fail
 			// it with a wrapped context.DeadlineExceeded; wait.Interrupted
-			// would then match, waitForAcceptance would return (false, nil),
+			// would then match, waitForAcceptance would return (false, _, nil),
 			// and Create would report optimistic success for a group the quota
 			// engine has already rejected — the claim would burn the 15-minute
 			// registration TTL with the reservation never freed. The typed
@@ -411,19 +483,31 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bo
 			}
 			return false, &ErrQuotaExceeded{Message: msg}
 		}
-		// Any other ReconcileFailed is a refusal too. Previously it was
-		// indistinguishable from "still reconciling": the poll timed out, Create
-		// reported optimistic success, and the launch burned the full 15-minute
-		// registration TTL before karpenter re-planned — onto the same flavor,
-		// forever, with the operator's own explanation never surfaced anywhere.
-		if reason, message, failed := ng.ReconcileFailure(); failed {
+		// A transient failure is the operator retrying a Clever Cloud API call
+		// on its own (live: UpstreamError, recovered about an hour later), not
+		// a verdict on the group — so none of the refusal machinery below. The
+		// same incident hits every flavor: treated as a refusal, successive
+		// claims would delete one group each mid-first-reconcile (the upstream
+		// reservation-leak pattern createMu guards against) and hold out the
+		// whole catalogue flavor by flavor. Keep polling as for any group still
+		// in progress; it was recorded above, and the caller surfaces it.
+		if _, _, transient := ng.TransientFailure(); transient {
+			return false, nil
+		}
+		// Any other ReconcileFailed is a refusal too — including a reason never
+		// seen before. Previously it was indistinguishable from "still
+		// reconciling": the poll timed out, Create reported optimistic success,
+		// and the launch burned the full 15-minute registration TTL before
+		// karpenter re-planned — onto the same flavor, forever, with the
+		// operator's own explanation never surfaced anywhere.
+		if reason, message, refused := ng.Refusal(); refused {
 			metrics.NodeGroupRejections.Inc(nil)
 			// Free the refused reservation, exactly as the quota branch does —
 			// but never let its failure replace the refusal. This Delete runs on
 			// the poll's own 15s context, so a refusal observed late enough
 			// would fail it with a wrapped context.DeadlineExceeded;
 			// wait.Interrupted would then match, waitForAcceptance would return
-			// (false, nil), and Create would report optimistic success for a
+			// (false, _, nil), and Create would report optimistic success for a
 			// group the operator has already refused — the exact 15-minute TTL
 			// burn this branch exists to prevent. The typed error wins; the
 			// leftover group is reclaimed by the GC sweep.
@@ -433,18 +517,21 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bo
 			}
 			return false, &ErrFlavorRejected{Flavor: ng.Spec.Flavor, Reason: reason, Message: message}
 		}
-		return ng.IsSynced(), nil
+		return false, nil
 	})
 	if err == nil {
-		return true, nil
+		return true, retried, nil
 	}
 	if wait.Interrupted(err) {
 		if parentCtx.Err() != nil {
-			return false, parentCtx.Err()
+			// Shutdown, not an outcome: no transient failure either, or it
+			// would be published as a failed launch. The claim's next attempt
+			// adopts the group and its poll reads the status again.
+			return false, nil, parentCtx.Err()
 		}
-		return false, nil
+		return false, retried, nil
 	}
-	return false, err
+	return false, retried, err
 }
 
 // Get fetches a NodeGroup by name.

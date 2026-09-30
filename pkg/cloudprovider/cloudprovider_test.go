@@ -23,6 +23,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,6 +38,7 @@ import (
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	cloudprovider "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/cloudprovider"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
@@ -115,18 +117,99 @@ func testNodeClaim(name string) *karpv1.NodeClaim {
 	}
 }
 
-// markSynced simulates the Clever Cloud operator accepting the NodeGroup.
-func markSynced(t *testing.T, kubeClient client.Client, name string) {
+// condTrue builds a True condition of the given type, as the Clever Cloud
+// operator writes it.
+func condTrue(condType, reason, message string) ngv1.NodeGroupCondition {
+	return ngv1.NodeGroupCondition{Type: condType, Status: corev1.ConditionTrue, Reason: reason, Message: message}
+}
+
+// syncedStatus is the status of a NodeGroup the operator has accepted.
+func syncedStatus() ngv1.NodeGroupStatus {
+	return ngv1.NodeGroupStatus{
+		Phase:      ngv1.PhaseSynced,
+		Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReady, "Synced", "")},
+	}
+}
+
+// upstreamErrorStatus is the status the operator reports while it retries a
+// failing Clever Cloud API call. Measured live: phase=UpstreamError with
+// Ready=True(Synced) + ReconcileInProgress=True(Scaling) +
+// ReconcileFailed=True(UpstreamError), on a group that was already up; the
+// operator retried until it succeeded. Without ready, the same failure lands
+// on a group still in its first reconcile (Creating).
+func upstreamErrorStatus(ready bool) ngv1.NodeGroupStatus {
+	failed := condTrue(ngv1.ConditionTypeReconcileFailed, ngv1.ReasonUpstreamError, "API error: RequestDidntReturnSuccess")
+	if !ready {
+		return ngv1.NodeGroupStatus{
+			Phase:      ngv1.PhaseUpstreamError,
+			Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReconcileInProgress, "Creating", ""), failed},
+		}
+	}
+	return ngv1.NodeGroupStatus{
+		Phase: ngv1.PhaseUpstreamError,
+		Conditions: []ngv1.NodeGroupCondition{
+			condTrue(ngv1.ConditionTypeReady, "Synced", ""),
+			condTrue(ngv1.ConditionTypeReconcileInProgress, "Scaling", ""),
+			failed,
+		},
+		NodeCount: 1,
+	}
+}
+
+// setStatus plays the Clever Cloud operator: it writes the given status on the
+// NodeGroup verbatim. A status may carry several conditions at once, as the
+// live operator reports them. It reports failures with Errorf, never Fatalf,
+// because callers run it from operator-simulating goroutines.
+func setStatus(t *testing.T, kubeClient client.Client, name string, status ngv1.NodeGroupStatus) {
 	t.Helper()
 	ng := &ngv1.NodeGroup{}
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, ng); err != nil {
-		t.Fatalf("getting nodegroup: %v", err)
+		t.Errorf("getting nodegroup: %v", err)
+		return
 	}
-	ng.Status.Conditions = []ngv1.NodeGroupCondition{{Type: ngv1.ConditionTypeReady, Status: corev1.ConditionTrue, Reason: "Synced"}}
-	ng.Status.Phase = ngv1.PhaseSynced
+	ng.Status = status
 	if err := kubeClient.Update(context.Background(), ng); err != nil {
-		t.Fatalf("updating nodegroup status: %v", err)
+		t.Errorf("updating nodegroup status: %v", err)
 	}
+}
+
+// markSynced simulates the Clever Cloud operator accepting the NodeGroup.
+func markSynced(t *testing.T, kubeClient client.Client, name string) {
+	t.Helper()
+	setStatus(t, kubeClient, name, syncedStatus())
+}
+
+// statusStep separates successive statuses written by setStatusOnceCreated:
+// longer than the 1s acceptance-poll interval, so the poll observes each one.
+const statusStep = 1500 * time.Millisecond
+
+// setStatusOnceCreated waits for the NodeGroup to appear, then writes each
+// status in turn, statusStep apart. It stops early if the group is deleted in
+// between, so a Create that wrongly deletes it fails its assertions instead of
+// hanging the test.
+func setStatusOnceCreated(t *testing.T, kubeClient client.Client, name string, statuses ...ngv1.NodeGroupStatus) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i, status := range statuses {
+			if i > 0 {
+				time.Sleep(statusStep)
+			}
+			for {
+				err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, &ngv1.NodeGroup{})
+				if err == nil {
+					break
+				}
+				if i > 0 && apierrors.IsNotFound(err) {
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+			setStatus(t, kubeClient, name, status)
+		}
+	}()
+	return done
 }
 
 func TestCreatePicksCheapestCompatibleFlavor(t *testing.T) {
@@ -799,25 +882,9 @@ func TestCreateAdoptionDescribesTheExistingFlavor(t *testing.T) {
 // reason that is not the organisation quota.
 func markRefused(t *testing.T, kubeClient client.Client, name, reason string) <-chan struct{} {
 	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			ng := &ngv1.NodeGroup{}
-			if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, ng); err != nil {
-				continue
-			}
-			ng.Status.Conditions = []ngv1.NodeGroupCondition{{
-				Type: ngv1.ConditionTypeReconcileFailed, Status: corev1.ConditionTrue,
-				Reason: reason, Message: "flavor is not available on this cluster",
-			}}
-			if err := kubeClient.Update(context.Background(), ng); err != nil {
-				t.Errorf("updating nodegroup status: %v", err)
-			}
-			return
-		}
-	}()
-	return done
+	return setStatusOnceCreated(t, kubeClient, name, ngv1.NodeGroupStatus{
+		Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReconcileFailed, reason, "flavor is not available on this cluster")},
+	})
 }
 
 // TestCreateFlavorRefusalReturnsInsufficientCapacity covers the cloudprovider
@@ -880,5 +947,85 @@ func TestCreateAvoidsARefusedFlavor(t *testing.T) {
 		t.Errorf("expected the refused flavor to be skipped, got %q again", got)
 	} else if got != "XS" {
 		t.Errorf("expected the next-cheapest flavor XS, got %q", got)
+	}
+}
+
+// TestCreateUpstreamErrorDoesNotWalkTheCatalogue covers the cloudprovider half
+// of a Clever Cloud API incident. The operator reports
+// ReconcileFailed=True(UpstreamError) on whatever group it is reconciling and
+// retries on its own. Read as a flavor refusal, each launch failed with ICE
+// and held its flavor out, so successive claims walked the catalogue until
+// every flavor was held out and provisioning stopped. The launch must succeed
+// once the retry does, and the flavor must stay available.
+func TestCreateUpstreamErrorDoesNotWalkTheCatalogue(t *testing.T) {
+	cp, kubeClient := newTestProvider(t, readyNodeClass("default"))
+
+	incident := testNodeClaim("default-incident")
+	done := setStatusOnceCreated(t, kubeClient, incident.Name, upstreamErrorStatus(false), syncedStatus())
+	created, err := cp.Create(context.Background(), incident)
+	<-done
+	if err != nil {
+		t.Fatalf("a transient upstream failure must not fail the launch, got %T: %v (ICE=%v)",
+			err, err, corecloudprovider.IsInsufficientCapacityError(err))
+	}
+	if got := created.Labels[corev1.LabelInstanceTypeStable]; got != "2XS" {
+		t.Errorf("expected the cheapest flavor 2XS, got %q", got)
+	}
+
+	// The next launch still gets the cheapest flavor: nothing was held out.
+	next := testNodeClaim("default-next")
+	syncDone := setStatusOnceCreated(t, kubeClient, next.Name, syncedStatus())
+	created, err = cp.Create(context.Background(), next)
+	<-syncDone
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got := created.Labels[corev1.LabelInstanceTypeStable]; got != "2XS" {
+		t.Errorf("a platform-side failure must not hold 2XS out, next launch got %q", got)
+	}
+}
+
+// TestCreateAdoptsReadyGroupDuringUpstreamError covers the AlreadyExists
+// adoption path with the exact status measured live: a Ready group whose
+// operator is retrying a failed Clever Cloud API call. The group is the VM this
+// very claim launched on an earlier attempt; it was deleted as "refused" and
+// the launch failed with ICE.
+func TestCreateAdoptsReadyGroupDuringUpstreamError(t *testing.T) {
+	nodeClaim := testNodeClaim("default-adopt")
+	existing := &ngv1.NodeGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nodeClaim.Name,
+			Labels: map[string]string{
+				v1alpha1.ManagedLabelKey:   "true",
+				v1alpha1.NodeClaimLabelKey: nodeClaim.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "karpenter.sh/v1",
+				Kind:       "NodeClaim",
+				Name:       nodeClaim.Name,
+				UID:        nodeClaim.UID,
+			}},
+		},
+		Spec:   ngv1.NodeGroupSpec{Flavor: "S", NodeCount: 1},
+		Status: upstreamErrorStatus(true),
+	}
+	cp, kubeClient := newTestProvider(t, readyNodeClass("default"), existing)
+	timeoutsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
+
+	created, err := cp.Create(context.Background(), nodeClaim)
+	if err != nil {
+		t.Fatalf("adopting a Ready group must succeed, got %T: %v (ICE=%v)",
+			err, err, corecloudprovider.IsInsufficientCapacityError(err))
+	}
+	if got := created.Labels[corev1.LabelInstanceTypeStable]; got != "S" {
+		t.Errorf("instance-type label = %q, want the adopted group's S", got)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: nodeClaim.Name}, &ngv1.NodeGroup{}); err != nil {
+		t.Errorf("a Ready group must never be deleted: %v", err)
+	}
+	// Accepted on the first poll, not waited out as "in progress": a timeout
+	// is optimistic success too, so err alone proves nothing here.
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total") - timeoutsBefore; delta != 0 {
+		t.Errorf("acceptance_timeouts_total delta = %v, want 0: a Ready group is accepted on the first poll", delta)
 	}
 }

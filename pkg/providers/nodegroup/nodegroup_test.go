@@ -99,10 +99,111 @@ func testNodeClaim(name string) *karpv1.NodeClaim {
 	}
 }
 
+// eventsWithReason returns the captured events carrying the given reason.
+func (r *fakeRecorder) eventsWithReason(reason string) []events.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []events.Event
+	for _, e := range r.events {
+		if e.Reason == reason {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// assertOneNormalTransientFailure checks that Create surfaced the transient
+// failure its poll saw exactly once, as the Normal event of a group accepted
+// within the window.
+func assertOneNormalTransientFailure(t *testing.T, recorder *fakeRecorder) {
+	t.Helper()
+	evts := recorder.eventsWithReason("NodeGroupTransientFailure")
+	if len(evts) != 1 {
+		t.Fatalf("expected exactly one NodeGroupTransientFailure event, got %v", recorder.reasons())
+	}
+	if evts[0].Type != corev1.EventTypeNormal || !strings.Contains(evts[0].Message, ngv1.ReasonUpstreamError) {
+		t.Errorf("expected a Normal event carrying the operator's reason, got %+v", evts[0])
+	}
+}
+
+// condTrue builds a True condition of the given type, as the Clever Cloud
+// operator writes it.
+func condTrue(condType, reason, message string) ngv1.NodeGroupCondition {
+	return ngv1.NodeGroupCondition{Type: condType, Status: corev1.ConditionTrue, Reason: reason, Message: message}
+}
+
 // syncedConditions is the status the Clever Cloud operator reports once it
 // has accepted a NodeGroup.
 func syncedConditions() []ngv1.NodeGroupCondition {
-	return []ngv1.NodeGroupCondition{{Type: ngv1.ConditionTypeReady, Status: corev1.ConditionTrue, Reason: "Synced"}}
+	return []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReady, "Synced", "")}
+}
+
+// syncedStatus is the full status of an accepted NodeGroup.
+func syncedStatus() ngv1.NodeGroupStatus {
+	return ngv1.NodeGroupStatus{Phase: ngv1.PhaseSynced, Conditions: syncedConditions()}
+}
+
+// upstreamErrorStatus is the status the operator reports while it retries a
+// failing Clever Cloud API call. Measured live: phase=UpstreamError with
+// Ready=True(Synced) + ReconcileInProgress=True(Scaling) +
+// ReconcileFailed=True(UpstreamError), on a group that was already up and
+// being scaled; the operator retried until it succeeded. Without ready, the
+// same failure lands on a group still in its first reconcile (Creating).
+func upstreamErrorStatus(ready bool) ngv1.NodeGroupStatus {
+	failed := condTrue(ngv1.ConditionTypeReconcileFailed, ngv1.ReasonUpstreamError, "API error: RequestDidntReturnSuccess")
+	if !ready {
+		return ngv1.NodeGroupStatus{
+			Phase:      ngv1.PhaseUpstreamError,
+			Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReconcileInProgress, "Creating", ""), failed},
+		}
+	}
+	return ngv1.NodeGroupStatus{
+		Phase: ngv1.PhaseUpstreamError,
+		Conditions: []ngv1.NodeGroupCondition{
+			condTrue(ngv1.ConditionTypeReady, "Synced", ""),
+			condTrue(ngv1.ConditionTypeReconcileInProgress, "Scaling", ""),
+			failed,
+		},
+		NodeCount: 1,
+	}
+}
+
+// statusStep separates successive statuses written by setStatusOnceCreated:
+// longer than the 1s acceptance-poll interval, so the poll observes each one.
+const statusStep = 1500 * time.Millisecond
+
+// setStatusOnceCreated plays the Clever Cloud operator: once the NodeGroup
+// appears in the fake client, it writes each status in turn, statusStep apart.
+// A status may carry several conditions at once, as the live operator reports
+// them. It stops early if the group is deleted in between, so a Create that
+// wrongly deletes the group fails its assertions instead of hanging the test.
+func setStatusOnceCreated(t *testing.T, kubeClient client.Client, name string, statuses ...ngv1.NodeGroupStatus) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i, status := range statuses {
+			if i > 0 {
+				time.Sleep(statusStep)
+			}
+			for {
+				ng := &ngv1.NodeGroup{}
+				if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, ng); err != nil {
+					if i > 0 && apierrors.IsNotFound(err) {
+						return
+					}
+					time.Sleep(time.Millisecond)
+					continue
+				}
+				ng.Status = status
+				if err := kubeClient.Update(context.Background(), ng); err != nil {
+					t.Errorf("updating nodegroup status: %v", err)
+				}
+				break
+			}
+		}
+	}()
+	return done
 }
 
 // acceptOnceCreated simulates the Clever Cloud operator accepting the
@@ -110,76 +211,42 @@ func syncedConditions() []ngv1.NodeGroupCondition {
 // Synced so Create's acceptance poll returns well before the 15s timeout.
 func acceptOnceCreated(t *testing.T, kubeClient client.Client, name string) <-chan struct{} {
 	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			ng := &ngv1.NodeGroup{}
-			if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, ng); err != nil {
-				time.Sleep(time.Millisecond)
-				continue
-			}
-			ng.Status.Conditions = syncedConditions()
-			ng.Status.Phase = ngv1.PhaseSynced
-			if err := kubeClient.Update(context.Background(), ng); err != nil {
-				t.Errorf("updating nodegroup status: %v", err)
-			}
-			return
-		}
-	}()
-	return done
+	return setStatusOnceCreated(t, kubeClient, name, syncedStatus())
 }
 
-// rejectOnceCreated simulates the Clever Cloud operator rejecting the
-// NodeGroup on quota once it appears in the fake client.
 // failOnceCreated flips the NodeGroup to ReconcileFailed with an arbitrary
 // reason once it appears, standing in for the upstream operator.
 func failOnceCreated(t *testing.T, kubeClient client.Client, name, reason, message string) <-chan struct{} {
 	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			ng := &ngv1.NodeGroup{}
-			if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, ng); err != nil {
-				time.Sleep(time.Millisecond)
-				continue
-			}
-			ng.Status.Conditions = []ngv1.NodeGroupCondition{{
-				Type: ngv1.ConditionTypeReconcileFailed, Status: corev1.ConditionTrue,
-				Reason: reason, Message: message,
-			}}
-			if err := kubeClient.Update(context.Background(), ng); err != nil {
-				t.Errorf("updating nodegroup status: %v", err)
-			}
-			return
-		}
-	}()
-	return done
+	return setStatusOnceCreated(t, kubeClient, name, ngv1.NodeGroupStatus{
+		Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReconcileFailed, reason, message)},
+	})
 }
 
+// rejectOnceCreated simulates the Clever Cloud operator rejecting the
+// NodeGroup on quota once it appears in the fake client.
 func rejectOnceCreated(t *testing.T, kubeClient client.Client, name, message string) <-chan struct{} {
 	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			ng := &ngv1.NodeGroup{}
-			if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, ng); err != nil {
-				time.Sleep(time.Millisecond)
-				continue
-			}
-			ng.Status.Conditions = []ngv1.NodeGroupCondition{{
-				Type: ngv1.ConditionTypeReconcileFailed, Status: corev1.ConditionTrue,
-				Reason: ngv1.ReasonQuotaExceeded, Message: message,
-			}}
-			if err := kubeClient.Update(context.Background(), ng); err != nil {
-				t.Errorf("updating nodegroup status: %v", err)
-			}
-			return
-		}
-	}()
-	return done
+	return failOnceCreated(t, kubeClient, name, ngv1.ReasonQuotaExceeded, message)
+}
+
+// ownedNodeGroup seeds a NodeGroup as Create would have made it for the claim
+// of the same name, with the given status: what the AlreadyExists path adopts.
+func ownedNodeGroup(name, flavor string, status ngv1.NodeGroupStatus) *ngv1.NodeGroup {
+	return &ngv1.NodeGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Labels: map[string]string{
+				v1alpha1.ManagedLabelKey:   "true",
+				v1alpha1.NodeClaimLabelKey: name,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: name},
+			},
+		},
+		Spec:   ngv1.NodeGroupSpec{Flavor: flavor, NodeCount: 1},
+		Status: status,
+	}
 }
 
 func TestProviderIDRoundTrip(t *testing.T) {
@@ -834,5 +901,322 @@ func TestAdoptionReleasesTheAdoptedGroupsFlavor(t *testing.T) {
 	}
 	if _, held := provider.RejectedFlavors()["XS"]; held {
 		t.Errorf("adopting a Synced XS group must release the hold on XS, got %v", provider.RejectedFlavors())
+	}
+}
+
+// TestCreateTransientFailureIsNotARefusal covers a fresh group whose first
+// reconcile hits a Clever Cloud API error the operator retries on its own
+// (ReconcileFailed=True(UpstreamError) next to ReconcileInProgress=True). It
+// was read as a refusal: the group was deleted mid-first-reconcile, its flavor
+// held out and the launch failed with ICE — and since the same incident hits
+// every flavor, successive claims walked and held out the whole catalogue. It
+// must behave like any group still in progress: the poll keeps waiting and,
+// here, times out into the optimistic launch.
+func TestCreateTransientFailureIsNotARefusal(t *testing.T) {
+	// Long enough for the second poll (t=1s) to observe the status.
+	prev := nodegroup.SetQuotaCheckTimeout(statusStep)
+	t.Cleanup(func() { nodegroup.SetQuotaCheckTimeout(prev) })
+
+	provider, kubeClient, recorder := newTestProviderWithRecorder(t)
+	nodeClaim := testNodeClaim("default-upstream")
+	rejectionsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total")
+	timeoutsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
+
+	done := setStatusOnceCreated(t, kubeClient, nodeClaim.Name, upstreamErrorStatus(false))
+	ng, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XS")
+	<-done
+	if err != nil {
+		t.Fatalf("a transient upstream failure must not fail the launch, got %T: %v", err, err)
+	}
+	if ng.Name != nodeClaim.Name {
+		t.Errorf("nodegroup name = %q, want %q", ng.Name, nodeClaim.Name)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: nodeClaim.Name}, &ngv1.NodeGroup{}); err != nil {
+		t.Errorf("the group must not be deleted while the operator retries it: %v", err)
+	}
+	if held := provider.RejectedFlavors(); len(held) != 0 {
+		t.Errorf("a platform-side failure must not hold a flavor out, held %v", held)
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total") - rejectionsBefore; delta != 0 {
+		t.Errorf("rejections_total delta = %v, want 0", delta)
+	}
+	// The window still closed without acceptance: that signal is unchanged.
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total") - timeoutsBefore; delta != 1 {
+		t.Errorf("acceptance_timeouts_total delta = %v, want 1", delta)
+	}
+	if slices.Contains(recorder.reasons(), "NodeGroupRejected") {
+		t.Errorf("a transient failure must not publish NodeGroupRejected, got %v", recorder.reasons())
+	}
+	evts := recorder.eventsWithReason("NodeGroupTransientFailure")
+	if len(evts) != 1 {
+		t.Fatalf("expected one NodeGroupTransientFailure event, got %v", recorder.reasons())
+	}
+	if evts[0].Type != corev1.EventTypeWarning || !strings.Contains(evts[0].Message, ngv1.ReasonUpstreamError) {
+		t.Errorf("expected a Warning carrying the operator's reason, got %+v", evts[0])
+	}
+}
+
+// TestCreateTransientFailureThenReadyIsAccepted proves the poll keeps waiting
+// through a transient failure instead of ending on it: the operator's retry
+// succeeds within the window and the launch is accepted like any other.
+func TestCreateTransientFailureThenReadyIsAccepted(t *testing.T) {
+	prev := nodegroup.SetQuotaCheckTimeout(5 * time.Second)
+	t.Cleanup(func() { nodegroup.SetQuotaCheckTimeout(prev) })
+
+	provider, kubeClient, recorder := newTestProviderWithRecorder(t)
+	nodeClaim := testNodeClaim("default-retried")
+	timeoutsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
+
+	done := setStatusOnceCreated(t, kubeClient, nodeClaim.Name, upstreamErrorStatus(false), syncedStatus())
+	_, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XS")
+	<-done
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total") - timeoutsBefore; delta != 0 {
+		t.Errorf("acceptance_timeouts_total delta = %v, want 0: the group was accepted within the window", delta)
+	}
+	evts := recorder.eventsWithReason("NodeGroupTransientFailure")
+	if len(evts) != 1 || evts[0].Type != corev1.EventTypeNormal {
+		t.Errorf("expected one Normal NodeGroupTransientFailure event once the retry succeeded, got %+v", evts)
+	}
+}
+
+// TestCreateTransientFailureThenVanishIsSurfaced covers a poll that ends in an
+// error after seeing a transient failure: the group vanishes while the
+// operator retries a failed Clever Cloud API call. The launch fails as for any
+// vanish, but the transient failure must still be surfaced, so the vanish can
+// be tied back to the platform incident.
+func TestCreateTransientFailureThenVanishIsSurfaced(t *testing.T) {
+	prev := nodegroup.SetQuotaCheckTimeout(5 * time.Second)
+	t.Cleanup(func() { nodegroup.SetQuotaCheckTimeout(prev) })
+
+	provider, kubeClient, recorder := newTestProviderWithRecorder(t)
+	nodeClaim := testNodeClaim("default-upstream-vanish")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-setStatusOnceCreated(t, kubeClient, nodeClaim.Name, upstreamErrorStatus(false))
+		// Long enough for the poll (t=1s) to observe the transient failure.
+		time.Sleep(statusStep)
+		_ = kubeClient.Delete(context.Background(), &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: nodeClaim.Name}})
+	}()
+	_, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XS")
+	<-done
+	if !errors.Is(err, nodegroup.ErrNodeGroupVanished) {
+		t.Fatalf("expected ErrNodeGroupVanished, got %T: %v", err, err)
+	}
+	if !slices.Contains(recorder.reasons(), "NodeGroupVanished") {
+		t.Errorf("expected a NodeGroupVanished event, got %v", recorder.reasons())
+	}
+	evts := recorder.eventsWithReason("NodeGroupTransientFailure")
+	if len(evts) != 1 {
+		t.Fatalf("expected one NodeGroupTransientFailure event on the failed launch, got %v", recorder.reasons())
+	}
+	if evts[0].Type != corev1.EventTypeWarning ||
+		!strings.Contains(evts[0].Message, ngv1.ReasonUpstreamError) ||
+		!strings.Contains(evts[0].Message, nodegroup.ErrNodeGroupVanished.Error()) {
+		t.Errorf("expected a Warning carrying the operator's reason and the vanish, got %+v", evts[0])
+	}
+}
+
+// TestCreateParentCancellationPublishesNoTransientFailure covers a controller
+// shutdown after the poll saw a transient failure. A shutdown is not an
+// outcome, as for the acceptance timeout: publishing the failure would report
+// a failed launch that did not fail. The claim's next attempt adopts the group,
+// and its own poll surfaces the failure if the operator still reports it.
+func TestCreateParentCancellationPublishesNoTransientFailure(t *testing.T) {
+	prev := nodegroup.SetQuotaCheckTimeout(5 * time.Second)
+	t.Cleanup(func() { nodegroup.SetQuotaCheckTimeout(prev) })
+
+	provider, kubeClient, recorder := newTestProviderWithRecorder(t)
+	nodeClaim := testNodeClaim("default-cancel-upstream")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := setStatusOnceCreated(t, kubeClient, nodeClaim.Name, upstreamErrorStatus(false))
+	go func() {
+		// Between the polls at t=1s, which sees the transient failure, and
+		// t=2s.
+		time.Sleep(statusStep)
+		cancel()
+	}()
+	_, err := provider.Create(ctx, nodeClaim, testNodeClass("default"), "2XS")
+	<-done
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the parent's cancellation, got %T: %v", err, err)
+	}
+	if slices.Contains(recorder.reasons(), "NodeGroupTransientFailure") {
+		t.Errorf("a shutdown must not publish the transient failure as a failed launch, got %v", recorder.reasons())
+	}
+	if slices.Contains(recorder.reasons(), "NodeGroupAcceptanceTimeout") {
+		t.Errorf("a shutdown must not publish a NodeGroupAcceptanceTimeout event, got %v", recorder.reasons())
+	}
+}
+
+// TestCreateReadyWinsOverFailureConditions pins the precedence one way: the
+// operator reports several conditions at once, and a Ready group is a booted
+// VM whatever else its status carries. On the AlreadyExists adoption path it
+// is the VM this very claim launched on an earlier attempt; deleting it as
+// "refused" would destroy a working machine.
+func TestCreateReadyWinsOverFailureConditions(t *testing.T) {
+	// Short, so a regression that waits a Ready group out as "in progress"
+	// fails on the timeout assertions below without costing the full window.
+	prev := nodegroup.SetQuotaCheckTimeout(5 * time.Second)
+	t.Cleanup(func() { nodegroup.SetQuotaCheckTimeout(prev) })
+
+	cases := map[string]struct {
+		status ngv1.NodeGroupStatus
+		// transient: a transient failure is set next to Ready. Ready still
+		// decides the outcome, but the poll saw the failure and must surface
+		// it, as a Normal event.
+		transient bool
+	}{
+		"live: ready + scaling + upstream error": {status: upstreamErrorStatus(true), transient: true},
+		"ready + terminal refusal": {status: ngv1.NodeGroupStatus{
+			Phase: ngv1.PhaseSynced,
+			Conditions: []ngv1.NodeGroupCondition{
+				condTrue(ngv1.ConditionTypeReady, "Synced", ""),
+				condTrue(ngv1.ConditionTypeReconcileFailed, "FlavorNotAvailable", "nope"),
+			},
+		}},
+		"ready + quota exceeded": {status: ngv1.NodeGroupStatus{
+			Phase: ngv1.PhaseQuotaExceeded,
+			Conditions: []ngv1.NodeGroupCondition{
+				condTrue(ngv1.ConditionTypeReady, "Synced", ""),
+				condTrue(ngv1.ConditionTypeReconcileFailed, ngv1.ReasonQuotaExceeded, ""),
+			},
+		}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			provider, kubeClient, recorder := newTestProviderWithRecorder(t, ownedNodeGroup("default-adopt", "S", tc.status))
+			rejectionsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total")
+			quotaBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_quota_rejections_total")
+			timeoutsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
+
+			ng, err := provider.Create(context.Background(), testNodeClaim("default-adopt"), testNodeClass("default"), "2XS")
+			if err != nil {
+				t.Fatalf("adopting a Ready group must succeed, got %T: %v", err, err)
+			}
+			if ng.Spec.Flavor != "S" {
+				t.Errorf("flavor = %q, want the adopted group's %q", ng.Spec.Flavor, "S")
+			}
+			if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: "default-adopt"}, &ngv1.NodeGroup{}); err != nil {
+				t.Errorf("a Ready group must never be deleted: %v", err)
+			}
+			if held := provider.RejectedFlavors(); len(held) != 0 {
+				t.Errorf("no flavor may be held out for a Ready group, held %v", held)
+			}
+			if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total") - rejectionsBefore; delta != 0 {
+				t.Errorf("rejections_total delta = %v, want 0", delta)
+			}
+			// Accepted on the first poll, not waited out as "in progress".
+			if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total") - timeoutsBefore; delta != 0 {
+				t.Errorf("acceptance_timeouts_total delta = %v, want 0", delta)
+			}
+			// No quota rejection recorded either, hence no backoff armed.
+			if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_quota_rejections_total") - quotaBefore; delta != 0 {
+				t.Errorf("quota_rejections_total delta = %v, want 0", delta)
+			}
+			if slices.Contains(recorder.reasons(), "NodeGroupRejected") || slices.Contains(recorder.reasons(), "NodeGroupQuotaExceeded") {
+				t.Errorf("a Ready group must not be reported as refused, got %v", recorder.reasons())
+			}
+			if tc.transient {
+				assertOneNormalTransientFailure(t, recorder)
+			} else if slices.Contains(recorder.reasons(), "NodeGroupTransientFailure") {
+				t.Errorf("no transient failure was reported, got %v", recorder.reasons())
+			}
+		})
+	}
+
+	// Same live shape on a fresh create: the operator's first status write
+	// already carries Ready.
+	t.Run("fresh create: ready + scaling + upstream error", func(t *testing.T) {
+		provider, kubeClient, recorder := newTestProviderWithRecorder(t)
+		nodeClaim := testNodeClaim("default-fresh")
+		timeoutsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
+		done := setStatusOnceCreated(t, kubeClient, nodeClaim.Name, upstreamErrorStatus(true))
+		_, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XS")
+		<-done
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: nodeClaim.Name}, &ngv1.NodeGroup{}); err != nil {
+			t.Errorf("a Ready group must never be deleted: %v", err)
+		}
+		if held := provider.RejectedFlavors(); len(held) != 0 {
+			t.Errorf("no flavor may be held out for a Ready group, held %v", held)
+		}
+		// Accepted as soon as the poll sees Ready, not waited out as "in
+		// progress": a timeout would still return nil, so err alone proves
+		// nothing here.
+		if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total") - timeoutsBefore; delta != 0 {
+			t.Errorf("acceptance_timeouts_total delta = %v, want 0", delta)
+		}
+		if slices.Contains(recorder.reasons(), "NodeGroupAcceptanceTimeout") {
+			t.Errorf("a Ready group must not be reported as an acceptance timeout, got %v", recorder.reasons())
+		}
+		assertOneNormalTransientFailure(t, recorder)
+	})
+
+	// Not only on the first status: the poll saw the group in progress, then
+	// Ready and the transient failure together in one later status.
+	t.Run("in progress, then ready + scaling + upstream error", func(t *testing.T) {
+		provider, kubeClient, recorder := newTestProviderWithRecorder(t)
+		nodeClaim := testNodeClaim("default-later")
+		timeoutsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
+		inProgress := ngv1.NodeGroupStatus{
+			Phase:      "Creating",
+			Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReconcileInProgress, "Creating", "")},
+		}
+		done := setStatusOnceCreated(t, kubeClient, nodeClaim.Name, inProgress, upstreamErrorStatus(true))
+		_, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XS")
+		<-done
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total") - timeoutsBefore; delta != 0 {
+			t.Errorf("acceptance_timeouts_total delta = %v, want 0", delta)
+		}
+		assertOneNormalTransientFailure(t, recorder)
+	})
+}
+
+// TestCreateUnknownReasonStaysTerminal pins the precedence the other way: only
+// the allowlisted transient reasons are retried. A reason this provider has
+// never seen is still a refusal, even while ReconcileInProgress is also True —
+// a real refusal read as "in progress" would burn the 15-minute registration
+// TTL.
+func TestCreateUnknownReasonStaysTerminal(t *testing.T) {
+	provider, kubeClient, recorder := newTestProviderWithRecorder(t)
+	nodeClaim := testNodeClaim("default-unknown")
+
+	done := setStatusOnceCreated(t, kubeClient, nodeClaim.Name, ngv1.NodeGroupStatus{
+		Phase: "SomethingNew",
+		Conditions: []ngv1.NodeGroupCondition{
+			condTrue(ngv1.ConditionTypeReconcileInProgress, "Creating", ""),
+			condTrue(ngv1.ConditionTypeReconcileFailed, "SomethingNew", "the operator said no"),
+		},
+	})
+	_, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XS")
+	<-done
+
+	var rejected *nodegroup.ErrFlavorRejected
+	if !errors.As(err, &rejected) {
+		t.Fatalf("expected *ErrFlavorRejected for an unknown reason, got %T: %v", err, err)
+	}
+	if rejected.Reason != "SomethingNew" {
+		t.Errorf("refusal reason = %q, want %q", rejected.Reason, "SomethingNew")
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: nodeClaim.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
+		t.Errorf("expected the refused nodegroup to be deleted, got %v", err)
+	}
+	if _, held := provider.RejectedFlavors()["2XS"]; !held {
+		t.Errorf("expected 2XS to be held out, got %v", provider.RejectedFlavors())
+	}
+	if slices.Contains(recorder.reasons(), "NodeGroupTransientFailure") {
+		t.Errorf("a refusal must not be reported as transient, got %v", recorder.reasons())
 	}
 }
