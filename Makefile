@@ -146,7 +146,7 @@ vulncheck: ## Report known vulnerabilities reachable from the code (govulncheck;
 
 .PHONY: image
 image: ## Build the container image
-	docker build --build-arg VERSION=$(TAG) -t $(IMAGE):$(TAG) .
+	docker build -t $(IMAGE):$(TAG) .
 
 .PHONY: chart-lint
 chart-lint: ## Lint and render both Helm charts

@@ -154,35 +154,6 @@ var (
 		nil,
 	)
 
-	// PricingRefreshFailures counts failed catalogue refreshes; each failure
-	// keeps the last-known-good catalogue in use.
-	PricingRefreshFailures = opmetrics.NewPrometheusCounter(
-		crmetrics.Registry,
-		prometheus.CounterOpts{
-			Namespace: namespace,
-			Subsystem: "pricing",
-			Name:      "refresh_failures_total",
-			Help:      "Failed refreshes of the flavor/price catalogue. The last-known-good catalogue stays in use.",
-		},
-		nil,
-	)
-
-	// PricingLastSuccessfulRefresh is the unix time of the last successful
-	// catalogue refresh. Deliberately NOT pre-seeded in init: the series is
-	// absent until the first successful refresh, and exports nothing at all
-	// when the refresher is disabled (air-gap installs) — alert on staleness
-	// only when > 0.
-	PricingLastSuccessfulRefresh = opmetrics.NewPrometheusGauge(
-		crmetrics.Registry,
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Subsystem: "pricing",
-			Name:      "last_successful_refresh_timestamp_seconds",
-			Help:      "Unix time of the last successful catalogue refresh. Absent until the first success; exports no series when the refresher is disabled.",
-		},
-		nil,
-	)
-
 	// UnknownFlavorLookups counts instance-type lookups for a flavor absent
 	// from the served catalogue — a running NodeGroup references a flavor the
 	// catalogue no longer carries.
@@ -200,8 +171,7 @@ var (
 
 // init pre-seeds the unlabeled series so they exist from the first scrape:
 // increase()-style alerts cannot credit an absent→1 transition, which would
-// make the first incident tick after a controller restart invisible. The
-// pricing timestamp gauge is intentionally left absent (see its comment).
+// make the first incident tick after a controller restart invisible.
 func init() {
 	NodeGroupAcceptanceTimeouts.Add(0, nil)
 	NodeGroupQuotaRejections.Add(0, nil)
@@ -211,6 +181,5 @@ func init() {
 	FlavorsConfigInvalid.Set(0, nil)
 	GCReapedNodeGroups.Add(0, nil)
 	GCRefusedNodeGroups.Set(0, nil)
-	PricingRefreshFailures.Add(0, nil)
 	UnknownFlavorLookups.Add(0, nil)
 }

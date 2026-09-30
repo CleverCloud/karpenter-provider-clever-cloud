@@ -13,15 +13,13 @@ All provider series are prefixed `karpenter_clevercloud_`.
 |---|---|---|---|
 | `nodegroup_acceptance_timeouts_total` | counter | A NodeGroup creation was not accepted by the node-group operator within the poll window and proceeded optimistically. | One-off ticks are benign (slow reconcile). **Sustained growth means the node-group operator is down or wedged**: every launch will burn the 15-minute registration TTL. Check the operator on the control-plane VM (platform-side); scale-ups stall until it recovers. |
 | `nodegroup_quota_rejections_total` | counter | The organisation quota rejected a NodeGroup creation (fresh upstream rejections; cached-backoff fast-fails are not counted). | Normal near the quota ceiling — karpenter relaxes to other options. If persistent while workloads stay Pending, raise the org quota or lower NodePool limits. |
-| `nodegroup_rejections_total` | counter | The node-group operator refused a NodeGroup for a reason that is **not** the organisation quota — a flavor this cluster cannot provision, a spec it will not accept. The refused flavor is held out of provisioning for 5 minutes so the scheduler relaxes to another one. | Unlike a quota rejection this is not normal operation: the request was well-formed as far as the provider knows. Read the `NodeGroupRejected` event on the NodeClaim — it carries the operator's own reason and message. A flavor refused persistently is not usable on this cluster: pin the catalogue with `settings.flavors`, or restrict it with `CLEVER_CLOUD_TOPOLOGY`. |
+| `nodegroup_rejections_total` | counter | The node-group operator refused a NodeGroup for a reason that is **not** the organisation quota — a flavor this cluster cannot provision, a spec it will not accept. The refused flavor is held out of provisioning for 5 minutes so the scheduler relaxes to another one. | Unlike a quota rejection this is not normal operation: the request was well-formed as far as the provider knows. Read the `NodeGroupRejected` event on the NodeClaim — it carries the operator's own reason and message. A flavor refused persistently is not usable on this cluster: exclude it with a `node.kubernetes.io/instance-type` `NotIn` requirement on your NodePools. |
 | `nodegroup_vanished_total` | counter | A NodeGroup disappeared after creation while its NodeClaim was still unregistered — usually the quota engine reclaiming an accepted group. Each tick is a launch fast-failed instead of burning the 15-minute registration TTL. | Occasional ticks near the quota ceiling are the documented upstream race. Sustained growth means the platform keeps reclaiming accepted groups — check quota headroom and the node-group operator. |
 | `nodegroup_external_resizes` | gauge | Managed NodeGroups whose `nodeCount` is not 1 — something outside karpenter resizes them (the platform's alert-driven scaler via an inherited `autoscalingEnabled`, a human, anything with `nodegroups/scale` RBAC). | **Non-zero breaks the 1 NodeClaim = 1 NodeGroup invariant**: the extra nodes are never registered — they get no provider ID and keep the `karpenter.sh/unregistered` taint — so karpenter neither manages nor prices them. Find the resizer; ensure the cluster's `autoscalingEnabled` feature is off (the two autoscalers must never run together), then set `nodeCount` back to 1. **Also check karpenter-core's `karpenter_cluster_state_synced`**: a node carrying `karpenter.sh/nodepool` without a `spec.providerID` keeps it at 0 after every controller restart — provisioning and disruption stop cluster-wide and `cluster is waiting on sync for extended duration` is logged every 10 s. NodeGroups created by the current version never put that label on their nodes; for older groups, whose immutable `spec.labels` still carry it, the providerid controller removes it from the extra node it refuses to stamp (logged once per node). The controller never touches nodes of unmanaged groups, and that includes an older group recreated upstream without its `karpenter.clever-cloud.com/managed` label but with its old `spec.labels`: its single node carries the label with no provider ID and freezes the sync the same way. If `karpenter_cluster_state_synced` stays at 0 anyway, list the culprits with `kubectl get nodes -l karpenter.sh/nodepool -o custom-columns=NAME:.metadata.name,PROVIDERID:.spec.providerID` and remove the label from any node with an empty provider ID, or revert the resize. |
 | `gc_reaped_nodegroups_total` | counter | The GC safety net deleted an orphaned NodeGroup (its NodeClaim was force-deleted outside the normal flow). | Occasional ticks are the safety net working. Frequent ticks mean something force-deletes NodeClaims — find it. |
 | `gc_refused_nodegroups` | gauge | NodeGroups the last GC sweep refused to reap: managed label present, but no verified dead NodeClaim owner. | **Non-zero needs attention** — each one is a VM billing hourly. A copied manifest: remove the `karpenter.clever-cloud.com/managed` label. A deliberately orphaned group: delete it manually. Details in the `GarbageCollectionRefused` event on the NodeGroup. |
 | `instancetype_flavors_config_invalid` | gauge | 1 while the `settings.flavors` overrides file failed to load: the controller runs on the base catalogue WITHOUT the configured overrides instead of crashlooping. | Fix `settings.flavors` (the chart also validates it at install time via values.schema.json); the next pod roll picks it up. **Note**: a flavor that only the overrides kept in the catalogue leaves it while the gauge is 1 — its nodes are then rolled by drift (see [Flavor removal semantics](#flavor-removal-semantics)). |
-| `pricing_refresh_failures_total` | counter | A catalogue refresh from the public price API failed; the last-known-good catalogue stays in use. | Transient failures are harmless. Persistent failures mean prices/flavors drift from reality: check egress to `api.clever-cloud.com` and the error log, or pin the catalogue via `settings.flavors`. |
-| `pricing_last_successful_refresh_timestamp_seconds` | gauge | Unix time of the last successful catalogue refresh. **Absent until the first success, and exports no series when the refresher is disabled** (`settings.pricing.enabled=false`). | Alert on staleness only when > 0 (see below). |
-| `instancetype_unknown_flavor_lookups_total` | counter | An instance-type lookup referenced a flavor absent from the served catalogue. | A running NodeGroup uses a flavor the catalogue lost (upstream change, topology misconfig, removed override). GC and termination keep working on a synthesized type, and the affected nodes are **rolled by drift under disruption budgets** (see [Flavor removal semantics](#flavor-removal-semantics)); restore the flavor via `settings.flavors` or fix `CLEVER_CLOUD_TOPOLOGY` to stop the roll. |
+| `instancetype_unknown_flavor_lookups_total` | counter | An instance-type lookup referenced a flavor absent from the served catalogue. | A running NodeGroup uses a flavor the catalogue lost (a removed or invalid `settings.flavors` override, a release whose built-in catalogue dropped it). GC and termination keep working on a synthesized type, and the affected nodes are **rolled by drift under disruption budgets** (see [Flavor removal semantics](#flavor-removal-semantics)); restore the flavor via `settings.flavors` to stop the roll. |
 
 Suggested alert expressions:
 
@@ -50,23 +48,24 @@ karpenter_cluster_state_unsynced_time_seconds > 900
 # The flavors overrides file is broken; the configured overrides are inactive
 karpenter_clevercloud_instancetype_flavors_config_invalid > 0
 
-# Catalogue stale for more than two refresh periods (only when refresher active)
-karpenter_clevercloud_pricing_last_successful_refresh_timestamp_seconds > 0
-  and time() - karpenter_clevercloud_pricing_last_successful_refresh_timestamp_seconds > 86400
-
 # Running nodes reference a flavor the catalogue lost
 increase(karpenter_clevercloud_instancetype_unknown_flavor_lookups_total[30m]) > 0
 ```
 
-All counters and the refused gauge are pre-seeded at startup so the series
-exist from the first scrape; only the pricing timestamp gauge is deliberately
-absent until its first success.
+All counters and gauges are pre-seeded at startup so the series exist from the
+first scrape.
+
+The controller no longer exports `pricing_refresh_failures_total` nor
+`pricing_last_successful_refresh_timestamp_seconds`: the dynamic pricing
+refresher that fed them was removed, and the catalogue is now the built-in one
+plus `settings.flavors`. Delete any alert or dashboard built on them.
 
 ## Flavor removal semantics
 
-When a flavor leaves the served catalogue (upstream removal, a topology
-change, a removed override) while nodes of that flavor still run, the
-degradation is deliberate and bounded:
+When a flavor leaves the served catalogue (a removed or invalid
+`settings.flavors` override, a release whose built-in catalogue dropped it)
+while nodes of that flavor still run, the degradation is deliberate and
+bounded:
 
 - `Get`/`List` keep describing the affected NodeGroups with a **synthesized
   instance type** (seed sizing when the name is known, observed capacity when
@@ -81,10 +80,9 @@ degradation is deliberate and bounded:
   fit no remaining flavor leave the node parked with a `Blocked` disruption
   event until capacity or budgets allow.
 - `instancetype_unknown_flavor_lookups_total` moves and a per-flavor log line
-  names it. Remediation: restore the flavor via `settings.flavors` (an
-  override resurrecting a flavor absent from the live catalogue is accepted
-  but logged loudly — the platform may reject new NodeGroups using it) or fix
-  `CLEVER_CLOUD_TOPOLOGY`.
+  names it. Remediation: restore the flavor via `settings.flavors` (a flavor
+  outside the built-in catalogue must set `cpu`, `memoryKi` and
+  `priceHourly`).
 
 ## CloudProvider call metrics
 
@@ -115,6 +113,6 @@ condition.
 Refusal logs are deduplicated to one line per NodeGroup per controller
 lifetime — the gauge, not the log volume, is the persistent signal.
 
-Deliberate descope: pricing-refresh failures and unknown-flavor lookups are
-metrics/log-only — neither site holds a natural involved object for an Event
-(the refresher has no NodeClass in hand; instance-type lookups have no client).
+Deliberate descope: unknown-flavor lookups are metrics/log-only — the lookup
+site holds no natural involved object for an Event (instance-type lookups have
+no client).

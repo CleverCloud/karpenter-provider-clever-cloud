@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "title": "karpenter chart values (partial schema)",
-  "description": "Validates the settings.flavors overrides and the boolean toggles at helm install/upgrade time, before a typo reaches the controller. The booleans need typing because the templates gate on Go-template truthiness, where any non-empty string is true: a quoted \"false\" (--set-string, or a quoted values file) would render the exact opposite of its intent. Everything else is intentionally unconstrained.",
+  "description": "Validates the settings.flavors overrides and the boolean toggles at helm install/upgrade time, before a typo reaches the controller. The booleans need typing because the templates gate on Go-template truthiness, where any non-empty string is true: a quoted \"false\" (--set-string, or a quoted values file) would render the exact opposite of its intent. Everything else is intentionally unconstrained, unknown keys included: values a past release consumed and a later one removed (settings.pricing) must keep rendering under `helm upgrade --reuse-values`.",
   "type": "object",
   "properties": {
     "serviceAccount": {
@@ -44,15 +44,6 @@
             "nodeRepair": {
               "type": "boolean",
               "description": "Enable Karpenter's NodeRepair feature gate."
-            }
-          }
-        },
-        "pricing": {
-          "type": "object",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Enable the dynamic price/flavor refresher. The string \"false\" would render PRICING_REFRESH_ENABLED=\"true\"."
             }
           }
         },

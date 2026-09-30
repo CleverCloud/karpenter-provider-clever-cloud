@@ -26,25 +26,18 @@ import (
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/garbagecollection"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/instancetypecapacity"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodeclass"
-	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/pricing"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/providerid"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
 // NewControllers wires the Clever Cloud controllers. uncached reads straight
-// from the API server (the GC confirms destructive decisions with it);
-// pricingController is optional (nil when the dynamic price refresher is
-// disabled).
-func NewControllers(kubeClient client.Client, uncached client.Reader, recorder events.Recorder, nodeGroupProvider *nodegroup.Provider, instanceTypeProvider *instancetype.Provider, pricingController *pricing.Controller) []controller.Controller {
-	controllers := []controller.Controller{
+// from the API server (the GC confirms destructive decisions with it).
+func NewControllers(kubeClient client.Client, uncached client.Reader, recorder events.Recorder, nodeGroupProvider *nodegroup.Provider, instanceTypeProvider *instancetype.Provider) []controller.Controller {
+	return []controller.Controller{
 		providerid.NewController(kubeClient, uncached),
 		garbagecollection.NewController(kubeClient, uncached, nodeGroupProvider, recorder),
 		nodeclass.NewController(kubeClient),
 		instancetypecapacity.NewController(kubeClient, instanceTypeProvider),
 	}
-	if pricingController != nil {
-		controllers = append(controllers, pricingController)
-	}
-	return controllers
 }
