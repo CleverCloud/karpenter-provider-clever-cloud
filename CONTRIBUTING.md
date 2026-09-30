@@ -12,6 +12,17 @@ You need Go (the version pinned in [go.mod](go.mod)), `make`, and — for chart 
 `helm` and `kubectl`. A ready-to-use [devcontainer](.devcontainer/) is included. Run `make help`
 for the list of targets.
 
+The `go` directive in go.mod names one exact patch release: CI installs that release, and the
+[Dockerfile](Dockerfile) builder image is pinned to the same tag, because the golang image never
+switches toolchains (`GOTOOLCHAIN=local`): its tag, not go.mod, decides which standard library
+ships in the image. Bump both together (Go patch releases carry the standard-library security
+fixes); a unit test in `cmd/controller` fails when they diverge. Nothing bumps them automatically:
+Dependabot does not raise the `go` directive for Go security releases, and a Dockerfile-only bump
+would fail that test by design. The trigger is the daily govulncheck run of the CodeQL workflow,
+which turns red as soon as a standard-library vulnerability reachable from this code is published.
+Move both pins to the latest patch release of the Go minor, not merely the first one that fixes the
+reported issue.
+
 ## Local validation chain
 
 Before opening a pull request, the local validation chain must be green:

@@ -29,6 +29,8 @@ Run `make generate` after any change to `pkg/apis/` (deepcopy), `pkg/apis/v1alph
 
 The chart CRD copies are generated too: `make generate` copies `deploy/crds/` verbatim into `charts/karpenter/crds/` and awk-templates them into `charts/karpenter-crd/templates/` (`sync-chart-crds`). Never edit those files by hand — CI fails if `make generate` produces a diff.
 
+The Go patch release is pinned twice and the two must match: the `go` directive in `go.mod` (what CI installs, tests and govulncheck-scans with) and the Dockerfile's `golang:<x.y.z>` builder tag (what the shipped binary is actually built with — the golang image runs with `GOTOOLCHAIN=local`). Bump both together, to the latest patch release of the minor; `TestImageBuilderMatchesGoDirective` (`cmd/controller`) fails otherwise. Nothing bumps them automatically — the daily govulncheck run in the CodeQL workflow is the trigger.
+
 ## Architecture
 
 ### The core invariant: 1 NodeClaim = 1 NodeGroup
