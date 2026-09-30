@@ -31,10 +31,8 @@ import (
 
 	cloudprovider "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/cloudprovider"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers"
-	pricingcontroller "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/pricing"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
-	pricingprovider "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/pricing"
 )
 
 func main() {
@@ -54,31 +52,13 @@ func main() {
 	region := env.WithDefaultString("CLEVER_CLOUD_REGION", "par")
 
 	// FLAVORS_CONFIG_PATH points at a YAML list of per-flavor overrides (mounted
-	// from the chart's ConfigMap). They overlay the base catalog — the dynamic
-	// refresher's result, or the built-in DefaultFlavors — and always win. An
-	// invalid file degrades to the base catalogue instead of crashlooping the
-	// controller (surfaced via the flavors_config_invalid gauge).
+	// from the chart's ConfigMap). They overlay the built-in DefaultFlavors and
+	// always win. An invalid file degrades to the built-in catalogue instead of
+	// crashlooping the controller (surfaced via the flavors_config_invalid
+	// gauge).
 	overrides := instancetype.LoadFlavorsOrDegrade(env.WithDefaultString("FLAVORS_CONFIG_PATH", ""))
 
 	instanceTypeProvider := instancetype.NewProvider(region, nil, overrides)
-
-	// Dynamic price/flavor refresher, gated by PRICING_REFRESH_ENABLED. The
-	// binary defaults to off (safe fallback); the shipped chart and manifest
-	// enable it by default. It updates the base catalog every
-	// PRICING_REFRESH_PERIOD from Clever Cloud's public API; the overrides above
-	// are re-applied on top of every refresh.
-	var pricingCtrl *pricingcontroller.Controller
-	if env.WithDefaultBool("PRICING_REFRESH_ENABLED", false) {
-		resolver := pricingprovider.NewProvider(pricingprovider.Options{
-			BaseURL:        env.WithDefaultString("PRICING_API_URL", pricingprovider.DefaultBaseURL),
-			ProductURL:     env.WithDefaultString("PRICING_PRODUCT_URL", ""),
-			PriceSystemURL: env.WithDefaultString("PRICING_PRICE_SYSTEM_URL", ""),
-			Region:         region, // price-system zone_id
-			Topology:       env.WithDefaultString("CLEVER_CLOUD_TOPOLOGY", pricingprovider.TopologyAll),
-		})
-		period := env.WithDefaultDuration("PRICING_REFRESH_PERIOD", pricingcontroller.DefaultRefreshPeriod)
-		pricingCtrl = pricingcontroller.NewController(resolver, instanceTypeProvider, period)
-	}
 
 	nodeGroupProvider := nodegroup.NewProvider(op.GetClient(), op.EventRecorder)
 	cleverCloudProvider := cloudprovider.New(op.GetClient(), instanceTypeProvider, nodeGroupProvider)
@@ -106,7 +86,6 @@ func main() {
 			op.EventRecorder,
 			nodeGroupProvider,
 			instanceTypeProvider,
-			pricingCtrl,
 		)...).
 		Start(ctx)
 }

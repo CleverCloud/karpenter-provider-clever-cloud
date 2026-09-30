@@ -464,50 +464,28 @@ func findFlavor(t *testing.T, flavors []instancetype.Flavor, name string) instan
 	return instancetype.Flavor{}
 }
 
-func TestSetBaseFlavorsReappliesOverrides(t *testing.T) {
-	overrides := []instancetype.FlavorOverride{{Name: "M", PriceHourly: ptr(0.10)}}
-	p := instancetype.NewProvider("par", nil, overrides)
+func TestNewProviderOverlaysOverridesOnTheSeed(t *testing.T) {
+	p := instancetype.NewProvider("par", nil, []instancetype.FlavorOverride{{Name: "M", PriceHourly: ptr(0.10)}})
 
-	it, err := p.Get("M")
+	if got := len(p.List()); got != len(instancetype.DefaultFlavors) {
+		t.Fatalf("a price-only override must not change the catalogue size: got %d flavors, want %d", got, len(instancetype.DefaultFlavors))
+	}
+	m, err := p.Get("M")
 	if err != nil {
 		t.Fatalf("Get(M): %v", err)
 	}
-	if it.Offerings[0].Price != 0.10 {
-		t.Errorf("expected pinned price 0.10 at startup, got %v", it.Offerings[0].Price)
-	}
-
-	// A dynamic refresh updates the base; the override must still win for M.
-	p.SetBaseFlavors([]instancetype.Flavor{
-		{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.20},
-		{Name: "XS", CPU: 6, MemoryKi: 7937580, PriceHourly: 0.07},
-	})
-
-	m, _ := p.Get("M")
 	if m.Offerings[0].Price != 0.10 {
-		t.Errorf("expected override to survive refresh (0.10), got %v", m.Offerings[0].Price)
+		t.Errorf("expected the pinned M price 0.10, got %v", m.Offerings[0].Price)
+	}
+	if got := m.Capacity.Cpu().Value(); got != 10 {
+		t.Errorf("unset override fields must fall through to the seed: M cpu = %d, want 10", got)
 	}
 	xs, err := p.Get("XS")
 	if err != nil {
 		t.Fatalf("Get(XS): %v", err)
 	}
-	if xs.Offerings[0].Price != 0.07 {
-		t.Errorf("expected refreshed XS price 0.07, got %v", xs.Offerings[0].Price)
-	}
-	// The refresh narrowed the base to M+XS; the old default-only flavors are gone.
-	if _, err := p.Get("2XS"); err == nil {
-		t.Error("expected 2XS gone after a base refresh that omitted it")
-	}
-}
-
-func TestSetBaseFlavorsIgnoresEmpty(t *testing.T) {
-	p := instancetype.NewProvider("par", nil, nil)
-	before := len(p.List())
-
-	p.SetBaseFlavors(nil)
-	p.SetBaseFlavors([]instancetype.Flavor{})
-
-	if got := len(p.List()); got != before {
-		t.Errorf("empty SetBaseFlavors must keep the catalog: before %d, after %d", before, got)
+	if xs.Offerings[0].Price != 0.0611 {
+		t.Errorf("a flavor without an override must keep its seed price 0.0611, got %v", xs.Offerings[0].Price)
 	}
 }
 
@@ -527,10 +505,6 @@ func TestProviderConcurrentAccess(t *testing.T) {
 				}
 				_, _ = p.Get("M")
 				p.RecordObservedCapacity("L", capacity, allocatable)
-				p.SetBaseFlavors([]instancetype.Flavor{
-					{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.20},
-					{Name: "L", CPU: 12, MemoryKi: 23983488, PriceHourly: 0.1667},
-				})
 			}
 		}()
 	}

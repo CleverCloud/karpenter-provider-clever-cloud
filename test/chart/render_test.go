@@ -145,15 +145,13 @@ func controllerEnv(spec corev1.PodSpec, name string) *corev1.EnvVar {
 
 // TestBooleanValuesRejectStringForms pins the values.schema.json type guard.
 // The templates gate on Go-template truthiness, where any non-empty string is
-// true: the STRING "false" (--set-string, or a quoted values file) in
-// settings.pricing.enabled rendered PRICING_REFRESH_ENABLED="true" — the exact
-// opposite of intent — and the string "false" in settings.disableLeaderElection
-// with replicas>1 would run two active controllers. Every boolean the templates
-// consume must be typed in the schema so the string form is refused at
+// true: the STRING "false" (--set-string, or a quoted values file) renders the
+// exact opposite of intent — in settings.disableLeaderElection with replicas>1
+// it would run two active controllers. Every boolean the templates consume
+// must be typed in the schema so the string form is refused at
 // install/upgrade/template time.
 func TestBooleanValuesRejectStringForms(t *testing.T) {
 	for _, path := range []string{
-		"settings.pricing.enabled",
 		"settings.disableLeaderElection",
 		"settings.featureGates.nodeRepair",
 		"podDisruptionBudget.enabled",
@@ -173,26 +171,68 @@ func TestBooleanValuesRejectStringForms(t *testing.T) {
 	}
 }
 
-// TestPricingEnabledGatesEnvVar pins both halves of the pricing gate contract:
-// the default (true) must render PRICING_REFRESH_ENABLED="true" — the binary
-// defaults the gate to false, so losing the env var would silently disable the
-// refresher the chart promises — and the real boolean false must drop the env
-// var entirely so the binary's safe default takes over (the chart never renders
-// PRICING_REFRESH_ENABLED="false"; that shape is why the binary default must
-// stay false).
-func TestPricingEnabledGatesEnvVar(t *testing.T) {
-	t.Run("default renders the gate on", func(t *testing.T) {
-		env := controllerEnv(controllerPodSpec(t, helmTemplate(t)), "PRICING_REFRESH_ENABLED")
-		if env == nil || env.Value != "true" {
-			t.Fatalf(`default values must render PRICING_REFRESH_ENABLED="true", got %+v`, env)
+// removedPricingEnv are the environment variables of the dynamic pricing
+// refresher, removed with it: the controller reads none of them any more.
+var removedPricingEnv = []string{
+	"PRICING_REFRESH_ENABLED",
+	"PRICING_REFRESH_PERIOD",
+	"PRICING_API_URL",
+	"PRICING_PRODUCT_URL",
+	"PRICING_PRICE_SYSTEM_URL",
+	"CLEVER_CLOUD_TOPOLOGY",
+}
+
+// legacyPricingValues is the settings.pricing block earlier releases shipped
+// and documented, with every key set: `helm upgrade --reuse-values` carries it
+// into an upgrade verbatim.
+const legacyPricingValues = `settings:
+  pricing:
+    enabled: true
+    refreshPeriod: 12h
+    apiURL: https://api.clever-cloud.com
+    kubernetesProductURL: https://proxy.example/v4/kubernetes-product
+    priceSystemURL: https://proxy.example/v4/billing/price-system
+    topology: DISTRIBUTED
+`
+
+// TestLegacyPricingValuesAreIgnored pins the upgrade path from a release that
+// still had the pricing refresher: its values must keep rendering (the schema
+// tolerates unknown keys, so --reuse-values does not fail the upgrade) and
+// must not bring back any of the removed env vars, in the chart or in the
+// raw manifest generated from it.
+func TestLegacyPricingValuesAreIgnored(t *testing.T) {
+	assertNoPricingEnv := func(t *testing.T, spec corev1.PodSpec) {
+		t.Helper()
+		for _, name := range removedPricingEnv {
+			if env := controllerEnv(spec, name); env != nil {
+				t.Errorf("the controller no longer reads %s, but it is rendered: %+v", name, env)
+			}
 		}
+	}
+
+	t.Run("default values", func(t *testing.T) {
+		assertNoPricingEnv(t, controllerPodSpec(t, helmTemplate(t)))
 	})
 
-	t.Run("boolean false drops the env var", func(t *testing.T) {
-		env := controllerEnv(controllerPodSpec(t, helmTemplate(t, "settings.pricing.enabled=false")), "PRICING_REFRESH_ENABLED")
-		if env != nil {
-			t.Fatalf("settings.pricing.enabled=false must not render PRICING_REFRESH_ENABLED at all, got %+v", env)
+	t.Run("reused settings.pricing values", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "legacy-values.yaml")
+		if err := os.WriteFile(path, []byte(legacyPricingValues), 0o600); err != nil {
+			t.Fatal(err)
 		}
+		out, err := helmTemplateArgs(t, "--values", path)
+		if err != nil {
+			t.Fatalf("values carrying the removed settings.pricing block must still render "+
+				"(values.schema.json must tolerate unknown keys), got: %v\n%s", err, out)
+		}
+		assertNoPricingEnv(t, controllerPodSpec(t, out))
+	})
+
+	t.Run("raw manifest", func(t *testing.T) {
+		raw, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy", "karpenter.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertNoPricingEnv(t, controllerPodSpec(t, string(raw)))
 	})
 }
 

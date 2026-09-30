@@ -265,9 +265,6 @@ func (f *framework) startController(ctx context.Context) func() {
 	cmd.Env = append(os.Environ(),
 		"KUBECONFIG="+f.kubeconfigPath,
 		"DISABLE_LEADER_ELECTION=true",
-		// Deterministic catalog: the suite tests the provider, not the public
-		// pricing API's availability.
-		"PRICING_REFRESH_ENABLED=false",
 		"LOG_LEVEL=debug",
 		fmt.Sprintf("METRICS_PORT=%d", f.metricsPort),
 		fmt.Sprintf("HEALTH_PROBE_PORT=%d", f.healthPort),

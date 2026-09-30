@@ -18,6 +18,7 @@ package cloudprovider_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -47,12 +48,19 @@ func newTestProvider(t *testing.T, objs ...client.Object) (*cloudprovider.CloudP
 
 func newTestProviderWithCatalog(t *testing.T, objs ...client.Object) (*cloudprovider.CloudProvider, client.Client, *instancetype.Provider) {
 	t.Helper()
+	return newTestProviderWithBase(t, nil, objs...)
+}
+
+// newTestProviderWithBase serves base instead of the built-in catalogue, to
+// model a flavor that left it while its NodeGroups still run.
+func newTestProviderWithBase(t *testing.T, base []instancetype.Flavor, objs ...client.Object) (*cloudprovider.CloudProvider, client.Client, *instancetype.Provider) {
+	t.Helper()
 	kubeClient := fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(objs...).
 		WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
 		Build()
-	itp := instancetype.NewProvider("par", nil, nil)
+	itp := instancetype.NewProvider("par", base, nil)
 	ngp := nodegroup.NewProvider(kubeClient, noopRecorder{})
 	return cloudprovider.New(kubeClient, itp, ngp), kubeClient, itp
 }
@@ -428,16 +436,29 @@ func TestGetInstanceTypesCatalog(t *testing.T) {
 }
 
 // The tests below pin the unknown-flavor degradation contract: a running
-// NodeGroup whose flavor left the served catalogue — refresher shrink or
-// removed override — must keep Get and List working (core GC and node
-// termination depend on them), while the synthesized type never reaches the
-// provisioning catalog.
+// NodeGroup whose flavor left the served catalogue — a removed override, or a
+// release whose built-in seed dropped it — must keep Get and List working
+// (core GC and node termination depend on them), while the synthesized type
+// never reaches the provisioning catalog.
+
+// onlyM is a catalogue that lost every flavor but M.
+var onlyM = []instancetype.Flavor{{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.2}}
+
+// requireNotServed fails the test unless flavor is really absent from the
+// served catalogue. Without it, a provider that ignored the narrowed base and
+// served the full seed would pass every degradation assertion below: seed
+// sizing and a normal lookup look the same from the outside.
+func requireNotServed(t *testing.T, itp *instancetype.Provider, flavor string) {
+	t.Helper()
+	if _, err := itp.Get(flavor); !errors.Is(err, instancetype.ErrUnknownFlavor) {
+		t.Fatalf("precondition: %s must be absent from the served catalogue, Get returned err=%v", flavor, err)
+	}
+}
 
 func TestGetSynthesizesWhenFlavorLeftTheCatalogue(t *testing.T) {
-	cp, _, itp := newTestProviderWithCatalog(t, managedNodeGroup("default-old2xs", "2XS"))
-	// The refresher shrinks the catalogue to M only (upstream removal or a
-	// topology misread) while a 2XS node still runs.
-	itp.SetBaseFlavors([]instancetype.Flavor{{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.2}})
+	// The catalogue serves M only while a 2XS node still runs.
+	cp, _, itp := newTestProviderWithBase(t, onlyM, managedNodeGroup("default-old2xs", "2XS"))
+	requireNotServed(t, itp, "2XS")
 
 	claim, err := cp.Get(context.Background(), "clevercloud://default-old2xs")
 	if err != nil {
@@ -456,14 +477,14 @@ func TestGetSynthesizesWhenFlavorLeftTheCatalogue(t *testing.T) {
 }
 
 func TestListIncludesNodeGroupWithUnknownFlavor(t *testing.T) {
-	cp, _, itp := newTestProviderWithCatalog(t,
+	// 2XS left the catalogue while its node runs; CUSTOM was only ever there
+	// through a since-removed override.
+	cp, _, itp := newTestProviderWithBase(t, onlyM,
 		managedNodeGroup("default-known", "M"),
 		managedNodeGroup("default-old2xs", "2XS"),
 		managedNodeGroup("default-custom", "CUSTOM"),
 	)
-	// The refresher shrinks the catalogue (topology misread is the likeliest
-	// trigger): 2XS leaves while its node runs, CUSTOM was never in it.
-	itp.SetBaseFlavors([]instancetype.Flavor{{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.2}})
+	requireNotServed(t, itp, "2XS")
 
 	claims, err := cp.List(context.Background())
 	if err != nil {
@@ -821,10 +842,10 @@ func TestCreateFlavorRefusalReturnsInsufficientCapacity(t *testing.T) {
 }
 
 // TestCreateAvoidsARefusedFlavor covers the other half of the coupling. The
-// catalogue is deliberately permissive — it offers every flavor the platform
-// advertises for any topology — so an upstream refusal is the only signal that
-// one of them is unusable here. karpenter-core keeps no per-offering memory of
-// an InsufficientCapacityError, so without the hold the scheduler would re-pick
+// catalogue is deliberately permissive — it offers every built-in flavor on
+// every topology — so an upstream refusal is the only signal that one of them
+// is unusable here. karpenter-core keeps no per-offering memory of an
+// InsufficientCapacityError, so without the hold the scheduler would re-pick
 // the same cheapest flavor forever.
 func TestCreateAvoidsARefusedFlavor(t *testing.T) {
 	cp, kubeClient := newTestProvider(t, readyNodeClass("default"))

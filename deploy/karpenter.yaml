@@ -303,12 +303,6 @@ spec:
               value: "1s"
             - name: FEATURE_GATES
               value: "NodeRepair=false"
-            - name: PRICING_REFRESH_ENABLED
-              value: "true"
-            - name: PRICING_REFRESH_PERIOD
-              value: "12h"
-            - name: PRICING_API_URL
-              value: "https://api.clever-cloud.com"
             - name: MEMORY_LIMIT
               valueFrom:
                 resourceFieldRef:

@@ -6,15 +6,12 @@
 # on every Go patch release (cmd/controller's TestImageBuilderMatchesGoDirective
 # fails when the two diverge).
 FROM golang:1.26.8 AS builder
-ARG VERSION=dev
 WORKDIR /workspace
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ cmd/
 COPY pkg/ pkg/
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
-    -ldflags="-s -w -X github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/version.Version=${VERSION}" \
-    -o karpenter-clevercloud ./cmd/controller
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o karpenter-clevercloud ./cmd/controller
 
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /

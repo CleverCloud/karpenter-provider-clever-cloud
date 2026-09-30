@@ -8,7 +8,7 @@ This guide walks you through deploying the Karpenter provider for Clever Cloud o
 - `kubectl` pointing at your cluster, with cluster-admin access
 - `helm` v3.x
 
-> **Note:** No Clever Cloud API token or credentials are required. The provider drives the in-cluster NodeGroup API (`nodegroups.api.clever-cloud.com/v1`) that every CKE cluster serves; the Clever Cloud operator upstream turns NodeGroups into VMs.
+> **Note:** No Clever Cloud API token or credentials are required, and no egress beyond the cluster's API server. The provider drives the in-cluster NodeGroup API (`nodegroups.api.clever-cloud.com/v1`) that every CKE cluster serves and makes no call to any Clever Cloud HTTP endpoint; the Clever Cloud operator upstream turns NodeGroups into VMs.
 
 Each release publishes the controller image and both Helm charts to ghcr.io, so the default path below needs no local build. Chart versions follow the release tags without the `v` prefix: release `v0.12.0` publishes chart version `0.12.0` and image tag `v0.12.0`. To build and deploy your own image instead, see [Installing from source](#installing-from-source).
 
@@ -106,6 +106,8 @@ helm upgrade karpenter \
 ```
 
 If you did not install the CRD chart, apply the CRDs by hand instead (Helm does not upgrade CRDs shipped in the main chart's `crds/` directory), from a checkout of the matching release tag: `kubectl apply -f deploy/crds/`.
+
+> **Note:** Earlier releases shipped a dynamic pricing refresher that polled Clever Cloud's public API (`settings.pricing`, on by default). It is gone: the catalogue is the built-in one plus `settings.flavors`. A `--reuse-values` upgrade that still carries `settings.pricing` renders fine and the values are ignored, the egress rule to `api.clever-cloud.com` can be dropped, and alerts on `karpenter_clevercloud_pricing_refresh_failures_total` or `karpenter_clevercloud_pricing_last_successful_refresh_timestamp_seconds` must be deleted — those series no longer exist.
 
 > **Note:** Releases installed from the pre-rename chart (`helm install karpenter-clevercloud charts/karpenter-clevercloud`) cannot be upgraded in place: the chart rename changes the Deployment's immutable selector labels. Uninstall the old release first, then install fresh under the new name — the CRDs and your NodePools/NodeClasses are untouched by that operation.
 

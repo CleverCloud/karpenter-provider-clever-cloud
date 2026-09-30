@@ -21,9 +21,9 @@ limitations under the License.
 // (status.capacity); L and XL are derived from the documented specs
 // (https://www.clever.cloud/developers/doc/kubernetes/) using the same
 // kernel-visible-memory ratio as the measured flavors. Prices are the
-// documented public-beta worker prices (EUR/hour, June 2026) and can also be
-// refreshed at runtime from Clever Cloud's public price API (see SetBaseFlavors
-// and the pricing provider).
+// documented public-beta worker prices (EUR/hour, June 2026). The served
+// catalogue is this static seed with the operator's settings.flavors overrides
+// on top: nothing is fetched from a Clever Cloud endpoint at runtime.
 package instancetype
 
 import (
@@ -49,12 +49,12 @@ import (
 )
 
 const (
-	// DefaultVCPURate is the public CKE worker price per vCPU per hour (EUR);
-	// kubernetes.node.vcpu in the price-system. Used to derive flavor prices
-	// when no live rate is available.
+	// DefaultVCPURate is the documented public CKE worker price per vCPU per
+	// hour (EUR). With DefaultRAMRate it prices the seed flavors through
+	// ComputePrice.
 	DefaultVCPURate = 0.00277777777
-	// DefaultRAMRate is the public CKE worker price per nominal GB of RAM per
-	// hour (EUR); kubernetes.node.ram in the price-system.
+	// DefaultRAMRate is the documented public CKE worker price per nominal GB
+	// of RAM per hour (EUR).
 	DefaultRAMRate = 0.00555555555
 )
 
@@ -70,11 +70,10 @@ type Flavor struct {
 	PriceHourly float64 `json:"priceHourly"`
 }
 
-// Sizing is the static per-flavor seed the public Clever Cloud API cannot
-// provide: vCPU count, kernel-visible memory (KiB) and the NOMINAL advertised
-// memory (GB) used only by the price formula. CPU and MemoryKi additionally
-// self-correct at runtime via RecordObservedCapacity; NominalGB has no runtime
-// source.
+// Sizing is the static per-flavor seed: vCPU count, kernel-visible memory
+// (KiB) and the NOMINAL advertised memory (GB) used only by the price
+// formula. CPU and MemoryKi additionally self-correct at runtime via
+// RecordObservedCapacity; NominalGB has no runtime source.
 type Sizing struct {
 	CPU       int64
 	MemoryKi  int64
@@ -83,8 +82,8 @@ type Sizing struct {
 
 var (
 	// FlavorSizing is the canonical sizing table (ordered smallest-to-largest).
-	// Both DefaultFlavors and the dynamic pricing refresher derive from it; it
-	// is the single source of truth for per-flavor sizing.
+	// DefaultFlavors, ApplyOverrides and Synthesize all derive from it; it is
+	// the single source of truth for per-flavor sizing.
 	FlavorSizing = []struct {
 		Name string
 		Sizing
@@ -108,10 +107,10 @@ var (
 		return m
 	}()
 
-	// DefaultFlavors is the static CKE flavor catalog used as the base when no
-	// dynamic refresh has happened. Prices are kept as literals (audited public
-	// beta values); TestDefaultFlavorsMatchSeed pins them against FlavorSizing
-	// and the default rates so the two never drift.
+	// DefaultFlavors is the built-in CKE flavor catalog, the base the
+	// settings.flavors overrides are overlaid on. Prices are kept as literals
+	// (audited public beta values); TestDefaultFlavorsMatchSeed pins them
+	// against FlavorSizing and the default rates so the two never drift.
 	DefaultFlavors = []Flavor{
 		{Name: "2XS", CPU: 4, MemoryKi: 3911884, PriceHourly: 0.0333},
 		{Name: "XS", CPU: 6, MemoryKi: 7937580, PriceHourly: 0.0611},
@@ -143,7 +142,7 @@ func ComputePrice(cpu int64, nominalGB, vcpuRate, ramRate float64) float64 {
 // FlavorOverride is a partial, per-flavor override loaded from settings.flavors
 // (FLAVORS_CONFIG_PATH). Only Name is required; every other field is optional
 // and, when set, replaces the corresponding value from the base catalog (the
-// dynamic refresher or the built-in seed). Unset fields fall through.
+// built-in seed). Unset fields fall through.
 type FlavorOverride struct {
 	Name        string   `json:"name"`
 	CPU         *int64   `json:"cpu,omitempty"`
@@ -158,75 +157,37 @@ type observedCapacity struct {
 }
 
 // Provider builds Karpenter instance types from a flavor catalog computed by
-// overlaying per-flavor overrides on top of a base catalog (the dynamic
-// refresher's result, or the built-in seed).
+// overlaying per-flavor overrides on top of the built-in seed.
 type Provider struct {
-	region    string
-	overrides []FlavorOverride
+	region string
+	// flavors is computed once by NewProvider and never written afterwards,
+	// so List and Get read it without locking.
+	flavors []Flavor
 
+	// mu guards observed, the only state that changes at runtime.
 	mu       sync.RWMutex
-	flavors  []Flavor
 	observed map[string]observedCapacity
 }
 
-// NewProvider builds a Provider for the given region. base is the starting
-// catalog (the built-in DefaultFlavors when empty); overrides are overlaid on
-// top of it and re-applied on every SetBaseFlavors call.
+// NewProvider builds a Provider for the given region: the overrides are
+// overlaid on base (the built-in DefaultFlavors when empty, which is what the
+// controller passes) and the resulting catalog is fixed for the Provider's
+// lifetime. An override that cannot be constructed is logged and skipped.
 func NewProvider(region string, base []Flavor, overrides []FlavorOverride) *Provider {
-	p := &Provider{
-		region:    region,
-		overrides: overrides,
-		observed:  map[string]observedCapacity{},
-	}
-	p.flavors = p.compose(base)
-	return p
-}
-
-// compose overlays the configured overrides on base (defaulting to
-// DefaultFlavors), logs any override that had to be skipped, and warns when
-// an override resurrects a seed flavor the live catalogue no longer offers —
-// nodes provisioned with it may be rejected by the platform at create time.
-func (p *Provider) compose(base []Flavor) []Flavor {
 	if len(base) == 0 {
 		base = DefaultFlavors
 	}
-	baseNames := make(map[string]struct{}, len(base))
-	for _, f := range base {
-		baseNames[f.Name] = struct{}{}
-	}
-	for _, o := range p.overrides {
-		if _, inBase := baseNames[o.Name]; inBase {
-			continue
-		}
-		if _, seeded := SizingByName[o.Name]; seeded {
-			log.Log.WithName("instancetype").Info(
-				"flavor override resurrects a flavor absent from the live catalogue; the platform may reject NodeGroups using it",
-				"flavor", o.Name)
-		}
-	}
-	flavors, skipped := ApplyOverrides(base, p.overrides)
+	flavors, skipped := ApplyOverrides(base, overrides)
 	for _, name := range skipped {
 		log.Log.WithName("instancetype").Info(
 			"skipping flavor override: not in base/seed and missing cpu, memoryKi or priceHourly",
 			"flavor", name)
 	}
-	return flavors
-}
-
-// SetBaseFlavors replaces the base catalog (typically from the dynamic price
-// refresher) and re-applies the configured overrides so they always win. An
-// empty base is ignored so a failed refresh never clears a working catalog.
-func (p *Provider) SetBaseFlavors(base []Flavor) {
-	if len(base) == 0 {
-		return
+	return &Provider{
+		region:   region,
+		flavors:  flavors,
+		observed: map[string]observedCapacity{},
 	}
-	next := p.compose(base)
-	if len(next) == 0 {
-		return
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.flavors = next
 }
 
 // LoadFlavorsFromFile reads and validates per-flavor overrides from a YAML file
@@ -423,25 +384,12 @@ func (p *Provider) RecordObservedCapacity(flavor string, capacity, allocatable c
 	p.observed[flavor] = observedCapacity{capacity: filterGeneralizable(capacity), allocatable: filterGeneralizable(allocatable)}
 }
 
-// snapshotFlavors copies the current catalog under a short read lock. Copying
-// before building instance types avoids holding the lock across newInstanceType
-// (which re-acquires it for the observed map) — a nested RLock that could
-// deadlock against a pending SetBaseFlavors writer.
-func (p *Provider) snapshotFlavors() []Flavor {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := make([]Flavor, len(p.flavors))
-	copy(out, p.flavors)
-	return out
-}
-
 // List returns the full instance type catalog. Karpenter mutates the returned
 // objects (lazy allocatable computation), so fresh objects are built on every
 // call.
 func (p *Provider) List() []*cloudprovider.InstanceType {
-	flavors := p.snapshotFlavors()
-	its := make([]*cloudprovider.InstanceType, 0, len(flavors))
-	for _, f := range flavors {
+	its := make([]*cloudprovider.InstanceType, 0, len(p.flavors))
+	for _, f := range p.flavors {
 		its = append(its, p.newInstanceType(f))
 	}
 	return its
@@ -455,7 +403,7 @@ var ErrUnknownFlavor = errors.New("unknown flavor")
 
 // Get returns the instance type for a flavor name, or an error if unknown.
 func (p *Provider) Get(flavor string) (*cloudprovider.InstanceType, error) {
-	for _, f := range p.snapshotFlavors() {
+	for _, f := range p.flavors {
 		if f.Name == flavor {
 			return p.newInstanceType(f), nil
 		}
@@ -469,14 +417,14 @@ func (p *Provider) Get(flavor string) (*cloudprovider.InstanceType, error) {
 
 // Synthesize builds an instance type for a flavor absent from the served
 // catalogue, so CloudProvider.Get/List keep describing a running NodeGroup
-// whose flavor left it (upstream removal, topology change, removed
-// override). Sizing comes from the static seed when the name is known,
-// enriched with observed capacity when a live node reported it; a fully
-// unknown name yields a name-only instance type — sufficient for the
-// consumers of degraded claims (karpenter-core's garbage collection and
-// node termination read only the provider ID and existence). The result is
-// NOT added to the catalogue: List() never returns it, so nothing new is
-// ever provisioned or priced with it.
+// whose flavor left it (a removed or invalid settings.flavors override, a
+// release whose built-in seed no longer carries it). Sizing comes from the
+// static seed when the name is known, enriched with observed capacity when a
+// live node reported it; a fully unknown name yields a name-only instance
+// type — sufficient for the consumers of degraded claims (karpenter-core's
+// garbage collection and node termination read only the provider ID and
+// existence). The result is NOT added to the catalogue: List() never returns
+// it, so nothing new is ever provisioned or priced with it.
 func (p *Provider) Synthesize(flavor string) *cloudprovider.InstanceType {
 	f := Flavor{Name: flavor}
 	if s, seeded := SizingByName[flavor]; seeded {

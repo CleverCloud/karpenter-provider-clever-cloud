@@ -62,10 +62,7 @@ kubectl apply -f examples/v1/general-purpose.yaml
 | `settings.disableLeaderElection` | `false` | For single-replica dev setups |
 | `settings.batchMaxDuration` / `batchIdleDuration` | `10s` / `1s` | Pod batching windows |
 | `settings.featureGates.nodeRepair` | `false` | Enable node auto-repair |
-| `settings.flavors` | `[]` | Per-flavor overrides overlaid on the base catalogue (`name` required; `cpu`/`memoryKi`/`priceHourly` optional). Empty = base catalogue unchanged. Mounted via a ConfigMap; always win and re-applied after every dynamic refresh |
-| `settings.pricing.enabled` | `true` | Background refresher pulling CKE prices/flavors from Clever Cloud's public API. Enabled by default; requires egress to `apiURL` (TCP 443). Set `false` to keep the controller fully in-cluster |
-| `settings.pricing.refreshPeriod` / `apiURL` / `topology` | `12h` / `https://api.clever-cloud.com` / `""` | Refresh interval, API base URL (override for proxy/testing), and an OPTIONAL restriction of the catalogue to one CKE topology (empty = union of all, the default) |
-| `settings.pricing.kubernetesProductURL` / `priceSystemURL` | `""` / `""` | Optional full-URL override per endpoint (default: `apiURL` + standard path); set only if the two APIs live at different hosts/paths |
+| `settings.flavors` | `[]` | Per-flavor overrides overlaid on the built-in catalogue (`name` required; `cpu`/`memoryKi`/`priceHourly` optional). Empty = built-in catalogue unchanged. Mounted via a ConfigMap; overrides always win |
 | `controller.resources` | 200m/256Mi, limit 512Mi | Controller container resources |
 | `controller.env` | `[]` | Extra environment variables |
 | `service.enabled` | `true` | ClusterIP service exposing `/metrics` |
@@ -83,6 +80,12 @@ helm upgrade karpenter \
   --version <version> -n karpenter --reuse-values
 helm uninstall karpenter -n karpenter   # CRDs, NodePools and NodeClasses are kept
 ```
+
+The controller talks to nothing but the cluster's Kubernetes API: it needs no
+Clever Cloud API token and no egress beyond the API server. Earlier releases
+had a `settings.pricing` block (a dynamic pricing refresher, since removed); a
+`--reuse-values` upgrade that still carries it renders fine and the values are
+ignored.
 
 Before uninstalling for good, scale your Karpenter-backed workloads down
 (or delete the NodePools) so the provisioned NodeGroups are cleaned up

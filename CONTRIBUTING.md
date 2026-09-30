@@ -100,9 +100,9 @@ implement and must move in lockstep): these bumps carry more than Go code and fo
 pushed to it):
 
 1. Check the [compatibility matrix](https://karpenter.sh/docs/upgrading/compatibility/): the
-   karpenter minor must support every Kubernetes version CKE offers (the public
-   `/v4/kubernetes-product` endpoint lists them). Never ship a karpenter minor whose matrix
-   excludes the CKE default version.
+   karpenter minor must support every Kubernetes version CKE offers (check the
+   [CKE documentation](https://www.clever.cloud/developers/doc/kubernetes/) or the Clever Cloud
+   console). Never ship a karpenter minor whose matrix excludes the CKE default version.
 2. Bump the module (`go get sigs.k8s.io/karpenter@vX.Y.Z && go mod tidy` — operatorpkg usually
    moves with it), fix any API breakage, then run `make generate` — it refreshes the vendored
    `karpenter.sh_*.yaml` CRDs from the module and syncs both chart copies. Review the CRD diff

@@ -204,17 +204,18 @@ func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
 }
 
 // resolveNodeGroupInstanceType describes a running NodeGroup, degrading to a
-// synthesized instance type when its flavor left the catalogue (upstream
-// removal, topology change, removed override). Failing on that condition is
-// never an option: a List error stalls karpenter-core's nodeclaim garbage
-// collection cluster-wide and a Get error wedges node termination before
-// drain — while SKIPPING the entry instead would make core GC read the
-// missing provider ID as an orphaned claim and delete the node as soon as it
-// is NotReady (a kubelet restart suffices). The synthesized type never
-// enters GetInstanceTypes, so nothing new is provisioned or priced with it;
-// the running node itself is replaced by karpenter-core's
-// InstanceTypeNotFound drift path, paced by the NodePool's disruption
-// budgets. Only the unknown-flavor error degrades — anything else surfaces.
+// synthesized instance type when its flavor left the catalogue (a removed or
+// invalid settings.flavors override, a release whose built-in seed no longer
+// carries it). Failing on that condition is never an option: a List error
+// stalls karpenter-core's nodeclaim garbage collection cluster-wide and a Get
+// error wedges node termination before drain — while SKIPPING the entry
+// instead would make core GC read the missing provider ID as an orphaned claim
+// and delete the node as soon as it is NotReady (a kubelet restart suffices).
+// The synthesized type never enters GetInstanceTypes, so nothing new is
+// provisioned or priced with it; the running node itself is replaced by
+// karpenter-core's InstanceTypeNotFound drift path, paced by the NodePool's
+// disruption budgets. Only the unknown-flavor error degrades — anything else
+// surfaces.
 func (c *CloudProvider) resolveNodeGroupInstanceType(ctx context.Context, ng *ngv1.NodeGroup) (*cloudprovider.InstanceType, error) {
 	instanceType, err := c.instanceTypeProvider.Get(ng.Spec.Flavor)
 	if err == nil {
@@ -230,7 +231,7 @@ func (c *CloudProvider) resolveNodeGroupInstanceType(ctx context.Context, ng *ng
 		log.FromContext(ctx).WithValues("flavor", ng.Spec.Flavor, "NodeGroup", ng.Name).Info(
 			"flavor is missing from the served catalogue; serving a synthesized instance type " +
 				"(existing nodes are replaced through drift under disruption budgets, new nodes never use it — " +
-				"restore the flavor via settings.flavors or check CLEVER_CLOUD_TOPOLOGY)")
+				"restore the flavor via settings.flavors)")
 	}
 	return c.instanceTypeProvider.Synthesize(ng.Spec.Flavor), nil
 }
@@ -307,9 +308,9 @@ func (c *CloudProvider) resolveNodeClassFromNodeClaim(ctx context.Context, nodeC
 func (c *CloudProvider) resolveInstanceType(nodeClaim *karpv1.NodeClaim) (*cloudprovider.InstanceType, error) {
 	requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
 	// Flavors the upstream operator refused recently are held out: the
-	// catalogue is deliberately permissive (it offers every flavor the platform
-	// advertises, for any topology), so the refusal is the only signal that one
-	// of them is not usable on THIS cluster.
+	// catalogue is deliberately permissive (it offers every built-in flavor on
+	// every topology), so the refusal is the only signal that one of them is
+	// not usable on THIS cluster.
 	rejected := c.nodeGroupProvider.RejectedFlavors()
 	var best *cloudprovider.InstanceType
 	bestPrice := 0.0
