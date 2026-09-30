@@ -124,16 +124,25 @@ settings:
   # -- Per-flavor overrides overlaid on top of the built-in catalogue (the
   # 2XS…XL seed). Leave empty to use the built-in catalogue unchanged. Each
   # entry needs a `name` (as accepted by the Clever Cloud NodeGroup API,
-  # uppercase); `cpu` (vCPUs), `memoryKi` (kernel-visible memory in KiB) and
-  # `priceHourly` (EUR/hour) are OPTIONAL — set only the fields you want to
-  # pin, the rest fall through to the built-in value. A name absent from the
-  # built-in catalogue must supply all three fields. Overrides always win.
+  # uppercase); `cpu` (vCPUs) and `memoryKi` (kernel-visible memory in KiB)
+  # are OPTIONAL — set only the fields you want to pin, the rest fall through
+  # to the built-in value. A name absent from the built-in catalogue must
+  # supply both. There is no price field: every flavor's price is a unitless
+  # cost derived from its cpu and memoryKi (2XS = 1), so pinning memoryKi
+  # reprices the flavor. Pin every flavor the same way, or none: a single
+  # pinned flavor can make consolidation rank sets of nodes differently from
+  # what CKE bills (see the README's Flavor catalogue). Overrides always win.
   # CPU/memory still self-correct at runtime from observed node capacity.
   # Rendered into a ConfigMap mounted in the controller.
-  # Example (pin only M's price, leave everything else at its default):
+  # Example (pin every flavor's memory to what its nodes report on the current
+  # CKE image, keep their cpu):
   #   flavors:
-  #     - name: M
-  #       priceHourly: 0.1167
+  #     - { name: 2XS, memoryKi: 3715344 }
+  #     - { name: XS, memoryKi: 7553664 }
+  #     - { name: S, memoryKi: 11385832 }
+  #     - { name: M, memoryKi: 15229256 }
+  #     - { name: L, memoryKi: 22896304 }
+  #     - { name: XL, memoryKi: 30584176 }
   flavors: []
 
 service:

@@ -18,7 +18,7 @@ All provider series are prefixed `karpenter_clevercloud_`.
 | `nodegroup_external_resizes` | gauge | Managed NodeGroups whose `nodeCount` is not 1 — something outside karpenter resizes them (the platform's alert-driven scaler via an inherited `autoscalingEnabled`, a human, anything with `nodegroups/scale` RBAC). | **Non-zero breaks the 1 NodeClaim = 1 NodeGroup invariant**: the extra nodes are never registered — they get no provider ID and keep the `karpenter.sh/unregistered` taint — so karpenter neither manages nor prices them. Find the resizer; ensure the cluster's `autoscalingEnabled` feature is off (the two autoscalers must never run together), then set `nodeCount` back to 1. **Also check karpenter-core's `karpenter_cluster_state_synced`**: a node carrying `karpenter.sh/nodepool` without a `spec.providerID` keeps it at 0 after every controller restart — provisioning and disruption stop cluster-wide and `cluster is waiting on sync for extended duration` is logged every 10 s. NodeGroups created by the current version never put that label on their nodes; for older groups, whose immutable `spec.labels` still carry it, the providerid controller removes it from the extra node it refuses to stamp (logged once per node). The controller never touches nodes of unmanaged groups, and that includes an older group recreated upstream without its `karpenter.clever-cloud.com/managed` label but with its old `spec.labels`: its single node carries the label with no provider ID and freezes the sync the same way. If `karpenter_cluster_state_synced` stays at 0 anyway, list the culprits with `kubectl get nodes -l karpenter.sh/nodepool -o custom-columns=NAME:.metadata.name,PROVIDERID:.spec.providerID` and remove the label from any node with an empty provider ID, or revert the resize. |
 | `gc_reaped_nodegroups_total` | counter | The GC safety net deleted an orphaned NodeGroup (its NodeClaim was force-deleted outside the normal flow). | Occasional ticks are the safety net working. Frequent ticks mean something force-deletes NodeClaims — find it. |
 | `gc_refused_nodegroups` | gauge | NodeGroups the last GC sweep refused to reap: managed label present, but no verified dead NodeClaim owner. | **Non-zero needs attention** — each one is a VM billing hourly. A copied manifest: remove the `karpenter.clever-cloud.com/managed` label. A deliberately orphaned group: delete it manually. Details in the `GarbageCollectionRefused` event on the NodeGroup. |
-| `instancetype_flavors_config_invalid` | gauge | 1 while the `settings.flavors` overrides file failed to load: the controller runs on the base catalogue WITHOUT the configured overrides instead of crashlooping. | Fix `settings.flavors` (the chart also validates it at install time via values.schema.json); the next pod roll picks it up. **Note**: a flavor that only the overrides kept in the catalogue leaves it while the gauge is 1 — its nodes are then rolled by drift (see [Flavor removal semantics](#flavor-removal-semantics)). |
+| `instancetype_flavors_config_invalid` | gauge | 1 while the `settings.flavors` overrides file failed to load: the controller runs on the base catalogue WITHOUT the configured overrides instead of crashlooping. Any key the controller does not know invalidates the whole file, including `priceHourly`, which earlier releases accepted (prices are now derived from `cpu` and `memoryKi`). | Fix `settings.flavors` (the chart also validates it at install time via values.schema.json, so this mostly fires when the ConfigMap was written outside the chart): remove `priceHourly` and any other unknown key; the next pod roll picks it up. **Note**: a flavor that only the overrides kept in the catalogue leaves it while the gauge is 1 — its nodes are then rolled by drift (see [Flavor removal semantics](#flavor-removal-semantics)). |
 | `instancetype_unknown_flavor_lookups_total` | counter | An instance-type lookup referenced a flavor absent from the served catalogue. | A running NodeGroup uses a flavor the catalogue lost (a removed or invalid `settings.flavors` override, a release whose built-in catalogue dropped it). GC and termination keep working on a synthesized type, and the affected nodes are **rolled by drift under disruption budgets** (see [Flavor removal semantics](#flavor-removal-semantics)); restore the flavor via `settings.flavors` to stop the roll. |
 
 Suggested alert expressions:
@@ -81,8 +81,27 @@ bounded:
   event until capacity or budgets allow.
 - `instancetype_unknown_flavor_lookups_total` moves and a per-flavor log line
   names it. Remediation: restore the flavor via `settings.flavors` (a flavor
-  outside the built-in catalogue must set `cpu`, `memoryKi` and
-  `priceHourly`).
+  outside the built-in catalogue must set `cpu` and `memoryKi`; its price is
+  derived from them).
+
+## Price units
+
+Offering prices are not EUR: every flavor is priced by its cpu and memory
+relative to the built-in `2XS`, which costs 1.0 (formula and table in the
+[README](../README.md#flavor-catalogue)). karpenter-core only compares and
+sums them, so its decisions depend on how prices rank, not on their unit;
+but every price-based figure it reports is in this unit, whatever its label
+says:
+
+- `karpenter_nodepools_cost_total` (help text: "Units are determined by the
+  cloud provider") is the NodePool's total in 2XS-equivalents: 3.0 is the
+  price of three 2XS nodes, not 3 EUR an hour.
+- `savings: $…` in disruption log lines and in the `ConsolidationCandidate` /
+  `ConsolidationRejected` events is the same unit: `$1.85` is the price of an
+  XS, not a sum of money. The `$` is hard-coded by karpenter-core.
+
+Earlier releases served EUR/hour prices, so a dashboard or alert threshold
+built on these figures must be rescaled, not reused.
 
 ## CloudProvider call metrics
 

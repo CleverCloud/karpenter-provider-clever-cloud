@@ -525,7 +525,7 @@ func TestGetInstanceTypesCatalog(t *testing.T) {
 // never reaches the provisioning catalog.
 
 // onlyM is a catalogue that lost every flavor but M.
-var onlyM = []instancetype.Flavor{{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.2}}
+var onlyM = []instancetype.Flavor{{Name: "M", CPU: 10, MemoryKi: 15988992}}
 
 // requireNotServed fails the test unless flavor is really absent from the
 // served catalogue. Without it, a provider that ignored the narrowed base and
