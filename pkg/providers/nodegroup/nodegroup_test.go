@@ -32,6 +32,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/clock"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -42,6 +44,7 @@ import (
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
@@ -67,12 +70,25 @@ func (r *fakeRecorder) reasons() []string {
 	return reasons
 }
 
+// catalogue sizes flavors for the providers under test as the controller
+// does: the built-in catalogue.
+var catalogue = instancetype.NewProvider("par", nil, nil)
+
 func newTestProvider(t *testing.T, objs ...client.Object) (*nodegroup.Provider, client.Client) {
 	provider, kubeClient, _ := newTestProviderWithRecorder(t, objs...)
 	return provider, kubeClient
 }
 
 func newTestProviderWithRecorder(t *testing.T, objs ...client.Object) (*nodegroup.Provider, client.Client, *fakeRecorder) {
+	t.Helper()
+	provider, kubeClient, recorder, _ := newClockedTestProvider(t, objs...)
+	return provider, kubeClient, recorder
+}
+
+// newClockedTestProvider is newTestProviderWithRecorder with the fake clock
+// that times the provider's quota backoff and refusal hold-out, so that tests
+// can step through them. The acceptance poll keeps real time.
+func newClockedTestProvider(t *testing.T, objs ...client.Object) (*nodegroup.Provider, client.Client, *fakeRecorder, *clocktesting.FakeClock) {
 	t.Helper()
 	// No WithStatusSubresource for NodeGroup: status must stay writable via
 	// plain Update so the tests can play the Clever Cloud operator, and so
@@ -82,7 +98,8 @@ func newTestProviderWithRecorder(t *testing.T, objs ...client.Object) (*nodegrou
 		WithObjects(objs...).
 		Build()
 	recorder := &fakeRecorder{}
-	return nodegroup.NewProvider(kubeClient, recorder), kubeClient, recorder
+	clk := clocktesting.NewFakeClock(time.Now())
+	return nodegroup.NewProvider(kubeClient, recorder, catalogue, clk), kubeClient, recorder, clk
 }
 
 func testNodeClass(name string) *v1alpha1.CleverNodeClass {
@@ -816,7 +833,7 @@ func TestCreateReleasesTheLockOnAcknowledgement(t *testing.T) {
 			},
 		}).
 		Build()
-	provider := nodegroup.NewProvider(kubeClient, &fakeRecorder{})
+	provider := nodegroup.NewProvider(kubeClient, &fakeRecorder{}, catalogue, clock.RealClock{})
 	timeoutsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
 
 	firstErr := make(chan error, 1)
@@ -915,9 +932,15 @@ func TestQuotaBackoffFailsFastUntilDelete(t *testing.T) {
 		t.Fatalf("expected no nodegroup to be created during backoff, got %v", err)
 	}
 
-	// Deleting a NodeGroup frees capacity and clears the backoff.
+	// Deleting a NodeGroup frees capacity and clears the backoff: every
+	// flavor is available again.
 	if err := provider.Delete(context.Background(), existing); err != nil {
 		t.Fatalf("Delete: %v", err)
+	}
+	for _, flavor := range []string{"2XS", "XL"} {
+		if provider.Unavailable(flavor) {
+			t.Errorf("%s still unavailable after capacity was freed", flavor)
+		}
 	}
 	third := testNodeClaim("default-quot3")
 	done = acceptOnceCreated(t, kubeClient, third.Name)
@@ -925,6 +948,225 @@ func TestQuotaBackoffFailsFastUntilDelete(t *testing.T) {
 	<-done
 	if err != nil {
 		t.Fatalf("expected Create to succeed after capacity freed, got %v", err)
+	}
+}
+
+// TestQuotaRejectionCoversOnlyFlavorsAtLeastAsLarge pins the size-aware
+// backoff. The quota counts vCPUs and memory, so capacity it cannot fit S into
+// cannot fit a flavor at least as large either, but may still fit XS or 2XS.
+// The backoff used to be global: after one rejection it failed every launch,
+// the smallest included, so pods that fit the remaining quota stayed Pending
+// while karpenter-core re-planned the same over-quota claim on every pass.
+func TestQuotaRejectionCoversOnlyFlavorsAtLeastAsLarge(t *testing.T) {
+	provider, kubeClient := newTestProvider(t)
+	nodeClass := testNodeClass("default")
+	ctx := context.Background()
+
+	rejected := testNodeClaim("default-quots")
+	done := rejectOnceCreated(t, kubeClient, rejected.Name, "")
+	_, err := provider.Create(ctx, rejected, nodeClass, "S")
+	<-done
+	var quotaErr *nodegroup.ErrQuotaExceeded
+	if !errors.As(err, &quotaErr) || quotaErr.Flavor != "S" {
+		t.Fatalf("expected *ErrQuotaExceeded for S, got %T: %v", err, err)
+	}
+	for flavor, want := range map[string]bool{"2XS": false, "XS": false, "S": true, "M": true, "L": true, "XL": true} {
+		if got := provider.Unavailable(flavor); got != want {
+			t.Errorf("Unavailable(%s) = %v after a quota rejection of S, want %v", flavor, got, want)
+		}
+	}
+
+	// A larger flavor fails fast, naming the rejection that covers it,
+	// without reaching the API.
+	larger := testNodeClaim("default-quotl")
+	_, err = provider.Create(ctx, larger, nodeClass, "XL")
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("expected a fast *ErrQuotaExceeded for XL, got %T: %v", err, err)
+	}
+	if quotaErr.Flavor != "XL" || !strings.Contains(quotaErr.Message, "rejected S, and it is at least as large") {
+		t.Errorf("fast-fail does not name the covering rejection: %+v", quotaErr)
+	}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: larger.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no nodegroup created for a covered flavor, got %v", err)
+	}
+
+	// A smaller flavor is not failed by it: it goes to the operator. The
+	// error is checked first: a fast-fail never creates the group the
+	// operator goroutine waits for.
+	smaller := testNodeClaim("default-quotx")
+	done = acceptOnceCreated(t, kubeClient, smaller.Name)
+	if _, err := provider.Create(ctx, smaller, nodeClass, "XS"); err != nil {
+		t.Fatalf("a flavor smaller than the rejected one must reach the API, got %v", err)
+	}
+	<-done
+}
+
+// TestQuotaRejectionSizesFlavorsByTheirCatalogueEntries pins what "at least as
+// large" means: at least as many vCPUs AND at least as much memory, as the
+// catalogue entries (overrides included) advertise. A flavor with fewer vCPUs
+// but more memory may fit a quota that refused the other on vCPUs, so it stays
+// available; a flavor the catalogue cannot size is covered by its own
+// rejection only, and so is every flavor when there is no catalogue at all —
+// which the event reporting the rejection says instead of claiming larger
+// flavors it does not cover.
+func TestQuotaRejectionSizesFlavorsByTheirCatalogueEntries(t *testing.T) {
+	cpu, memoryKi := int64(4), int64(30000000)
+	highMem := instancetype.NewProvider("par", nil, []instancetype.FlavorOverride{{Name: "HIGHMEM", CPU: &cpu, MemoryKi: &memoryKi}})
+
+	// The event reporting the rejection says what it does: to the flavors at
+	// least as large when the rejected one is sized, to it alone otherwise.
+	const (
+		sizedConsequence   = "every other flavor at least as large for up to 2m0s"
+		unsizedConsequence = "the catalogue cannot size it, so no other flavor is affected"
+	)
+	for _, tc := range []struct {
+		name        string
+		catalogue   nodegroup.Catalogue
+		rejected    string
+		want        map[string]bool
+		consequence string
+	}{
+		{
+			name:        "fewer vCPUs, more memory",
+			catalogue:   highMem,
+			rejected:    "S",
+			want:        map[string]bool{"HIGHMEM": false, "XS": false, "M": true},
+			consequence: sizedConsequence,
+		},
+		{
+			name:        "an override flavor covers the flavors at least as large as its entry",
+			catalogue:   highMem,
+			rejected:    "HIGHMEM",
+			want:        map[string]bool{"HIGHMEM": true, "XL": true, "L": false, "2XS": false},
+			consequence: sizedConsequence,
+		},
+		{
+			name:        "a flavor the catalogue cannot size",
+			catalogue:   highMem,
+			rejected:    "GPU",
+			want:        map[string]bool{"GPU": true, "XL": false, "2XS": false},
+			consequence: unsizedConsequence,
+		},
+		{
+			name:        "no catalogue",
+			rejected:    "M",
+			want:        map[string]bool{"M": true, "L": false, "XL": false, "2XS": false},
+			consequence: unsizedConsequence,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).Build()
+			recorder := &fakeRecorder{}
+			provider := nodegroup.NewProvider(kubeClient, recorder, tc.catalogue, clock.RealClock{})
+			provider.RecordLateRefusal(testNodeClaim("default-sized"), ownedNodeGroup("default-sized", tc.rejected, quotaRejectedStatus()))
+			for flavor, want := range tc.want {
+				if got := provider.Unavailable(flavor); got != want {
+					t.Errorf("Unavailable(%s) = %v after a quota rejection of %s, want %v", flavor, got, tc.rejected, want)
+				}
+			}
+			if len(recorder.events) != 1 || !strings.Contains(recorder.events[0].Message, tc.consequence) {
+				t.Errorf("want one event saying %q, got %+v", tc.consequence, recorder.events)
+			}
+		})
+	}
+}
+
+// TestQuotaRejectionReopensTheRejectedFlavorFirst pins when a quota
+// rejection stops covering each flavor, which bounds what a quota that stays
+// exhausted costs. Pending pods that fit several sizes walk down the
+// catalogue within one window: L, then XS, then 2XS rejected. Every flavor
+// used to reopen at the same moment — the 2XS rejection covers every other
+// flavor and expired with them — so core packed the pods back onto an L and
+// walked down again, one real rejection per flavor size in every window. Now
+// the rejected flavor reopens alone after QuotaBackoff, the cheapest probe of
+// whether capacity came back, and the flavors at least as large a window
+// later, unless that probe was rejected in turn.
+func TestQuotaRejectionReopensTheRejectedFlavorFirst(t *testing.T) {
+	provider, kubeClient, _, clk := newClockedTestProvider(t)
+	nodeClass := testNodeClass("default")
+	ctx := context.Background()
+	reject := func(name, flavor string) {
+		t.Helper()
+		done := rejectOnceCreated(t, kubeClient, name, "")
+		_, err := provider.Create(ctx, testNodeClaim(name), nodeClass, flavor)
+		<-done
+		var quotaErr *nodegroup.ErrQuotaExceeded
+		if !errors.As(err, &quotaErr) {
+			t.Fatalf("expected the quota to reject %s, got %T: %v", flavor, err, err)
+		}
+	}
+	requireUnavailable := func(stage string, available ...string) {
+		t.Helper()
+		for _, f := range instancetype.DefaultFlavors {
+			if got, want := provider.Unavailable(f.Name), !slices.Contains(available, f.Name); got != want {
+				t.Errorf("%s: Unavailable(%s) = %v, want %v", stage, f.Name, got, want)
+			}
+		}
+	}
+
+	reject("default-walkl", "L")
+	clk.Step(time.Second)
+	reject("default-walkx", "XS")
+	clk.Step(time.Second)
+	reject("default-walk2", "2XS")
+	requireUnavailable("after the walk down")
+
+	// The own windows of L and XS have passed as well, but the 2XS rejection
+	// still covers them: 2XS reopens alone, and a larger flavor still fails
+	// fast, naming it.
+	clk.Step(nodegroup.QuotaBackoff)
+	requireUnavailable("one window after the walk down", "2XS")
+	var quotaErr *nodegroup.ErrQuotaExceeded
+	if _, err := provider.Create(ctx, testNodeClaim("default-walkb"), nodeClass, "L"); !errors.As(err, &quotaErr) ||
+		!strings.Contains(quotaErr.Message, "rejected 2XS") {
+		t.Fatalf("expected L to fail fast on the 2XS rejection, got %T: %v", err, err)
+	}
+
+	// The 2XS probe is rejected again: the larger flavors stay covered.
+	reject("default-prob1", "2XS")
+	requireUnavailable("after the probe was rejected")
+	clk.Step(nodegroup.QuotaBackoff)
+	requireUnavailable("one window after the probe", "2XS")
+
+	// Nothing rejected since: everything reopens a window later, and a launch
+	// of the largest flavor reaches the API again.
+	clk.Step(nodegroup.QuotaBackoff)
+	requireUnavailable("two windows after the probe", "2XS", "XS", "S", "M", "L", "XL")
+	next := testNodeClaim("default-walkn")
+	done := acceptOnceCreated(t, kubeClient, next.Name)
+	if _, err := provider.Create(ctx, next, nodeClass, "XL"); err != nil {
+		t.Fatalf("expected Create to reach the API once the backoff expired, got %v", err)
+	}
+	<-done
+}
+
+// TestRefusedFlavorIsUnavailableForItsHoldOut pins the hold-out as the
+// scheduler sees it. A refusal is a verdict on the flavor, not on capacity:
+// it makes that flavor unavailable, and no other, until the hold-out expires.
+func TestRefusedFlavorIsUnavailableForItsHoldOut(t *testing.T) {
+	provider, kubeClient, _, clk := newClockedTestProvider(t)
+
+	refused := testNodeClaim("default-refm")
+	done := failOnceCreated(t, kubeClient, refused.Name, "FlavorNotAvailable", "nope")
+	_, err := provider.Create(context.Background(), refused, testNodeClass("default"), "M")
+	<-done
+	var rejectedErr *nodegroup.ErrFlavorRejected
+	if !errors.As(err, &rejectedErr) {
+		t.Fatalf("expected *ErrFlavorRejected, got %T: %v", err, err)
+	}
+	for flavor, want := range map[string]bool{"M": true, "L": false, "S": false} {
+		if got := provider.Unavailable(flavor); got != want {
+			t.Errorf("Unavailable(%s) = %v after a refusal of M, want %v", flavor, got, want)
+		}
+	}
+
+	clk.Step(nodegroup.FlavorBackoff - time.Second)
+	if !provider.Unavailable("M") {
+		t.Error("expected M to stay unavailable until its hold-out expires")
+	}
+	clk.Step(time.Second)
+	if provider.Unavailable("M") {
+		t.Error("expected M available again once its hold-out expired")
 	}
 }
 
@@ -1031,8 +1273,16 @@ func TestRecordLateRefusal(t *testing.T) {
 		t.Errorf("unexpected NodeGroupQuotaExceeded events %+v", quotaEvents)
 	}
 	var quotaErr *nodegroup.ErrQuotaExceeded
-	if _, err := provider.Create(context.Background(), testNodeClaim("default-next3"), testNodeClass("default"), "2XS"); !errors.As(err, &quotaErr) {
+	if _, err := provider.Create(context.Background(), testNodeClaim("default-next3"), testNodeClass("default"), "XS"); !errors.As(err, &quotaErr) {
 		t.Errorf("expected the late quota rejection to arm the backoff, got %T: %v", err, err)
+	}
+	// It feeds the same state as a rejection seen within the poll: the
+	// rejected flavor and every larger one are unavailable, a smaller one is
+	// not.
+	for flavor, want := range map[string]bool{"2XS": false, "XS": true, "S": true, "XL": true} {
+		if got := provider.Unavailable(flavor); got != want {
+			t.Errorf("Unavailable(%s) = %v after a late quota rejection of XS, want %v", flavor, got, want)
+		}
 	}
 	if len(provider.RejectedFlavors()) != 1 {
 		t.Errorf("a quota rejection must not hold its flavor out, got %v", provider.RejectedFlavors())
@@ -1242,7 +1492,7 @@ func TestAcceptanceKeepsAHoldOutRecordedDuringItsPoll(t *testing.T) {
 					time.Sleep(time.Millisecond)
 				}
 				provider.RecordLateRefusal(testNodeClaim(refusedA.Name), refusedA)
-				if _, held := provider.RejectedFlavors()["XS"]; !held {
+				if _, held := provider.RejectedFlavors()["XS"]; !held || !provider.Unavailable("XS") {
 					t.Errorf("A's late refusal must hold XS out, got %v", provider.RejectedFlavors())
 				}
 				// Then the operator accepts B.
@@ -1255,8 +1505,8 @@ func TestAcceptanceKeepsAHoldOutRecordedDuringItsPoll(t *testing.T) {
 				t.Fatalf("Create: %v", err)
 			}
 			<-done
-			if _, held := provider.RejectedFlavors()["XS"]; !held {
-				t.Errorf("B's acceptance must not release a hold-out recorded while it was polled, got %v", provider.RejectedFlavors())
+			if _, held := provider.RejectedFlavors()["XS"]; !held || !provider.Unavailable("XS") {
+				t.Errorf("B's acceptance must not release a hold-out recorded while it was polled: XS must stay unavailable, got %v", provider.RejectedFlavors())
 			}
 		})
 	}
@@ -1278,7 +1528,7 @@ func TestRefusalStaysTerminalWhenCleanupFails(t *testing.T) {
 			},
 		}).
 		Build()
-	provider := nodegroup.NewProvider(kubeClient, &fakeRecorder{})
+	provider := nodegroup.NewProvider(kubeClient, &fakeRecorder{}, catalogue, clock.RealClock{})
 	nodeClaim := testNodeClaim("default-refused")
 
 	done := failOnceCreated(t, kubeClient, nodeClaim.Name, "FlavorNotAvailable", "nope")
@@ -1313,7 +1563,7 @@ func TestQuotaRefusalStaysTerminalWhenCleanupFails(t *testing.T) {
 			},
 		}).
 		Build()
-	provider := nodegroup.NewProvider(kubeClient, &fakeRecorder{})
+	provider := nodegroup.NewProvider(kubeClient, &fakeRecorder{}, catalogue, clock.RealClock{})
 	nodeClaim := testNodeClaim("default-quota")
 	rejectionsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_quota_rejections_total")
 

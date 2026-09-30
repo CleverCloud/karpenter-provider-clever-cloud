@@ -123,30 +123,41 @@ func withClaim(pod *corev1.Pod, claim string) {
 	})
 }
 
-// provisioningPass runs one pass of karpenter-core's provisioner over the pod:
-// the provider's catalogue, core's volume topology, and core's scheduler over
-// the active nodes of its cluster state — the inputs Provisioner.Schedule
+// provisioningPass runs one pass of karpenter-core's provisioner over the
+// pods: the provider's catalogue, core's volume topology, and core's scheduler
+// over the active nodes of its cluster state — the inputs Provisioner.Schedule
 // builds, minus the listing of pending pods.
-func provisioningPass(t *testing.T, cp *cloudprovider.CloudProvider, kubeClient client.Client, cluster *state.Cluster, np *karpv1.NodePool, pod *corev1.Pod) coresched.Results {
+func provisioningPass(t *testing.T, cp *cloudprovider.CloudProvider, kubeClient client.Client, cluster *state.Cluster, np *karpv1.NodePool, pods ...*corev1.Pod) coresched.Results {
+	t.Helper()
+	return weightedProvisioningPass(t, cp, kubeClient, cluster, []*karpv1.NodePool{np}, pods...)
+}
+
+// weightedProvisioningPass is provisioningPass over several NodePools, given
+// in the order Provisioner.Schedule hands them to the scheduler: by
+// descending weight.
+func weightedProvisioningPass(t *testing.T, cp *cloudprovider.CloudProvider, kubeClient client.Client, cluster *state.Cluster, nodePools []*karpv1.NodePool, pods ...*corev1.Pod) coresched.Results {
 	t.Helper()
 	ctx := coreContext()
 	kubeClient = asAPIServer(t, kubeClient)
-	its, err := cp.GetInstanceTypes(ctx, np)
-	if err != nil {
-		t.Fatalf("GetInstanceTypes: %v", err)
+	instanceTypes := map[string][]*corecloudprovider.InstanceType{}
+	for _, np := range nodePools {
+		its, err := cp.GetInstanceTypes(ctx, np)
+		if err != nil {
+			t.Fatalf("GetInstanceTypes: %v", err)
+		}
+		instanceTypes[np.Name] = its
 	}
-	instanceTypes := map[string][]*corecloudprovider.InstanceType{np.Name: its}
-	pods := []*corev1.Pod{pod}
 	volumeRequirements := map[types.UID][]scheduling.Requirements{}
-	reqs, err := coresched.NewVolumeTopology(kubeClient).GetRequirements(ctx, pod)
-	if err != nil {
-		t.Fatalf("volume topology: %v", err)
-	}
-	if len(reqs) > 0 {
-		volumeRequirements[pod.UID] = reqs
+	for _, pod := range pods {
+		reqs, err := coresched.NewVolumeTopology(kubeClient).GetRequirements(ctx, pod)
+		if err != nil {
+			t.Fatalf("volume topology: %v", err)
+		}
+		if len(reqs) > 0 {
+			volumeRequirements[pod.UID] = reqs
+		}
 	}
 	stateNodes := cluster.DeepCopyNodes().Active()
-	nodePools := []*karpv1.NodePool{np}
 	topology, err := coresched.NewTopology(ctx, kubeClient, cluster, stateNodes, nodePools, instanceTypes, pods)
 	if err != nil {
 		t.Fatalf("topology: %v", err)

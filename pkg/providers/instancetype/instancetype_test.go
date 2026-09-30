@@ -902,3 +902,54 @@ func TestLoadFlavorsOrDegradeNeverFails(t *testing.T) {
 		}
 	})
 }
+
+// TestSizing pins what a quota rejection is sized with: the catalogue entry as
+// served, overrides included, else the sizing seed of a known flavor the
+// catalogue does not serve; never observed capacity. A flavor with neither
+// cannot be sized.
+func TestSizing(t *testing.T) {
+	p := instancetype.NewProvider("par", []instancetype.Flavor{{Name: "M", CPU: 10, MemoryKi: 15229256}},
+		[]instancetype.FlavorOverride{{Name: "M", MemoryKi: ptr(int64(16000000))}, {Name: "HIGHMEM", CPU: ptr(int64(4)), MemoryKi: ptr(int64(30000000))}})
+	capacity, allocatable := observedL(t)
+	if _, err := p.RecordObservedCapacity("L", capacity, allocatable); err != nil {
+		t.Fatalf("RecordObservedCapacity: %v", err)
+	}
+	for _, tc := range []struct {
+		flavor string
+		want   instancetype.Sizing
+		ok     bool
+	}{
+		{flavor: "M", want: instancetype.Sizing{CPU: 10, MemoryKi: 16000000}, ok: true},
+		{flavor: "HIGHMEM", want: instancetype.Sizing{CPU: 4, MemoryKi: 30000000}, ok: true},
+		// Not served (the base only carries M): the seed, whatever a node
+		// reported.
+		{flavor: "L", want: instancetype.SizingByName["L"], ok: true},
+		{flavor: "GPU", ok: false},
+	} {
+		got, ok := p.Sizing(tc.flavor)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("Sizing(%s) = %+v, %v; want %+v, %v", tc.flavor, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// TestSizingAtLeast pins "at least as large": both vCPUs and memory, so a
+// flavor with more memory but fewer vCPUs is not.
+func TestSizingAtLeast(t *testing.T) {
+	s := instancetype.SizingByName["S"]
+	for _, tc := range []struct {
+		name string
+		size instancetype.Sizing
+		want bool
+	}{
+		{"same", s, true},
+		{"larger", instancetype.SizingByName["M"], true},
+		{"smaller", instancetype.SizingByName["XS"], false},
+		{"more memory, fewer vCPUs", instancetype.Sizing{CPU: s.CPU - 1, MemoryKi: 2 * s.MemoryKi}, false},
+		{"more vCPUs, less memory", instancetype.Sizing{CPU: 2 * s.CPU, MemoryKi: s.MemoryKi - 1}, false},
+	} {
+		if got := tc.size.AtLeast(s); got != tc.want {
+			t.Errorf("%s: %+v.AtLeast(S) = %v, want %v", tc.name, tc.size, got, tc.want)
+		}
+	}
+}

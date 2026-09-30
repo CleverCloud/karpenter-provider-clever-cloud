@@ -1,7 +1,8 @@
 # This example uses two weighted NodePools over the same NodeClass:
 # Karpenter tries the highest-weight pool first (cheap 2XS capacity) and
 # falls back to the wider catalog only when the preferred pool cannot fit
-# the pods or hits its limits.
+# the pods, hits its limits, or has no flavor available (Clever Cloud
+# refused 2XS in the last 5 minutes).
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:

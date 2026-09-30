@@ -44,6 +44,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -57,6 +58,7 @@ import (
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodeclass"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodegroupstatus"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/providerid"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
@@ -129,7 +131,7 @@ func TestMain(m *testing.M) {
 		fmt.Printf("registering providerid controller: %v\n", err)
 		os.Exit(1)
 	}
-	nodeGroupProvider := nodegroup.NewProvider(mgr.GetClient(), discardRecorder{})
+	nodeGroupProvider := nodegroup.NewProvider(mgr.GetClient(), discardRecorder{}, instancetype.NewProvider("par", nil, nil), clock.RealClock{})
 	if err := nodegroupstatus.NewController(mgr.GetClient(), mgr.GetAPIReader(), nodeGroupProvider, discardRecorder{}).Register(ctx, mgr); err != nil {
 		fmt.Printf("registering nodegroup status controller: %v\n", err)
 		os.Exit(1)

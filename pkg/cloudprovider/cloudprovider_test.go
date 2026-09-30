@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -65,7 +66,7 @@ func newTestProviderWithBase(t *testing.T, base []instancetype.Flavor, objs ...c
 		WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
 		Build()
 	itp := instancetype.NewProvider("par", base, nil)
-	ngp := nodegroup.NewProvider(kubeClient, noopRecorder{})
+	ngp := nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{})
 	return cloudprovider.New(kubeClient, itp, ngp), kubeClient, itp
 }
 
@@ -402,8 +403,9 @@ func TestDeleteOfALateQuotaRejectionKeepsTheBackoff(t *testing.T) {
 	// after the acceptance poll by deleting its NodeClaim; karpenter-core's
 	// termination then calls Delete on the rejected group. That deletion
 	// frees no capacity, so the re-plan's next Create must still fail fast
-	// instead of hitting the exhausted quota again.
-	rejected := managedNodeGroup("default-late1", "XS")
+	// instead of hitting the exhausted quota again. 2XS is the smallest
+	// flavor, so its rejection covers every flavor the next claim allows.
+	rejected := managedNodeGroup("default-late1", "2XS")
 	rejected.Status = ngv1.NodeGroupStatus{
 		Phase:      ngv1.PhaseQuotaExceeded,
 		Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReconcileFailed, ngv1.ReasonQuotaExceeded, "")},
@@ -413,8 +415,9 @@ func TestDeleteOfALateQuotaRejectionKeepsTheBackoff(t *testing.T) {
 		WithObjects(readyNodeClass("default"), rejected).
 		WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
 		Build()
-	ngp := nodegroup.NewProvider(kubeClient, noopRecorder{})
-	cp := cloudprovider.New(kubeClient, instancetype.NewProvider("par", nil, nil), ngp)
+	itp := instancetype.NewProvider("par", nil, nil)
+	ngp := nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{})
+	cp := cloudprovider.New(kubeClient, itp, ngp)
 
 	claim := testNodeClaim(rejected.Name)
 	claim.Status.ProviderID = nodegroup.ProviderID(rejected.Name)

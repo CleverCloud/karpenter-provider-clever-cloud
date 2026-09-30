@@ -89,6 +89,12 @@ type Sizing struct {
 	MemoryKi int64
 }
 
+// AtLeast reports whether s is at least as large as o in both cpu and memory:
+// whatever capacity o does not fit in, s does not fit in either.
+func (s Sizing) AtLeast(o Sizing) bool {
+	return s.CPU >= o.CPU && s.MemoryKi >= o.MemoryKi
+}
+
 var (
 	// FlavorSizing is the canonical sizing table (ordered smallest-to-largest).
 	// DefaultFlavors, ApplyOverrides and Synthesize all derive from it; it is
@@ -455,16 +461,24 @@ func (p *Provider) RecordObservedCapacity(flavor string, capacity, allocatable c
 // an operator's pin moves the bounds with it), else the sizing seed of a known
 // flavor the catalogue does not serve (what Synthesize describes it with).
 func (p *Provider) reference(flavor string) (observedCapacity, bool) {
-	f, ok := p.served(flavor)
+	s, ok := p.Sizing(flavor)
 	if !ok {
-		s, seeded := SizingByName[flavor]
-		if !seeded {
-			return observedCapacity{}, false
-		}
-		f = Flavor{Name: flavor, CPU: s.CPU, MemoryKi: s.MemoryKi}
+		return observedCapacity{}, false
 	}
-	capacity, overhead := staticCapacity(f)
+	capacity, overhead := staticCapacity(Flavor{Name: flavor, CPU: s.CPU, MemoryKi: s.MemoryKi})
 	return observedCapacity{capacity: capacity, allocatable: resources.Subtract(capacity, overhead.Total())}, true
+}
+
+// Sizing returns the cpu and memoryKi the catalogue sizes flavor with: its
+// served entry (built-in seed plus overrides), else the sizing seed of a known
+// flavor the catalogue does not serve. ok is false for a flavor with neither.
+// Never observed capacity: the result is fixed for the Provider's lifetime.
+func (p *Provider) Sizing(flavor string) (Sizing, bool) {
+	if f, ok := p.served(flavor); ok {
+		return Sizing{CPU: f.CPU, MemoryKi: f.MemoryKi}, true
+	}
+	s, seeded := SizingByName[flavor]
+	return s, seeded
 }
 
 // checkObservation accepts a report only when it could describe a VM of the

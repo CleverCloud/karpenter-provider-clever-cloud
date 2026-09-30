@@ -259,7 +259,10 @@ spec:
 ```
 
 Size `limits` against your organisation quota: the default org quota is 40 vCPU / 40 GB RAM **including the control
-plane** (a 3-node `S` control plane consumes 24 vCPU / 36 GB of it, leaving 16 vCPU / 4 GB for workers).
+plane** (a 3-node `S` control plane consumes 24 vCPU / 36 GB of it, leaving 16 vCPU / 4 GB for workers), and every other
+cluster of the organisation draws on it too. When the quota rejects a node, Karpenter plans around that flavor for a
+minute and around every larger one for two, and keeps launching the smaller ones, which may still fit (see
+[Unavailable flavors](docs/observability.md#unavailable-flavors)).
 
 ### CleverNodeClass
 

@@ -34,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -43,6 +44,7 @@ import (
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 )
 
 const (
@@ -52,12 +54,6 @@ const (
 
 	// quotaCheckInterval is the poll period during the quota check.
 	quotaCheckInterval = time.Second
-
-	// quotaBackoff is how long Create fails fast after a quota rejection
-	// instead of churning create/delete cycles against the Clever Cloud API.
-	// Deleting a NodeGroup that may hold capacity clears the backoff; deleting
-	// one the operator refused and that never synced does not (see Delete).
-	quotaBackoff = time.Minute
 )
 
 // quotaCheckTimeout bounds how long Create waits for the Clever Cloud
@@ -71,14 +67,31 @@ const (
 // Variable only so tests can exercise the timeout path without waiting 15s.
 var quotaCheckTimeout = 15 * time.Second
 
+// QuotaBackoff is how long a quota rejection of a flavor makes that flavor
+// unavailable: Create fails it fast instead of churning create/delete cycles
+// against the Clever Cloud API, and the cloud provider reports its offerings
+// unavailable to the scheduler. Every other flavor at least as large stays
+// unavailable for twice as long, so that the rejected flavor is retried first
+// (see quotaRejection.coverage). Deleting a NodeGroup that may hold capacity
+// ends both; deleting one the operator refused and that never synced does not
+// (see Delete).
+const QuotaBackoff = time.Minute
+
 // ErrQuotaExceeded is returned by Create when the organisation quota rejects
-// the requested capacity.
+// the requested capacity, or a recent rejection covers it. Flavor is the
+// flavor of the failed launch: the requested one, or the flavor of the group
+// Create adopted.
 type ErrQuotaExceeded struct {
+	Flavor  string
 	Message string
 }
 
 func (e *ErrQuotaExceeded) Error() string {
-	return fmt.Sprintf("clever cloud quota exceeded: %s", e.Message)
+	if e.Message == "" {
+		// Live, the operator's rejection carries no message.
+		return fmt.Sprintf("clever cloud quota exceeded for flavor %s", e.Flavor)
+	}
+	return fmt.Sprintf("clever cloud quota exceeded for flavor %s: %s", e.Flavor, e.Message)
 }
 
 // ErrFlavorRejected is returned by Create when the upstream operator refuses
@@ -98,16 +111,28 @@ func (e *ErrFlavorRejected) Error() string {
 	return fmt.Sprintf("clever cloud refused flavor %s (%s): %s", e.Flavor, e.Reason, e.Message)
 }
 
-// flavorBackoff is how long a flavor stays out of the catalogue after the
-// upstream operator refused it. Long enough that karpenter re-plans onto
-// another flavor instead of looping on the refused one, short enough that a
-// transient refusal or a platform-side fix is picked up without a restart.
+// flavorBackoff is how long a flavor stays unavailable after the upstream
+// operator refused it. Long enough that karpenter re-plans onto another flavor
+// instead of looping on the refused one, short enough that a transient refusal
+// or a platform-side fix is picked up without a restart.
 const flavorBackoff = 5 * time.Minute
+
+// Catalogue sizes flavors with the vCPU count and memory their catalogue
+// entries advertise, the two resources the organisation quota counts.
+// *instancetype.Provider implements it.
+type Catalogue interface {
+	Sizing(flavor string) (instancetype.Sizing, bool)
+}
 
 // Provider performs CRUD operations on Clever Cloud NodeGroups.
 type Provider struct {
 	kubeClient client.Client
 	recorder   events.Recorder
+	// catalogue sizes the flavors a quota rejection makes unavailable. Nil
+	// sizes none, so that a rejection covers the rejected flavor only.
+	catalogue Catalogue
+	// clock times the quota backoff and the refusal hold-out.
+	clock clock.PassiveClock
 
 	// createMu serializes NodeGroup creations. Concurrent creations make the
 	// upstream quota engine evaluate all in-flight groups together, rejecting
@@ -122,13 +147,18 @@ type Provider struct {
 	// for as long as the queue lasted.
 	createMu sync.Mutex
 
-	mu              sync.Mutex
-	quotaRejectedAt time.Time
-	quotaMessage    string
+	// mu guards what the provider learned from the operator's refusals, which
+	// Unavailable reports. karpenter-core keeps no per-offering memory of an
+	// InsufficientCapacityError: it deletes the claim and re-plans over the
+	// same offerings, so this state, turned into unavailable offerings by the
+	// cloud provider, is the only thing that keeps the scheduler from
+	// rebuilding the claim that was just refused.
+	mu sync.Mutex
+	// quotaRejections remembers, per flavor, the organisation quota's last
+	// rejection of it.
+	quotaRejections map[string]quotaRejection
 	// rejectedFlavors remembers, per flavor, the upstream operator's last
-	// refusal of it for a non-quota reason. Without it the scheduler re-picks
-	// the cheapest flavor immediately and loops: karpenter-core keeps no
-	// per-offering memory of an InsufficientCapacityError.
+	// refusal of it for a non-quota reason.
 	rejectedFlavors map[string]flavorHoldOut
 	// holdOutSeq is the sequence number of the last hold-out recorded.
 	holdOutSeq uint64
@@ -141,43 +171,138 @@ type flavorHoldOut struct {
 	// seq orders the hold-out among all those recorded, so that an acceptance
 	// releases only the ones recorded before its launch's create call (see
 	// clearFlavorRejection). A sequence rather than a time: two readings of
-	// the clock can be equal, and the order must be exact.
+	// the clock can be equal (a test's fake clock does not move at all), and
+	// the order must be exact.
 	seq uint64
 }
 
-func NewProvider(kubeClient client.Client, recorder events.Recorder) *Provider {
-	return &Provider{kubeClient: kubeClient, recorder: recorder}
+// quotaRejection is the organisation quota's last rejection of a flavor.
+type quotaRejection struct {
+	at      time.Time
+	message string
+	// size is the rejected flavor's catalogue sizing; sized is false for a
+	// flavor the catalogue cannot size, whose rejection covers only itself.
+	size  instancetype.Sizing
+	sized bool
 }
 
-// quotaBackoffActive reports whether a recent quota rejection should fail
-// creates fast, and the message of that rejection.
-func (p *Provider) quotaBackoffActive() (bool, string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return time.Since(p.quotaRejectedAt) < quotaBackoff, p.quotaMessage
+// NewProvider builds a Provider. catalogue sizes the flavors a quota
+// rejection makes unavailable (see Unavailable); nil sizes none. clk times how
+// long they stay unavailable.
+func NewProvider(kubeClient client.Client, recorder events.Recorder, catalogue Catalogue, clk clock.PassiveClock) *Provider {
+	return &Provider{kubeClient: kubeClient, recorder: recorder, catalogue: catalogue, clock: clk}
 }
 
-func (p *Provider) recordQuotaRejection(message string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.quotaRejectedAt = time.Now()
-	p.quotaMessage = message
+// sizing returns flavor's catalogue sizing; ok is false when there is no
+// catalogue or it cannot size flavor.
+func (p *Provider) sizing(flavor string) (instancetype.Sizing, bool) {
+	if p.catalogue == nil {
+		return instancetype.Sizing{}, false
+	}
+	return p.catalogue.Sizing(flavor)
 }
 
-// RejectedFlavors returns the flavors currently held out of provisioning
-// because the upstream operator refused them. The cloud provider filters them
-// out when resolving an instance type, so the scheduler relaxes to another
-// flavor instead of retrying the refused one.
-func (p *Provider) RejectedFlavors() map[string]struct{} {
+// recordQuotaRejection records that the organisation quota rejected flavor.
+// Until the rejection's coverage ends (see quotaRejection.coverage) or
+// capacity is freed, Create fails flavor and every flavor at least as large
+// fast and Unavailable reports them, while every smaller flavor stays
+// available — it may still fit.
+func (p *Provider) recordQuotaRejection(flavor, message string) {
+	size, sized := p.sizing(flavor)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out := map[string]struct{}{}
-	for flavor, hold := range p.rejectedFlavors {
-		if time.Since(hold.at) < flavorBackoff {
-			out[flavor] = struct{}{}
+	if p.quotaRejections == nil {
+		p.quotaRejections = map[string]quotaRejection{}
+	}
+	p.quotaRejections[flavor] = quotaRejection{at: p.clock.Now(), message: message, size: size, sized: sized}
+}
+
+// coverage reports until when this rejection of flavor rejected keeps flavor
+// unavailable, and whether it covers flavor at all; size and sized are
+// flavor's catalogue sizing.
+//
+// It covers rejected itself for QuotaBackoff. The quota counts vCPUs and
+// memory, so capacity it cannot fit rejected into cannot fit a flavor at least
+// as large either: the rejection covers each of those for twice as long. Once
+// the first window ends, rejected — the cheapest probe of whether capacity came
+// back — is launchable again on its own, and the larger flavors reopen a window
+// later, after that probe, unless it was rejected in turn. Were they all to
+// reopen together, a quota that stays exhausted would cost a walk down the
+// catalogue in every window: rejecting the smallest flavor covers every other
+// one, so every rejection would expire at the same moment, core would pack the
+// pending pods back onto the largest claim, and each flavor size on the way
+// down would cost one more real rejection upstream. A flavor the catalogue
+// cannot size is covered by its own rejection only, and its rejection covers
+// no other flavor.
+func (r quotaRejection) coverage(rejected, flavor string, size instancetype.Sizing, sized bool) (time.Time, bool) {
+	if rejected == flavor {
+		return r.at.Add(QuotaBackoff), true
+	}
+	if sized && r.sized && size.AtLeast(r.size) {
+		return r.at.Add(2 * QuotaBackoff), true
+	}
+	return time.Time{}, false
+}
+
+// quotaRejectionCovering returns the quota rejection in force that keeps flavor
+// unavailable the longest, the flavor it rejected and when it stops covering
+// flavor. p.mu must be held; size and sized are flavor's catalogue sizing.
+func (p *Provider) quotaRejectionCovering(flavor string, size instancetype.Sizing, sized bool) (string, quotaRejection, time.Time, bool) {
+	now := p.clock.Now()
+	var (
+		coveredBy string
+		covering  quotaRejection
+		until     time.Time
+		found     bool
+	)
+	for rejected, r := range p.quotaRejections {
+		end, covers := r.coverage(rejected, flavor, size, sized)
+		if !covers || !now.Before(end) {
+			continue
+		}
+		// Ties broken by name, so the fast-fail names the same rejection
+		// whatever the map order.
+		if !found || end.After(until) || (end.Equal(until) && rejected < coveredBy) {
+			coveredBy, covering, until, found = rejected, r, end, true
 		}
 	}
-	return out
+	return coveredBy, covering, until, found
+}
+
+// Unavailable reports whether a launch of flavor is known to fail right now,
+// which the cloud provider turns into Available=false offerings: a quota
+// rejection covers it (see quotaRejection.coverage) and no capacity was freed
+// since, or the operator refused flavor itself within the last flavorBackoff.
+func (p *Provider) Unavailable(flavor string) bool {
+	size, sized := p.sizing(flavor)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if hold, held := p.rejectedFlavors[flavor]; held && p.clock.Since(hold.at) < flavorBackoff {
+		return true
+	}
+	_, _, _, covered := p.quotaRejectionCovering(flavor, size, sized)
+	return covered
+}
+
+// quotaFastFail returns the error Create fails a launch of flavor with, without
+// calling the API, while a quota rejection covers it; nil otherwise.
+func (p *Provider) quotaFastFail(flavor string) error {
+	size, sized := p.sizing(flavor)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rejected, r, until, covered := p.quotaRejectionCovering(flavor, size, sized)
+	if !covered {
+		return nil
+	}
+	cause := "the organisation quota rejected it"
+	if rejected != flavor {
+		cause = fmt.Sprintf("the organisation quota rejected %s, and it is at least as large", rejected)
+	}
+	if r.message != "" {
+		cause += " (" + r.message + ")"
+	}
+	remaining := max(until.Sub(p.clock.Now()).Round(time.Second), time.Second)
+	return &ErrQuotaExceeded{Flavor: flavor, Message: fmt.Sprintf("%s; it stays unavailable for another %s unless capacity is freed", cause, remaining)}
 }
 
 func (p *Provider) recordFlavorRejection(flavor string) {
@@ -187,7 +312,7 @@ func (p *Provider) recordFlavorRejection(flavor string) {
 		p.rejectedFlavors = map[string]flavorHoldOut{}
 	}
 	p.holdOutSeq++
-	p.rejectedFlavors[flavor] = flavorHoldOut{at: time.Now(), seq: p.holdOutSeq}
+	p.rejectedFlavors[flavor] = flavorHoldOut{at: p.clock.Now(), seq: p.holdOutSeq}
 }
 
 // holdOutMark returns the sequence number of the last hold-out recorded so
@@ -217,10 +342,12 @@ func (p *Provider) clearFlavorRejection(flavor string, mark uint64) {
 	}
 }
 
-func (p *Provider) clearQuotaRejection() {
+// clearQuotaRejections forgets every quota rejection: capacity was freed, so
+// any flavor may fit again.
+func (p *Provider) clearQuotaRejections() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.quotaRejectedAt = time.Time{}
+	p.quotaRejections = nil
 }
 
 // ProviderID returns the provider ID for a NodeGroup name.
@@ -291,11 +418,14 @@ func NodeClaimOwners(ng *ngv1.NodeGroup) []string {
 func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.CleverNodeClass, flavor string) (*ngv1.NodeGroup, error) {
 	p.createMu.Lock()
 	defer p.createMu.Unlock()
-	// No event on the backoff fast-fail: karpenter-core already publishes an
+	// Checked under createMu: a claim resolved before a rejection that landed
+	// while it waited here must not repeat it. Only the flavors the rejection
+	// covers fail fast; a smaller one may fit and goes to the API. No event on
+	// the fast-fail: karpenter-core already publishes an
 	// InsufficientCapacityError event per attempt, and claims get fresh names
 	// each retry so per-claim dedupe cannot bound the volume.
-	if active, message := p.quotaBackoffActive(); active {
-		return nil, &ErrQuotaExceeded{Message: fmt.Sprintf("%s (cached for up to %s; freed capacity clears it immediately)", message, quotaBackoff)}
+	if err := p.quotaFastFail(flavor); err != nil {
+		return nil, err
 	}
 	ng := &ngv1.NodeGroup{
 		ObjectMeta: metav1.ObjectMeta{
@@ -363,15 +493,15 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 	if err != nil {
 		quotaErr := &ErrQuotaExceeded{}
 		if errors.As(err, &quotaErr) {
-			p.publishQuotaEvent(nodeClaim, err)
+			p.publishQuotaEvent(nodeClaim, quotaErr)
 		}
 		rejectedErr := &ErrFlavorRejected{}
 		if errors.As(err, &rejectedErr) {
 			// Hold the flavor out of provisioning for a short window:
 			// karpenter-core keeps no per-offering memory of an
-			// InsufficientCapacityError, so without this the scheduler
-			// re-picks the cheapest flavor immediately and loops on the one
-			// that was just refused.
+			// InsufficientCapacityError, so without this (reported as an
+			// unavailable offering) the scheduler re-picks the cheapest
+			// flavor immediately and loops on the one that was just refused.
 			p.recordFlavorRejection(rejectedErr.Flavor)
 			p.recorder.Publish(events.Event{
 				InvolvedObject: nodeClaim,
@@ -385,15 +515,17 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 		if errors.Is(err, ErrNodeGroupVanished) {
 			metrics.NodeGroupVanished.Inc(nil)
 			// The documented cause is the quota engine reclaiming an accepted
-			// group: arm the backoff so retries fail fast instead of looping
-			// create→vanish against the API. Freed capacity clears it.
-			p.recordQuotaRejection("an accepted nodegroup was reclaimed upstream (vanish); capacity is likely exhausted")
+			// group: record it as a quota rejection of the group's flavor so
+			// retries fail fast instead of looping create→vanish against the
+			// API. Freed capacity clears it.
+			p.recordQuotaRejection(ng.Spec.Flavor, "an accepted nodegroup was reclaimed upstream (vanish); capacity is likely exhausted")
 			p.recorder.Publish(events.Event{
 				InvolvedObject: nodeClaim,
 				Type:           corev1.EventTypeWarning,
 				Reason:         "NodeGroupVanished",
-				Message:        fmt.Sprintf("NodeGroup %s disappeared or was being deleted during the acceptance poll (usually the quota engine reclaiming an accepted group); failing the launch instead of waiting out the registration TTL", ng.Name),
-				DedupeValues:   []string{nodeClaim.Name},
+				Message: fmt.Sprintf("NodeGroup %s disappeared or was being deleted during the acceptance poll (usually the quota engine reclaiming an accepted group); failing the launch instead of waiting out the registration TTL, and %s",
+					ng.Name, p.quotaConsequence(ng.Spec.Flavor)),
+				DedupeValues: []string{nodeClaim.Name},
 			})
 		}
 		return nil, err
@@ -429,14 +561,25 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 
 // publishQuotaEvent surfaces a quota rejection on the NodeClaim so users see
 // it in kubectl describe, not only in controller logs and scheduler events.
-func (p *Provider) publishQuotaEvent(nodeClaim *karpv1.NodeClaim, err error) {
+func (p *Provider) publishQuotaEvent(nodeClaim *karpv1.NodeClaim, err *ErrQuotaExceeded) {
 	p.recorder.Publish(events.Event{
 		InvolvedObject: nodeClaim,
 		Type:           corev1.EventTypeWarning,
 		Reason:         "NodeGroupQuotaExceeded",
-		Message:        err.Error(),
+		Message:        fmt.Sprintf("%v; %s", err, p.quotaConsequence(err.Flavor)),
 		DedupeValues:   []string{nodeClaim.Name},
 	})
+}
+
+// quotaConsequence says what a quota rejection of flavor does to the next
+// launches, for the events that report one (see quotaRejection.coverage).
+func (p *Provider) quotaConsequence(flavor string) string {
+	if _, sized := p.sizing(flavor); !sized {
+		return fmt.Sprintf("%s is unavailable to the scheduler for up to %s (freed capacity clears it); the catalogue cannot size it, so no other flavor is affected",
+			flavor, QuotaBackoff)
+	}
+	return fmt.Sprintf("%s is unavailable to the scheduler for up to %s and every other flavor at least as large for up to %s, so that %s is retried first (freed capacity clears it); smaller flavors stay available",
+		flavor, QuotaBackoff, 2*QuotaBackoff, flavor)
 }
 
 // publishTransientFailure surfaces a transient failure the operator reported
@@ -585,7 +728,7 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (ac
 			// Record before the cleanup delete: the rejection happened even
 			// if freeing the reservation below fails. Fresh upstream
 			// rejections only — backoff fast-fails don't count.
-			p.recordQuotaRejection(msg)
+			p.recordQuotaRejection(ng.Spec.Flavor, msg)
 			metrics.NodeGroupQuotaRejections.Inc(nil)
 			// Free the rejected reservation immediately so it does not
 			// starve other NodeGroups in the org. Deleted directly (not via
@@ -604,7 +747,7 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (ac
 				log.FromContext(ctx).WithValues("NodeGroup", name).Error(err,
 					"could not delete the quota-rejected nodegroup; the garbage collector will reclaim it")
 			}
-			return false, &ErrQuotaExceeded{Message: msg}
+			return false, &ErrQuotaExceeded{Flavor: ng.Spec.Flavor, Message: msg}
 		}
 		// A transient failure is the operator retrying a Clever Cloud API call
 		// on its own (live: UpstreamError, recovered about an hour later), not
@@ -692,21 +835,22 @@ func (p *Provider) List(ctx context.Context) ([]ngv1.NodeGroup, error) {
 }
 
 // Delete removes a NodeGroup; the Clever Cloud operator finalizer tears down
-// the VM and the Node object (~40s observed). Deletions free quota, so the
-// quota backoff is reset — except when the operator refused that very group
-// (a quota rejection or any other terminal refusal, ngv1.NodeGroup.IsRefused)
-// and it never synced: its VM never came up, so it held no capacity, and
-// clearing the backoff on its removal would send the next Create straight back
-// into an exhausted quota — whichever claim's rejection armed it. The
-// acceptance poll deletes the groups it sees refused directly, bypassing this
-// method, for the same reason. This removal is what karpenter-core's
-// termination runs after the nodegroupstatus controller fails a launch the
-// operator refused late, and what the GC runs on a refused group the
-// acceptance poll could not free. A Ready group always clears it: its VM holds
-// capacity whatever its later reconciles report.
+// the VM and the Node object (~40s observed). Deletions free quota, so every
+// quota rejection is forgotten and the flavors it covered are available again
+// — except when the operator refused that very group (a quota rejection or any
+// other terminal refusal, ngv1.NodeGroup.IsRefused) and it never synced: its
+// VM never came up, so it held no capacity, and clearing the backoff on its
+// removal would send the next Create straight back into an exhausted quota —
+// whichever claim's rejection armed it. The acceptance poll deletes the groups
+// it sees refused directly, bypassing this method, for the same reason. This
+// removal is what karpenter-core's termination runs after the nodegroupstatus
+// controller fails a launch the operator refused late, and what the GC runs on
+// a refused group the acceptance poll could not free. A Ready group always
+// clears it: its VM holds capacity whatever its later reconciles report. A
+// refusal hold-out is not a capacity verdict, so no deletion lifts it.
 func (p *Provider) Delete(ctx context.Context, ng *ngv1.NodeGroup) error {
 	if ng.IsSynced() || !ng.IsRefused() {
-		p.clearQuotaRejection()
+		p.clearQuotaRejections()
 	}
 	return p.kubeClient.Delete(ctx, &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: ng.Name}})
 }
@@ -715,24 +859,26 @@ func (p *Provider) Delete(ctx context.Context, ng *ngv1.NodeGroup) error {
 // Create's acceptance poll had returned, the way Create records one it sees
 // within the poll, so that the re-plan that follows lands somewhere else. The
 // nodegroupstatus controller calls it once it has deleted the launched
-// NodeClaim of the refused group. A quota rejection arms the quota backoff; any
-// other refusal holds the flavor out of provisioning. Each is counted, and
-// published on the NodeClaim, under the same metric and event reason as a
-// refusal seen within the poll. A group that is not refused is ignored.
+// NodeClaim of the refused group. A quota rejection arms the quota backoff for
+// the group's flavor and, for longer, every flavor at least as large; any
+// other refusal holds the flavor out of provisioning. Either way Unavailable
+// reports the flavors concerned. Each is counted, and published on the
+// NodeClaim, under the same metric and event reason as a refusal seen within
+// the poll. A group that is not refused is ignored.
 func (p *Provider) RecordLateRefusal(nodeClaim *karpv1.NodeClaim, ng *ngv1.NodeGroup) {
 	if ng.IsQuotaExceeded() {
 		msg := ""
 		if cond := ng.GetCondition(ngv1.ConditionTypeReconcileFailed); cond != nil {
 			msg = cond.Message
 		}
-		p.recordQuotaRejection(msg)
+		p.recordQuotaRejection(ng.Spec.Flavor, msg)
 		metrics.NodeGroupQuotaRejections.Inc(nil)
 		p.recorder.Publish(events.Event{
 			InvolvedObject: nodeClaim,
 			Type:           corev1.EventTypeWarning,
 			Reason:         "NodeGroupQuotaExceeded",
-			Message: fmt.Sprintf("The organisation quota rejected NodeGroup %s after its launch (%s); the NodeClaim was deleted so karpenter re-plans instead of waiting out the registration TTL, and new launches fail fast for up to %s (freed capacity clears it)",
-				ng.Name, DescribeFailure(ngv1.ReasonQuotaExceeded, msg), quotaBackoff),
+			Message: fmt.Sprintf("The organisation quota rejected NodeGroup %s (flavor %s) after its launch (%s); the NodeClaim was deleted so karpenter re-plans instead of waiting out the registration TTL, and %s",
+				ng.Name, ng.Spec.Flavor, DescribeFailure(ngv1.ReasonQuotaExceeded, msg), p.quotaConsequence(ng.Spec.Flavor)),
 			DedupeValues: []string{nodeClaim.Name},
 		})
 		return
