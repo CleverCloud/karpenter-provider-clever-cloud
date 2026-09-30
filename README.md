@@ -252,7 +252,24 @@ Label keys may not use the `clever-cloud.com/` prefix, any `kubernetes.io/` doma
 domain (Karpenter's own; it applies those keys itself at registration): the CRD rejects them at admission, and
 the NodeClass reports anything else it cannot deliver as `ValidationSucceeded=False`.
 
-Changing a NodeClass marks the NodeClaims built from it as drifted; Karpenter then replaces those nodes rolling-style.
+v0.12.0 still admitted subdomained `kubernetes.io/` keys (such as `app.kubernetes.io/part-of`) and `karpenter.sh`
+keys. A NodeClass that carries one from then (whatever its value, up to the 63 characters v0.12.0 enforced) stays
+Ready and keeps provisioning: no node launched from now on gets the key, and the `LabelsIgnored` status condition
+and a `LabelsIgnored` warning event name it. Until it is removed, the CRD refuses any edit of `spec.labels` that
+keeps it.
+
+Remove it only after the upgraded controller has reconciled the NodeClass. v0.12.0 hashed the key into the drift
+stamp of every NodeGroup it built, so removing it drifts those nodes until the controller has re-stamped them with
+a hash that leaves it out (annotation `karpenter.clever-cloud.com/clevernodeclass-hash-version: v3`). The
+`LabelsIgnored` condition says when that is done: its reason is then `LegacyLabelKeys`, and its message says that
+no node drifts for removing the key. While its reason is `HashMigrationPending`, its message counts the NodeGroups
+that would still drift, such as one whose node already drifted for another reason and keeps its stamp until it is
+replaced. Removing the key before the upgrade, in the same change as the upgrade, or while v0.12.0 still runs
+drifts the nodes v0.12.0 built from the NodeClass, and Karpenter replaces them.
+
+Changing a label the NodeClass delivers marks the NodeClaims built from it as drifted; Karpenter then replaces
+those nodes rolling-style. Adding or removing a key the NodeClass does not deliver drifts nothing, except on the
+nodes v0.12.0 built that the upgraded controller has not re-stamped yet (above).
 
 ### Targeting Karpenter nodes
 

@@ -73,6 +73,60 @@ func TestHashChangesWhenLabelsChange(t *testing.T) {
 	}
 }
 
+// TestHashCoversOnlyDeliveredLabels pins what the hash describes: the labels
+// the NodeGroup payload carries, since those are all a NodeClass contributes
+// to a node. A label the shared rule rejects is not delivered, so adding or
+// removing one must not drift any node: when the hash covered the raw labels,
+// removing a subdomained kubernetes.io/ key that v0.12.0 accepted — the only
+// way to clear the warning it now raises — replaced every node of the
+// NodeClass for a NodeGroup spec identical to theirs.
+func TestHashCoversOnlyDeliveredLabels(t *testing.T) {
+	delivered := map[string]string{"team": "data"}
+	want := testNodeClass(t, delivered).Hash()
+	for _, tc := range []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "legacy kubernetes.io subdomain key", key: "app.kubernetes.io/part-of", value: "shop"},
+		{name: "legacy topology.kubernetes.io key", key: "topology.kubernetes.io/zone", value: "par"},
+		{name: "legacy karpenter.sh key", key: "karpenter.sh/capacity-type", value: "on-demand"},
+		{name: "legacy karpenter.sh subdomain key", key: "compatibility.karpenter.sh/x", value: "1"},
+		{name: "reserved prefix", key: "clever-cloud.com/flavor", value: "XS"},
+		{name: "bare kubernetes.io prefix", key: "kubernetes.io/role", value: "worker"},
+		{name: "invalid key", key: "bad key", value: "x"},
+		{name: "invalid value", key: "env", value: "not valid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if v1alpha1.ValidateNodeClassLabel(tc.key, tc.value) == nil {
+				t.Fatalf("fixture %s=%s is delivered: pick a label the shared rule rejects", tc.key, tc.value)
+			}
+			labels := map[string]string{tc.key: tc.value}
+			for k, v := range delivered {
+				labels[k] = v
+			}
+			if got := testNodeClass(t, labels).Hash(); got != want {
+				t.Errorf("adding undelivered %s=%s moved the hash (%q, want %q): removing it again would drift "+
+					"every node of the NodeClass although no NodeGroup payload changes", tc.key, tc.value, got, want)
+			}
+		})
+	}
+	// Only undelivered labels: the same configuration as no labels at all.
+	if got, want := testNodeClass(t, map[string]string{"app.kubernetes.io/part-of": "shop"}).Hash(), testNodeClass(t, nil).Hash(); got != want {
+		t.Errorf("a spec whose only label is undelivered must hash like an empty spec, got %q, want %q", got, want)
+	}
+	// A delivered label still counts, in the provider's own domain too.
+	for _, key := range []string{"env", "karpenter.clever-cloud.com/team"} {
+		labels := map[string]string{"app.kubernetes.io/part-of": "shop", key: "x"}
+		for k, v := range delivered {
+			labels[k] = v
+		}
+		if got := testNodeClass(t, labels).Hash(); got == want {
+			t.Errorf("adding delivered label %s must move the hash, got %q twice", key, got)
+		}
+	}
+}
+
 func TestHashIgnoresObjectMetadata(t *testing.T) {
 	a := testNodeClass(t, map[string]string{"team": "data"})
 	b := testNodeClass(t, map[string]string{"team": "data"})
@@ -111,12 +165,22 @@ func TestHashTreatsEmptyAndAbsentLabelsAlike(t *testing.T) {
 // new hash reading as drift and replacing the whole fleet.
 func TestHashVersionPinnedToSpec(t *testing.T) {
 	const (
-		wantVersion = "v2"
-		// Hash of CleverNodeClassSpec{Labels: {"team": "data"}} under v2.
+		wantVersion = "v3"
+		// Hash of CleverNodeClassSpec{Labels: {"team": "data"}} under v3.
 		wantHash = "3789529822245891689"
 	)
-	// CleverNodeClassSpec's fields under v2, with their types.
+	// CleverNodeClassSpec's fields under v3, with their types.
 	wantFields := []string{"Labels map[string]string"}
+	// Labels v3 leaves out of the hash (ValidateNodeClassLabel rejects them):
+	// a spec adding them to the fixed one must keep wantHash. The rule is part
+	// of the hashing, and a change to it for these keys moves this hash.
+	undelivered := map[string]string{
+		"team":                       "data",
+		"app.kubernetes.io/part-of":  "shop",
+		"karpenter.sh/capacity-type": "on-demand",
+		"clever-cloud.com/flavor":    "XS",
+		"env":                        "not valid",
+	}
 
 	if v1alpha1.NodeClassHashVersion != wantVersion {
 		t.Fatalf("NodeClassHashVersion moved to %q: update wantVersion, wantHash and wantFields together",
@@ -135,13 +199,18 @@ func TestHashVersionPinnedToSpec(t *testing.T) {
 			"wantFields and wantHash in this test, in the same commit.",
 			fields, wantFields, v1alpha1.NodeClassHashVersion)
 	}
-	if got := testNodeClass(t, map[string]string{"team": "data"}).Hash(); got != wantHash {
-		t.Errorf("the hash of a fixed spec changed (%q, want %q).\n"+
-			"CleverNodeClassSpec or the hashing changed, so every existing NodeGroup now carries a "+
-			"stale, incomparable hash. Freeze the outgoing generation in previousNodeClassHashes, bump "+
-			"NodeClassHashVersion (currently %q) and update wantHash in this test, in the same commit — "+
-			"otherwise upgrading the controller replaces every node in every fleet.",
-			got, wantHash, v1alpha1.NodeClassHashVersion)
+	for _, labels := range []map[string]string{{"team": "data"}, undelivered} {
+		got := testNodeClass(t, labels).Hash()
+		if got == wantHash {
+			continue
+		}
+		t.Errorf("the hash of a fixed spec (labels %v) changed (%q, want %q).\n"+
+			"CleverNodeClassSpec, the hashing or the label rule it applies (ValidateNodeClassLabel) changed, "+
+			"so every existing NodeGroup now carries a stale, incomparable hash. Freeze the outgoing "+
+			"generation in previousNodeClassHashes, bump NodeClassHashVersion (currently %q) and update "+
+			"wantHash in this test, in the same commit — otherwise upgrading the controller replaces every "+
+			"node in every fleet.",
+			labels, got, wantHash, v1alpha1.NodeClassHashVersion)
 	}
 }
 
@@ -169,10 +238,24 @@ func TestHashGenerationsMatchTheirStamps(t *testing.T) {
 		// configuration, so a v1 stamp of either form matches both.
 		{name: "v1 stamp of empty labels, now absent", version: "", labels: nil, stamp: "14514438007709706818"},
 		{name: "v1 stamp of absent labels, now empty", version: "", labels: map[string]string{}, stamp: "7038317156814165261"},
-		// v2
+		// v2: NodeGroups created by v0.12.0.
 		{name: "v2", version: "v2", labels: map[string]string{"team": "data"}, stamp: "3789529822245891689"},
 		{name: "v2 absent labels", version: "v2", labels: nil, stamp: "7038317156814165261"},
 		{name: "v2 empty labels", version: "v2", labels: map[string]string{}, stamp: "7038317156814165261"},
+		// v2 hashed every label, delivered or not: its stamp of a spec
+		// carrying one is its own, and must still match that spec unchanged,
+		// or the upgrade that stops hashing them drifts the whole NodeClass.
+		{name: "v2 with a legacy kubernetes.io subdomain key", version: "v2",
+			labels: map[string]string{"team": "data", "app.kubernetes.io/part-of": "shop"}, stamp: "16335349422164111380"},
+		{name: "v2 with a legacy karpenter.sh key", version: "v2",
+			labels: map[string]string{"team": "data", "karpenter.sh/capacity-type": "on-demand"}, stamp: "14653552794626866276"},
+		// v3: undelivered labels are not part of the configuration.
+		{name: "v3", version: "v3", labels: map[string]string{"team": "data"}, stamp: "3789529822245891689"},
+		{name: "v3 absent labels", version: "v3", labels: nil, stamp: "7038317156814165261"},
+		{name: "v3 with a legacy key", version: "v3",
+			labels: map[string]string{"team": "data", "app.kubernetes.io/part-of": "shop"}, stamp: "3789529822245891689"},
+		{name: "v3 stamp of a legacy key, removed since", version: "v3",
+			labels: map[string]string{"team": "data"}, stamp: "3789529822245891689"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			match, known := testNodeClass(t, tc.labels).HashMatches(tc.version, tc.stamp)

@@ -40,7 +40,11 @@ type CleverNodeClassSpec struct {
 	// single owner of the full rule. The CEL rule below covers what CEL can
 	// express (contains subsumes both kubernetes.io/ prefixes of the older
 	// rule); label syntax degrades to ValidationSucceeded=False on the
-	// nodeclass controller.
+	// nodeclass controller. A NodeClass admitted by v0.12.0's narrower rule
+	// may still carry a subdomained kubernetes.io/ or karpenter.sh key: it
+	// stays Ready, the key is ignored (not delivered to new nodes, not part of
+	// the drift hash) and reported by the LabelsIgnored condition, and any
+	// edit of labels that keeps it is refused.
 	// +kubebuilder:validation:XValidation:message="label keys in the kubernetes.io/ or karpenter.sh domains or with the reserved prefix clever-cloud.com/ are not allowed",rule="self.all(k, !k.contains('kubernetes.io/') && !k.startsWith('clever-cloud.com/') && !k.startsWith('karpenter.sh/') && !k.contains('.karpenter.sh/'))"
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
@@ -67,7 +71,10 @@ type CleverNodeClass struct {
 // in the SAME commit as any change to CleverNodeClassSpec or to the hashing
 // itself: a new generation then neither reads as drift on every existing
 // NodeGroup (replacing the whole fleet for no configuration change) nor hides
-// a NodeClass edit that lands while the upgrade rolls out.
+// a NodeClass edit that lands while the upgrade rolls out. ValidateNodeClassLabel
+// is part of the hashing: Hash() covers only the labels it accepts, so a change
+// to what it accepts moves the hash of every spec setting an affected key, and
+// needs a generation whose frozen copy keeps the outgoing rule.
 //
 // A bump is required for ANY spec change, not only for those that move
 // existing hashes. Adding a field is one that does not (`IgnoreZeroValue`
@@ -89,7 +96,13 @@ type CleverNodeClass struct {
 //     function-local copy of the outgoing spec type (hashstructure mixes the
 //     struct's type name into the hash, so the copy keeps the name
 //     CleverNodeClassSpec), and return every hash the outgoing generation gave
-//     to a configuration the new one treats as identical. A new field whose
+//     to a configuration the new one treats as identical, as far as that set
+//     can be enumerated. v3's cannot: it treats as identical any two specs
+//     that differ only by labels the NodeGroup payload does not carry, so the
+//     v1 and v2 copies reproduce the spec as it stands, and an
+//     older-generation NodeGroup whose NodeClass gained or lost such a label
+//     before the migration re-stamped it drifts — the conservative side: a
+//     replacement, never a hidden edit. A new field whose
 //     value reproduces what nodes got before it existed (a CRD default) must
 //     be normalised to its zero value in normalised(), or every
 //     older-generation NodeGroup drifts at upgrade. A renamed or removed field
@@ -105,8 +118,10 @@ type CleverNodeClass struct {
 //
 // v1 (implicit, annotation absent — NodeGroups created up to v0.11.x): the
 // original unversioned hash, which also distinguished `labels: {}` from an
-// absent `labels`. v2: v1 over the normalised spec.
-const NodeClassHashVersion = "v2"
+// absent `labels`. v2 (v0.12.0): v1 over the normalised spec. v3: v2 over the
+// labels the NodeGroup payload carries only; v2 also hashed labels that never
+// reached a node, so removing one drifted every node of the NodeClass.
+const NodeClassHashVersion = "v3"
 
 // nodeClassHashVersionV1 is the generation of NodeGroups stamped before the
 // version annotation existed: an absent (or empty) annotation means v1.
@@ -131,6 +146,8 @@ type frozenHashGeneration struct {
 var previousNodeClassHashes = map[string]frozenHashGeneration{
 	// The v1 spec had nothing but labels.
 	nodeClassHashVersionV1: {fields: []string{"Labels"}, hashes: hashV1},
+	// So did the v2 spec.
+	"v2": {fields: []string{"Labels"}, hashes: hashV2},
 }
 
 // hashV1 is generation v1 frozen: hashstructure over the RAW spec, exactly as
@@ -155,15 +172,42 @@ func hashV1(spec CleverNodeClassSpec) []string {
 	return []string{hashOf(CleverNodeClassSpec{Labels: labels})}
 }
 
+// hashV2 is generation v2 frozen: hashstructure over the spec with `labels: {}`
+// normalised to an absent `labels`, exactly as shipped in v0.12.0 (git show
+// v0.12.0:pkg/apis/v1alpha1/clevernodeclass.go). It hashed every label,
+// including those the NodeGroup payload never carried, so it reproduces them
+// too: a v2 stamp matches the spec it was computed from, unchanged.
+func hashV2(spec CleverNodeClassSpec) []string {
+	// The v2 spec type, under its original name — see hashV1.
+	type CleverNodeClassSpec struct {
+		Labels map[string]string
+	}
+	labels := spec.Labels
+	if len(labels) == 0 {
+		labels = nil
+	}
+	return []string{hashOf(CleverNodeClassSpec{Labels: labels})}
+}
+
 // Hash returns a stable hash of the fields that, when changed, must trigger
 // drift on NodeClaims provisioned from this NodeClass — generation
 // NodeClassHashVersion.
 //
-// The spec is normalised first: `labels: {}` and an absent `labels` are the
-// same configuration, but hashstructure skips a nil map while hashing an empty
-// one, so without this they produce different hashes — and deleting a no-op
-// `labels: {}` line (which 9 of the 10 shipped examples used to carry) would
-// replace every node backed by the NodeClass.
+// It hashes the normalised spec: the NodeClass labels the NodeGroup label
+// filter admits, and nothing else. A label ValidateNodeClassLabel rejects is
+// not delivered, so adding or removing one must not replace any node. That is
+// the way out for a NodeClass carrying a key v0.12.0 accepted and the current
+// rule rejects (IsLegacyNodeClassLabel): when the hash covered the raw labels,
+// removing a key that no node ever received drifted every node of the
+// NodeClass, for a NodeGroup spec identical to theirs. An admitted label still
+// counts when a NodeClaim label on the same key (a NodePool template label)
+// overrides it in the payload: changing it then drifts nodes whose payload
+// does not change — the conservative side, and the NodeClass cannot know
+// which keys a NodePool sets. And `labels: {}` and an absent `labels`
+// are the same configuration, but hashstructure skips a nil map while hashing
+// an empty one, so without normalising they produce different hashes — and
+// deleting a no-op `labels: {}` line (which 9 of the 10 shipped examples used
+// to carry) would replace every node backed by the NodeClass.
 func (in *CleverNodeClass) Hash() string {
 	return hashOf(in.Spec.normalised())
 }
@@ -228,10 +272,18 @@ func hashOf(spec any) string {
 	})))
 }
 
-// normalised returns a copy of the spec in which empty-but-non-nil collections
-// are nil, so that two wire representations of the same configuration hash
-// identically.
+// normalised returns a copy of the spec reduced to what it contributes to the
+// NodeGroup payload, so that two specs contributing the same hash identically:
+// labels the NodeGroup label filter drops are dropped (ValidateNodeClassLabel —
+// the rule that filter applies), and empty-but-non-nil collections are nil.
 func (in CleverNodeClassSpec) normalised() CleverNodeClassSpec {
+	labels := map[string]string{}
+	for k, v := range in.Labels {
+		if ValidateNodeClassLabel(k, v) == nil {
+			labels[k] = v
+		}
+	}
+	in.Labels = labels
 	if len(in.Labels) == 0 {
 		in.Labels = nil
 	}

@@ -69,7 +69,11 @@ spec:
                   single owner of the full rule. The CEL rule below covers what CEL can
                   express (contains subsumes both kubernetes.io/ prefixes of the older
                   rule); label syntax degrades to ValidationSucceeded=False on the
-                  nodeclass controller.
+                  nodeclass controller. A NodeClass admitted by v0.12.0's narrower rule
+                  may still carry a subdomained kubernetes.io/ or karpenter.sh key: it
+                  stays Ready, the key is ignored (not delivered to new nodes, not part of
+                  the drift hash) and reported by the LabelsIgnored condition, and any
+                  edit of labels that keeps it is refused.
                 type: object
                 x-kubernetes-validations:
                 - message: label keys in the kubernetes.io/ or karpenter.sh domains

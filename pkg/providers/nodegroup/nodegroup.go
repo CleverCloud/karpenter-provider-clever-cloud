@@ -565,7 +565,9 @@ func (p *Provider) Delete(ctx context.Context, name string) error {
 // registration sync. Keys the NodeGroup payload cannot carry are filtered out:
 // for NodeClaim labels Karpenter applies those at registration anyway, while
 // NodeClass labels have no such fallback — which is why the nodeclass
-// controller rejects up front, with the same rule, anything filtered here.
+// controller rejects up front, with the same rule, anything filtered here
+// (bar the keys v0.12.0 accepted, which it reports as ignored), and why the
+// NodeClass hash stamped on the group covers only what passes it.
 //
 // The payload is immutable and the platform applies it to every node of the
 // group, not only to the one this NodeClaim is for, which is why core's
@@ -598,7 +600,9 @@ func nodeGroupLabels(nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.CleverNode
 // still reach the node through the registration sync. NodeClass labels have
 // NO such fallback: a dropped key is simply gone, which is why the nodeclass
 // controller rejects them up front with the same rule instead of ever letting
-// this filter fire.
+// this filter fire — except for keys v0.12.0 accepted
+// (v1alpha1.IsLegacyNodeClassLabel), which it keeps Ready and reports as
+// ignored, and which this filter drops.
 func isNodeGroupLabelAllowed(key, value string) bool {
 	return v1alpha1.ValidateNodeClassLabel(key, value) == nil
 }

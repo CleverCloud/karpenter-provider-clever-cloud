@@ -43,12 +43,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/retry"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
@@ -56,7 +58,17 @@ import (
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/providerid"
 )
 
-var kubeClient client.Client
+var (
+	kubeClient client.Client
+	// apiReader reads straight from the apiserver, for read-modify-write
+	// cycles the manager's cache may not have caught up with.
+	apiReader client.Reader
+)
+
+// noopRecorder discards events: the unit tests assert on them.
+type noopRecorder struct{}
+
+func (noopRecorder) Publish(...events.Event) {}
 
 func TestMain(m *testing.M) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
@@ -102,7 +114,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	if err := nodeclass.NewController(mgr.GetClient()).Register(ctx, mgr); err != nil {
+	if err := nodeclass.NewController(mgr.GetClient(), noopRecorder{}).Register(ctx, mgr); err != nil {
 		fmt.Printf("registering nodeclass controller: %v\n", err)
 		os.Exit(1)
 	}
@@ -120,6 +132,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	kubeClient = mgr.GetClient()
+	apiReader = mgr.GetAPIReader()
 
 	code := m.Run()
 	cancel()
@@ -331,6 +344,175 @@ func TestNodeClassValidation(t *testing.T) {
 		}
 		if nc.StatusConditions().Root().Status == metav1.ConditionTrue {
 			return fmt.Errorf("Ready must not be True with a failed validation")
+		}
+		return nil
+	})
+}
+
+// v012LabelsRule is the spec.labels CEL rule of the CleverNodeClass CRD
+// shipped with v0.12.0 (git show
+// v0.12.0:deploy/crds/karpenter.clever-cloud.com_clevernodeclasses.yaml): it
+// refused three prefixes only, so it admitted subdomained kubernetes.io/ keys
+// and the karpenter.sh domain.
+const v012LabelsRule = "self.all(k, !k.startsWith('kubernetes.io/') && !k.startsWith('node.kubernetes.io/') && !k.startsWith('clever-cloud.com/'))"
+
+// setNodeClassLabelsRule replaces the CEL rule on the installed CleverNodeClass
+// CRD's spec.labels and returns the rule it replaced. The apiserver applies
+// the new schema asynchronously: callers probe for it.
+func setNodeClassLabelsRule(t *testing.T, rule string) string {
+	t.Helper()
+	var previous string
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		crd := &apiextensionsv1.CustomResourceDefinition{}
+		if err := apiReader.Get(context.Background(), types.NamespacedName{Name: "clevernodeclasses.karpenter.clever-cloud.com"}, crd); err != nil {
+			return err
+		}
+		spec := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
+		labels := spec.Properties["labels"]
+		if len(labels.XValidations) != 1 {
+			return fmt.Errorf("expected exactly one CEL rule on spec.labels, got %+v", labels.XValidations)
+		}
+		previous = labels.XValidations[0].Rule
+		labels.XValidations = apiextensionsv1.ValidationRules{{Rule: rule, Message: labels.XValidations[0].Message}}
+		spec.Properties["labels"] = labels
+		return kubeClient.Update(context.Background(), crd)
+	})
+	if err != nil {
+		t.Fatalf("replacing the CleverNodeClass labels rule: %v", err)
+	}
+	return previous
+}
+
+// updateNodeClass applies mutate to the live NodeClass and writes it back,
+// retrying on conflicts with the controller's own writes.
+func updateNodeClass(ctx context.Context, name string, mutate func(*v1alpha1.CleverNodeClass)) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		nc := &v1alpha1.CleverNodeClass{}
+		if err := apiReader.Get(ctx, types.NamespacedName{Name: name}, nc); err != nil {
+			return err
+		}
+		mutate(nc)
+		return kubeClient.Update(ctx, nc)
+	})
+}
+
+// TestNodeClassLegacyLabels walks a NodeClass that v0.12.0 admitted with keys
+// the current CRD rule rejects — a subdomained kubernetes.io/ key, whose value
+// is not even label syntax, and a karpenter.sh key — through an upgrade,
+// against the real admission chain.
+// Validation ratcheting lets the unchanged object through every write that
+// leaves spec.labels alone (the controller's finalizer and status writes, a
+// metadata edit); the controller keeps it Ready and reports LabelsIgnored; an
+// edit of spec.labels that keeps a legacy key is refused; removing them is
+// accepted and clears the condition. New objects are refused such keys at
+// admission (TestNodeClassValidation).
+func TestNodeClassLegacyLabels(t *testing.T) {
+	ctx := context.Background()
+	const name = "legacy-labels"
+	legacyKeys := []string{"app.kubernetes.io/part-of", "karpenter.sh/capacity-type"}
+
+	// Only v0.12.0's rule admits such an object: install it for the time it
+	// takes to create one, then put the current rule back.
+	current := setNodeClassLabelsRule(t, v012LabelsRule)
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		setNodeClassLabelsRule(t, current)
+		// Probe until the apiserver enforces the current rule again, so no
+		// later test runs against the old one.
+		eventually(t, 10*time.Second, func(ctx context.Context) error {
+			probe := &v1alpha1.CleverNodeClass{
+				ObjectMeta: metav1.ObjectMeta{GenerateName: "legacy-probe-"},
+				Spec:       v1alpha1.CleverNodeClassSpec{Labels: map[string]string{legacyKeys[0]: "x"}},
+			}
+			err := kubeClient.Create(ctx, probe)
+			if err == nil {
+				_ = kubeClient.Delete(ctx, probe)
+				return fmt.Errorf("the current labels rule is not enforced yet")
+			}
+			if !apierrors.IsInvalid(err) {
+				return err
+			}
+			return nil
+		})
+	}
+	t.Cleanup(restore)
+	// The kubernetes.io value is not label syntax: v0.12.0 never checked it
+	// for a key it dropped from the NodeGroup payload, so such a NodeClass
+	// provisioned, and must stay Ready.
+	eventually(t, 10*time.Second, func(ctx context.Context) error {
+		return kubeClient.Create(ctx, &v1alpha1.CleverNodeClass{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: v1alpha1.CleverNodeClassSpec{Labels: map[string]string{
+				"team": "data", legacyKeys[0]: "My Platform", legacyKeys[1]: "on-demand",
+			}},
+		})
+	})
+	t.Cleanup(func() {
+		_ = kubeClient.Delete(ctx, &v1alpha1.CleverNodeClass{ObjectMeta: metav1.ObjectMeta{Name: name}})
+	})
+	restore()
+
+	// The upgraded controller: Ready, with the keys reported, not fatal. Its
+	// finalizer and status writes went through the ratchet.
+	eventually(t, 10*time.Second, func(ctx context.Context) error {
+		nc := &v1alpha1.CleverNodeClass{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Name: name}, nc); err != nil {
+			return err
+		}
+		if len(nc.Finalizers) == 0 {
+			return fmt.Errorf("termination finalizer not stamped yet")
+		}
+		if !nc.StatusConditions().Root().IsTrue() || !nc.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded) {
+			return fmt.Errorf("not Ready with ValidationSucceeded yet: %+v", nc.Status.Conditions)
+		}
+		ignored := nc.StatusConditions().Get(v1alpha1.ConditionTypeLabelsIgnored)
+		if !ignored.IsTrue() {
+			return fmt.Errorf("LabelsIgnored not true yet: %+v", nc.Status.Conditions)
+		}
+		// No NodeGroup carries an older hash generation: removing the keys
+		// drifts nothing, and the condition says so.
+		if ignored.Reason != "LegacyLabelKeys" {
+			return fmt.Errorf("LabelsIgnored reason %q, want LegacyLabelKeys with no NodeGroup to migrate", ignored.Reason)
+		}
+		for _, key := range legacyKeys {
+			if !strings.Contains(ignored.Message, key) {
+				return fmt.Errorf("LabelsIgnored message %q does not name %s", ignored.Message, key)
+			}
+		}
+		return nil
+	})
+
+	// A write that leaves spec.labels alone passes the ratchet.
+	if err := updateNodeClass(ctx, name, func(nc *v1alpha1.CleverNodeClass) {
+		nc.Annotations = map[string]string{"envtest/edit": "metadata-only"}
+	}); err != nil {
+		t.Fatalf("a metadata-only edit of a NodeClass carrying legacy keys must be admitted: %v", err)
+	}
+	// An edit of spec.labels is validated in full: keeping a legacy key fails.
+	err := updateNodeClass(ctx, name, func(nc *v1alpha1.CleverNodeClass) { nc.Spec.Labels["env"] = "prod" })
+	if !apierrors.IsInvalid(err) {
+		t.Fatalf("an edit of spec.labels keeping a legacy key must be refused at admission, got: %v", err)
+	}
+	// Removing them — the way out — is admitted and clears the condition.
+	if err := updateNodeClass(ctx, name, func(nc *v1alpha1.CleverNodeClass) {
+		nc.Spec.Labels = map[string]string{"team": "data"}
+	}); err != nil {
+		t.Fatalf("removing the legacy keys must be admitted: %v", err)
+	}
+	eventually(t, 10*time.Second, func(ctx context.Context) error {
+		nc := &v1alpha1.CleverNodeClass{}
+		if err := kubeClient.Get(ctx, types.NamespacedName{Name: name}, nc); err != nil {
+			return err
+		}
+		if cond := nc.StatusConditions().Get(v1alpha1.ConditionTypeLabelsIgnored); cond != nil {
+			return fmt.Errorf("LabelsIgnored still present: %+v", cond)
+		}
+		if !nc.StatusConditions().Root().IsTrue() {
+			return fmt.Errorf("not Ready: %+v", nc.Status.Conditions)
 		}
 		return nil
 	})

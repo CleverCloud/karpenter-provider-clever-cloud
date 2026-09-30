@@ -22,8 +22,12 @@ import (
 	"context"
 	goerrors "errors"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
@@ -42,10 +47,11 @@ import (
 
 type Controller struct {
 	kubeClient client.Client
+	recorder   events.Recorder
 }
 
-func NewController(kubeClient client.Client) *Controller {
-	return &Controller{kubeClient: kubeClient}
+func NewController(kubeClient client.Client, recorder events.Recorder) *Controller {
+	return &Controller{kubeClient: kubeClient, recorder: recorder}
 }
 
 func (c *Controller) Name() string {
@@ -68,7 +74,8 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 
 	stored = nodeClass.DeepCopy()
-	if err := validate(nodeClass); err != nil {
+	ignored, err := validate(nodeClass)
+	if err != nil {
 		nodeClass.StatusConditions().SetFalse(v1alpha1.ConditionTypeValidationSucceeded, "ValidationFailed", err.Error())
 	} else {
 		nodeClass.StatusConditions().SetTrue(v1alpha1.ConditionTypeValidationSucceeded)
@@ -83,6 +90,15 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			fmt.Sprintf("listing nodegroups.api.clever-cloud.com: %s (is this a Clever Kubernetes Engine cluster?)", err))
 	} else {
 		nodeClass.StatusConditions().SetTrue(v1alpha1.ConditionTypeNodeGroupAPIServed)
+	}
+	// The migration runs before the ignored keys are reported: whether
+	// removing them drifts nodes depends on what it leaves behind.
+	pending, migrationErr := pendingUnknown, error(nil)
+	if apiServed {
+		pending, migrationErr = c.migrateHashVersion(ctx, nodeClass)
+	}
+	if err := c.reportIgnoredLabels(ctx, nodeClass, ignored, pending); err != nil {
+		return reconcile.Result{}, err
 	}
 	if !equality.Semantic.DeepEqual(stored, nodeClass) {
 		if err := c.kubeClient.Status().Patch(ctx, nodeClass, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
@@ -104,11 +120,27 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		// until the next informer resync, which defaults to 10 hours.
 		return reconcile.Result{RequeueAfter: time.Minute}, nil
 	}
-	if err := c.migrateHashVersion(ctx, nodeClass); err != nil {
-		return reconcile.Result{}, err
+	if migrationErr != nil {
+		return reconcile.Result{}, migrationErr
+	}
+	if len(ignored) > 0 && pending > 0 {
+		// What unblocks the migration (a drifted node replaced, its NodeClaim
+		// condition cleared) is no event on the NodeClass: without a recheck,
+		// LabelsIgnored would keep advising against removing the keys until
+		// the next informer resync.
+		return reconcile.Result{RequeueAfter: hashMigrationRecheck}, nil
 	}
 	return reconcile.Result{}, nil
 }
+
+// pendingUnknown is migrateHashVersion's count of NodeGroups still on an older
+// hash generation when it could not list them: how many there are is unknown.
+const pendingUnknown = -1
+
+// hashMigrationRecheck is how often a NodeClass carrying ignored keys is
+// reconciled while some of its NodeGroups still carry an older hash
+// generation.
+const hashMigrationRecheck = time.Minute
 
 // migrateHashVersion re-stamps NodeGroups carrying an older generation of
 // Hash() with the current one, so that nodes built under an older generation
@@ -132,14 +164,22 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 // NodeClaim is ALREADY Drifted keeps its stamp whatever the hashes say, so the
 // migration can never cancel a replacement in flight; a later pass migrates it
 // if the condition clears.
-func (c *Controller) migrateHashVersion(ctx context.Context, nodeClass *v1alpha1.CleverNodeClass) error {
+//
+// It returns how many NodeGroups of the NodeClass still carry a generation this
+// controller knows and were not re-stamped: the NodeClass changed since they
+// were built, their NodeClaim is already Drifted, or a read or the write
+// failed. Older generations hashed labels v3 leaves out (v0.12.0 hashed every
+// label), so removing an ignored key drifts exactly those NodeGroups. The count
+// is pendingUnknown when the NodeGroups could not be listed.
+func (c *Controller) migrateHashVersion(ctx context.Context, nodeClass *v1alpha1.CleverNodeClass) (int, error) {
 	nodeGroups := &ngv1.NodeGroupList{}
 	if err := c.kubeClient.List(ctx, nodeGroups, client.MatchingLabels{
 		v1alpha1.ManagedLabelKey:   "true",
 		v1alpha1.NodeClassLabelKey: nodeClass.Name,
 	}); err != nil {
-		return err
+		return pendingUnknown, err
 	}
+	pending := 0
 	var errs []error
 	for i := range nodeGroups.Items {
 		ng := &nodeGroups.Items[i]
@@ -159,15 +199,18 @@ func (c *Controller) migrateHashVersion(ctx context.Context, nodeClass *v1alpha1
 			continue
 		}
 		if !match {
+			pending++
 			logger.Info("clevernodeclass changed since this nodegroup was created; keeping its hash so the node drifts")
 			continue
 		}
 		drifted, err := c.nodeClaimDrifted(ctx, ng)
 		if err != nil {
+			pending++
 			errs = append(errs, err)
 			continue
 		}
 		if drifted {
+			pending++
 			logger.Info("nodeclaim is already drifted; keeping the nodegroup's hash")
 			continue
 		}
@@ -175,12 +218,15 @@ func (c *Controller) migrateHashVersion(ctx context.Context, nodeClass *v1alpha1
 		ng.Annotations[v1alpha1.NodeClassHashLabelKey] = nodeClass.Hash()
 		ng.Annotations[v1alpha1.NodeClassHashVersionAnnotationKey] = v1alpha1.NodeClassHashVersion
 		if err := c.kubeClient.Patch(ctx, ng, client.MergeFrom(stored)); err != nil {
-			errs = append(errs, client.IgnoreNotFound(err))
+			if !errors.IsNotFound(err) {
+				pending++
+				errs = append(errs, err)
+			}
 			continue
 		}
 		logger.Info("migrated nodegroup to the current clevernodeclass hash version", "to", v1alpha1.NodeClassHashVersion)
 	}
-	return goerrors.Join(errs...)
+	return pending, goerrors.Join(errs...)
 }
 
 // nodeClaimDrifted reports whether the NodeClaim backing this NodeGroup already
@@ -231,12 +277,71 @@ func (c *Controller) finalize(ctx context.Context, nodeClass *v1alpha1.CleverNod
 // shared with the NodeGroup label filter: anything that filter would drop must
 // be rejected here, because NodeClass labels have no registration-sync
 // fallback.
-func validate(nodeClass *v1alpha1.CleverNodeClass) error {
-	for k, v := range nodeClass.Spec.Labels {
-		if err := v1alpha1.ValidateNodeClassLabel(k, v); err != nil {
-			return err
+//
+// The one exception is a key v0.12.0 accepted (v1alpha1.IsLegacyNodeClassLabel):
+// rejecting it would stop provisioning, on upgrade, from a NodeClass that has
+// provisioned for months. It is returned in ignored, sorted, instead of failing
+// validation. err is the first other rejection, in key order so that the
+// condition message does not flap between reconciles.
+func validate(nodeClass *v1alpha1.CleverNodeClass) (ignored []string, err error) {
+	for _, k := range slices.Sorted(maps.Keys(nodeClass.Spec.Labels)) {
+		v := nodeClass.Spec.Labels[k]
+		rejection := v1alpha1.ValidateNodeClassLabel(k, v)
+		switch {
+		case rejection == nil:
+		case v1alpha1.IsLegacyNodeClassLabel(k, v):
+			ignored = append(ignored, k)
+		case err == nil:
+			err = rejection
 		}
 	}
+	return ignored, err
+}
+
+// reportIgnoredLabels surfaces the legacy keys validate tolerated, without
+// touching readiness: the LabelsIgnored condition is the persistent signal
+// (set while they remain, removed with them), and a Warning event on the
+// NodeClass makes them visible in kubectl get events after the upgrade. The
+// event is published on every reconcile that finds them — at controller start
+// and on every change — deduplicated per reason and key set for an hour, so
+// the status write this reconcile triggers does not repeat it.
+//
+// The advice depends on the hash migration (pending, from migrateHashVersion):
+// a NodeGroup still stamped by v0.12.0 or earlier carries a hash of these keys,
+// so removing them drifts it. Only when none is left does the condition say
+// that removing them drifts no node (reason LegacyLabelKeys); until then it
+// says how many would (reason HashMigrationPending).
+func (c *Controller) reportIgnoredLabels(ctx context.Context, nodeClass *v1alpha1.CleverNodeClass, ignored []string, pending int) error {
+	if len(ignored) == 0 {
+		return nodeClass.StatusConditions().Clear(v1alpha1.ConditionTypeLabelsIgnored)
+	}
+	reason, advice := "LegacyLabelKeys", "Remove them: no node drifts for it"
+	switch {
+	case pending == pendingUnknown:
+		reason, advice = "HashMigrationPending", fmt.Sprintf("Do not remove them yet: the NodeGroups of the NodeClass could not be "+
+			"listed, so whether some are still stamped with a hash version older than %s (annotation %s), which hashed them, is unknown",
+			v1alpha1.NodeClassHashVersion, v1alpha1.NodeClassHashVersionAnnotationKey)
+	case pending > 0:
+		reason, advice = "HashMigrationPending", fmt.Sprintf("Do not remove them yet: removing them now drifts the %d NodeGroup(s) "+
+			"of the NodeClass still stamped with a hash version older than %s (annotation %s), which hashed them; the reason of "+
+			"this condition turns LegacyLabelKeys once none is left",
+			pending, v1alpha1.NodeClassHashVersion, v1alpha1.NodeClassHashVersionAnnotationKey)
+	}
+	msg := fmt.Sprintf("ignored spec.labels keys: %s. No node launched now gets them (the NodeGroup payload carries no key "+
+		"in the kubernetes.io/ or karpenter.sh domains); v0.12.0 accepted them, so the NodeClass stays Ready, but the CRD "+
+		"refuses them on new NodeClasses and on any edit of spec.labels that keeps them. %s",
+		strings.Join(ignored, ", "), advice)
+	if nodeClass.StatusConditions().SetTrueWithReason(v1alpha1.ConditionTypeLabelsIgnored, reason, msg) {
+		log.FromContext(ctx).WithValues("keys", ignored, "reason", reason).Info("ignoring clevernodeclass label keys accepted up to v0.12.0 that are not delivered to nodes")
+	}
+	c.recorder.Publish(events.Event{
+		InvolvedObject: nodeClass,
+		Type:           corev1.EventTypeWarning,
+		Reason:         "LabelsIgnored",
+		Message:        msg,
+		DedupeValues:   append([]string{nodeClass.Name, reason}, ignored...),
+		DedupeTimeout:  time.Hour,
+	})
 	return nil
 }
 

@@ -30,6 +30,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -38,6 +39,7 @@ import (
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	cloudprovider "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/cloudprovider"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodeclass"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
@@ -680,6 +682,83 @@ func TestCreateVanishedNodeGroupReturnsInsufficientCapacity(t *testing.T) {
 	<-done
 	if !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected InsufficientCapacityError on vanish, got %T: %v", err, err)
+	}
+}
+
+// TestLegacyNodeClassLabelKeepsProvisioningWithoutDelivery drives the upgrade
+// trap of a key v0.12.0 accepted and the shared label rule now rejects,
+// through the real nodeclass controller and Create. Failing its validation
+// made the NodeClass NotReady and Create refused every launch from it, so
+// provisioning stopped for every NodePool using it; and the only way out,
+// removing the key, drifted every node although no NodeGroup payload changed.
+// Now the NodeClass launches, the key stays out of the payload and of the hash
+// stamped next to it, and removing it drifts nothing — whatever the syntax of
+// its value, which v0.12.0 never checked for a key it did not deliver.
+func TestLegacyNodeClassLabelKeepsProvisioningWithoutDelivery(t *testing.T) {
+	for key, value := range map[string]string{
+		"app.kubernetes.io/part-of":  "shop",
+		"app.kubernetes.io/name":     "My Platform",
+		"karpenter.sh/capacity-type": "on-demand",
+	} {
+		t.Run(key, func(t *testing.T) {
+			ctx := context.Background()
+			// As v0.12.0 left it: admitted, and Ready.
+			nodeClass := readyNodeClass("default")
+			nodeClass.Spec.Labels = map[string]string{"team": "data", key: value}
+			cp, kubeClient := newTestProvider(t, nodeClass)
+			reconcileNodeClass := func() {
+				t.Helper()
+				if _, err := nodeclass.NewController(kubeClient, noopRecorder{}).Reconcile(ctx,
+					reconcile.Request{NamespacedName: types.NamespacedName{Name: "default"}}); err != nil {
+					t.Fatalf("reconciling nodeclass: %v", err)
+				}
+			}
+			reconcileNodeClass()
+
+			nodeClaim := testNodeClaim("default-legacy")
+			done := setStatusOnceCreated(t, kubeClient, nodeClaim.Name, syncedStatus())
+			created, err := cp.Create(ctx, nodeClaim)
+			if err != nil {
+				// Before waiting on done: a refused launch creates no group,
+				// and the status writer would wait for one forever.
+				t.Fatalf("Create from a NodeClass carrying legacy key %s: %v — provisioning stops on upgrade", key, err)
+			}
+			<-done
+			ng := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaim.Name}, ng); err != nil {
+				t.Fatalf("getting nodegroup: %v", err)
+			}
+			if _, ok := ng.Spec.Labels[key]; ok {
+				t.Errorf("legacy key %s reached the NodeGroup payload: %v", key, ng.Spec.Labels)
+			}
+			if ng.Spec.Labels["team"] != "data" {
+				t.Errorf("delivered label team lost from the NodeGroup payload: %v", ng.Spec.Labels)
+			}
+			delivered := readyNodeClass("default")
+			delivered.Spec.Labels = map[string]string{"team": "data"}
+			if got := ng.Annotations[v1alpha1.NodeClassHashLabelKey]; got != delivered.Hash() {
+				t.Errorf("the stamped hash %q does not describe the payload (want %q, the hash without %s)", got, delivered.Hash(), key)
+			}
+
+			// The way out: remove the key.
+			current := &v1alpha1.CleverNodeClass{}
+			if err := kubeClient.Get(ctx, types.NamespacedName{Name: "default"}, current); err != nil {
+				t.Fatal(err)
+			}
+			current.Spec.Labels = map[string]string{"team": "data"}
+			if err := kubeClient.Update(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			reconcileNodeClass()
+			nodeClaim.Status.ProviderID = created.Status.ProviderID
+			reason, err := cp.IsDrifted(ctx, nodeClaim)
+			if err != nil {
+				t.Fatalf("IsDrifted: %v", err)
+			}
+			if reason != "" {
+				t.Errorf("IsDrifted = %q after removing %s, which never reached the node", reason, key)
+			}
+		})
 	}
 }
 
