@@ -86,16 +86,17 @@ var (
 	// well-formed as far as this provider knows, and the flavor is held out of
 	// provisioning for a few minutes so the scheduler relaxes to another one.
 	// Refusals published after the acceptance poll, which the nodegroupstatus
-	// controller turns into a failed launch, count too. A failure the operator
-	// retries on its own (UpstreamError) is not a refusal and is not counted
-	// here.
+	// controller turns into a failed launch, count too, and so do creations
+	// the API server refused at admission because the NodeGroup CRD's enum
+	// does not carry their flavor. A failure the operator retries on its own
+	// (UpstreamError) is not a refusal and is not counted here.
 	NodeGroupRejections = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "nodegroup",
 			Name:      "rejections_total",
-			Help:      "NodeGroup creations refused by the node-group operator for a non-quota reason. The refused flavor is held out of provisioning briefly.",
+			Help:      "NodeGroup creations refused by the node-group operator for a non-quota reason, or refused at admission for their flavor. The refused flavor is held out of provisioning briefly.",
 		},
 		nil,
 	)

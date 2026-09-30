@@ -124,15 +124,22 @@ settings:
     nodeRepair: false
   # -- Per-flavor overrides overlaid on top of the built-in catalogue (the
   # 2XS…XL seed). Leave empty to use the built-in catalogue unchanged. Each
-  # entry needs a `name` (as accepted by the Clever Cloud NodeGroup API,
-  # uppercase); `cpu` (vCPUs) and `memoryKi` (kernel-visible memory in KiB)
-  # are OPTIONAL — set only the fields you want to pin, the rest fall through
-  # to the built-in value. A name absent from the built-in catalogue must
-  # supply both. There is no price field: every flavor's price is a unitless
-  # cost derived from its cpu and memoryKi (2XS = 1), so pinning memoryKi
-  # reprices the flavor. Pin every flavor the same way, or none: a single
-  # pinned flavor can make consolidation rank sets of nodes differently from
-  # what CKE bills (see the README's Flavor catalogue). Overrides always win.
+  # entry needs a `name`, uppercase as the Clever Cloud NodeGroup API takes
+  # it; `cpu` (vCPUs) and `memoryKi` (kernel-visible memory in KiB) are
+  # OPTIONAL — set only the fields you want to pin, the rest fall through to
+  # the built-in value. A name absent from the built-in catalogue adds a
+  # flavor: it must supply both, and follow Clever Cloud's naming (M, or S or
+  # L optionally prefixed by X or 2X to 9X, such as 2XL) — helm refuses any
+  # other name (2xs, CUSTOM), which the NodeGroup API could never create. That
+  # API accepts only 2XS…XL today (the NodeGroup CRD's spec.flavor enum), so
+  # add a flavor only once the enum carries it: until then every launch on it
+  # is refused, and it is held out of provisioning 5 minutes at a time
+  # (NodeGroupRejected event). There is no price field: every flavor's price
+  # is a unitless cost derived from its cpu and memoryKi (2XS = 1), so
+  # pinning memoryKi reprices the flavor. Pin every flavor the same way, or
+  # none: a single pinned flavor can make consolidation rank sets of nodes
+  # differently from what CKE bills (see the README's Flavor catalogue).
+  # Overrides always win.
   # At runtime nodes of the controller's own NodeGroups correct the memory
   # (the smallest node of a flavor wins; prices do not follow), but only
   # within 10% of the entry and with the same cpu: a pin further off is

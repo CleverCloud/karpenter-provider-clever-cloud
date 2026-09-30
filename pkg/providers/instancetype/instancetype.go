@@ -33,6 +33,8 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/samber/lo"
@@ -178,6 +180,39 @@ func RelativePrice(cpu, memoryKi int64) float64 {
 	return math.Round(price*1e4) / 1e4
 }
 
+// FlavorNamePattern is the shape of a Clever Cloud flavor name, which every
+// settings.flavors override name must have (ParseFlavorOverrides; the chart's
+// values.schema.json carries the same pattern). Clever Cloud names its flavors
+// as T-shirt sizes: S, M and L, with S and L extended by an X prefix that a
+// digit multiplies. The NodeGroup API's spec.flavor is an uppercase-only enum
+// of 2XS, XS, S, M, L and XL, and Clever Cloud's application instances carry
+// the same scheme on to 2XL and 3XL. Nothing of another shape can ever be
+// created: a case typo (2xs), a made-up name (CUSTOM) or a spelling the
+// platform does not use (XXL for 2XL) would enter the catalogue, could win
+// cheapest-first, and fail every launch at admission. A new name of that
+// shape stays possible, so a flavor Clever Cloud adds (2XL) can be declared
+// before a release of this provider carries it; until the NodeGroup API
+// accepts it, nodegroup.Provider.Create turns the admission refusal into a
+// held-out flavor.
+const FlavorNamePattern = `^(M|([2-9]?X)?[SL])$`
+
+var flavorNameRegexp = regexp.MustCompile(FlavorNamePattern)
+
+// flavorNameError explains why name cannot be a Clever Cloud flavor, naming
+// the uppercase spelling when that one could be.
+func flavorNameError(name string) error {
+	if upper := strings.ToUpper(name); flavorNameRegexp.MatchString(upper) {
+		return fmt.Errorf("flavor %q: Clever Cloud flavor names are uppercase, did you mean %q?", name, upper)
+	}
+	builtin := make([]string, 0, len(FlavorSizing))
+	for _, s := range FlavorSizing {
+		builtin = append(builtin, s.Name)
+	}
+	return fmt.Errorf("flavor %q cannot be a Clever Cloud flavor: the NodeGroup API accepts %s, "+
+		"and a new flavor must follow the same naming (M, or S or L optionally prefixed by X or 2X to 9X, such as 2XL)",
+		name, strings.Join(builtin, ", "))
+}
+
 // FlavorOverride is a partial, per-flavor override loaded from settings.flavors
 // (FLAVORS_CONFIG_PATH). Only Name is required; CPU and MemoryKi are optional
 // and, when set, replace the corresponding value from the base catalog (the
@@ -277,10 +312,11 @@ func LoadFlavorsOrDegrade(path string) []FlavorOverride {
 // a silent no-op instead of the operator's intended pin. The same rule
 // refuses the priceHourly key earlier releases accepted: prices are derived
 // now, and a file that still sets one is invalid as a whole rather than
-// applied without it. Each entry must have a non-empty, unique name; any
-// field that is set must be > 0. A name outside the static sizing seed
-// introduces a new flavor and must set both cpu and memoryKi, which are all
-// it is sized and priced from. The list must not be empty.
+// applied without it. Each entry must have a unique name of a Clever Cloud
+// flavor's shape (FlavorNamePattern), and any field that is set must be > 0.
+// A name outside the static sizing seed introduces a new flavor and must set
+// both cpu and memoryKi, which are all it is sized and priced from. The list
+// must not be empty.
 func ParseFlavorOverrides(data []byte) ([]FlavorOverride, error) {
 	var overrides []FlavorOverride
 	if err := yaml.UnmarshalStrict(data, &overrides); err != nil {
@@ -293,6 +329,9 @@ func ParseFlavorOverrides(data []byte) ([]FlavorOverride, error) {
 	for i, o := range overrides {
 		if o.Name == "" {
 			return nil, fmt.Errorf("flavor[%d]: name must not be empty", i)
+		}
+		if !flavorNameRegexp.MatchString(o.Name) {
+			return nil, flavorNameError(o.Name)
 		}
 		if _, dup := seen[o.Name]; dup {
 			return nil, fmt.Errorf("flavor %q: duplicate name", o.Name)

@@ -40,6 +40,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	sigsyaml "sigs.k8s.io/yaml"
+
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 )
 
 const (
@@ -236,6 +238,17 @@ func TestLegacyPricingValuesAreIgnored(t *testing.T) {
 	})
 }
 
+// helmTemplateValues renders charts/karpenter with the given values file
+// content; like helmTemplateArgs, it returns a refused render as an error.
+func helmTemplateValues(t *testing.T, values string) (string, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "values.yaml")
+	if err := os.WriteFile(path, []byte(values), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return helmTemplateArgs(t, "--values", path)
+}
+
 // TestFlavorPriceHourlyIsRefused pins the opposite choice for a key removed
 // from settings.flavors. Prices are derived from cpu and memoryKi now, and the
 // controller refuses a whole overrides file that still sets priceHourly: it
@@ -244,17 +257,8 @@ func TestLegacyPricingValuesAreIgnored(t *testing.T) {
 // fails loudly instead of rolling out a controller that silently lost them.
 // The same override without it must keep rendering into the ConfigMap.
 func TestFlavorPriceHourlyIsRefused(t *testing.T) {
-	render := func(t *testing.T, values string) (string, error) {
-		t.Helper()
-		path := filepath.Join(t.TempDir(), "values.yaml")
-		if err := os.WriteFile(path, []byte(values), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return helmTemplateArgs(t, "--values", path)
-	}
-
 	t.Run("legacy priceHourly", func(t *testing.T) {
-		out, err := render(t, "settings:\n  flavors:\n    - name: M\n      memoryKi: 15229256\n      priceHourly: 0.1167\n")
+		out, err := helmTemplateValues(t, "settings:\n  flavors:\n    - name: M\n      memoryKi: 15229256\n      priceHourly: 0.1167\n")
 		if err == nil {
 			t.Fatal("a settings.flavors entry carrying priceHourly must fail values.schema.json validation, " +
 				"but it rendered: the controller would then refuse the whole overrides file")
@@ -265,7 +269,7 @@ func TestFlavorPriceHourlyIsRefused(t *testing.T) {
 	})
 
 	t.Run("cpu and memoryKi only", func(t *testing.T) {
-		out, err := render(t, "settings:\n  flavors:\n    - name: M\n      memoryKi: 15229256\n")
+		out, err := helmTemplateValues(t, "settings:\n  flavors:\n    - name: M\n      memoryKi: 15229256\n")
 		if err != nil {
 			t.Fatalf("a valid override must render: %v\n%s", err, out)
 		}
@@ -273,6 +277,61 @@ func TestFlavorPriceHourlyIsRefused(t *testing.T) {
 			t.Errorf("the override did not reach the flavors ConfigMap:\n%s", out)
 		}
 	})
+}
+
+// TestFlavorNamesMirrorTheController pins values.schema.json to the controller
+// on settings.flavors names. The controller refuses a whole overrides file
+// holding a name the NodeGroup API can never accept (2xs, CUSTOM): served, it
+// would fail every launch it won. The schema must refuse exactly those names,
+// so that `helm upgrade` fails on them instead of rolling out a controller
+// that runs without any of the operator's overrides — and must accept every
+// name the controller does, or a valid pin would be refused.
+func TestFlavorNamesMirrorTheController(t *testing.T) {
+	t.Run("same pattern", func(t *testing.T) {
+		raw, err := os.ReadFile(filepath.Join(repoRoot(t), "charts", "karpenter", "values.schema.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var schema struct {
+			Properties struct {
+				Settings struct {
+					Properties struct {
+						Flavors struct {
+							Items struct {
+								Properties struct {
+									Name struct {
+										Pattern string `json:"pattern"`
+									} `json:"name"`
+								} `json:"properties"`
+							} `json:"items"`
+						} `json:"flavors"`
+					} `json:"properties"`
+				} `json:"settings"`
+			} `json:"properties"`
+		}
+		if err := sigsyaml.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("decoding values.schema.json: %v", err)
+		}
+		if got := schema.Properties.Settings.Properties.Flavors.Items.Properties.Name.Pattern; got != instancetype.FlavorNamePattern {
+			t.Errorf("settings.flavors[].name pattern = %q, want the controller's %q", got, instancetype.FlavorNamePattern)
+		}
+	})
+
+	for _, name := range []string{"2XS", "XS", "S", "M", "L", "XL", "2XL", "2xs", "m", "CUSTOM", "XXL"} {
+		t.Run(name, func(t *testing.T) {
+			entry := "- name: " + name + "\n  cpu: 20\n  memoryKi: 46137344\n"
+			_, parseErr := instancetype.ParseFlavorOverrides([]byte(entry))
+			out, renderErr := helmTemplateValues(t, "settings:\n  flavors:\n  "+strings.ReplaceAll(entry, "\n  ", "\n    "))
+			switch {
+			case parseErr == nil && renderErr != nil:
+				t.Errorf("the controller accepts %q but the chart refuses it:\n%s", name, out)
+			case parseErr != nil && renderErr == nil:
+				t.Errorf("the controller refuses %q (%v) but the chart renders it", name, parseErr)
+			case renderErr != nil && !strings.Contains(out, "does not match pattern"):
+				t.Errorf("expected a pattern violation for %q, got:\n%s", name, out)
+			}
+		})
+	}
 }
 
 // TestDefaultPlacementIsTopologyIndependent is the regression lock: the

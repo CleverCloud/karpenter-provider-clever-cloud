@@ -740,8 +740,8 @@ func TestParseFlavorOverridesRequiresCompleteNewFlavor(t *testing.T) {
 	// A name outside the seed introduces a new flavor: cpu and memoryKi are
 	// all it can be sized and priced from.
 	for name, data := range map[string]string{
-		"without memoryKi": "- name: CUSTOM\n  cpu: 2\n",
-		"without cpu":      "- name: CUSTOM\n  memoryKi: 2097152\n",
+		"without memoryKi": "- name: 2XL\n  cpu: 20\n",
+		"without cpu":      "- name: 2XL\n  memoryKi: 46137344\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := instancetype.ParseFlavorOverrides([]byte(data)); err == nil {
@@ -749,8 +749,65 @@ func TestParseFlavorOverridesRequiresCompleteNewFlavor(t *testing.T) {
 			}
 		})
 	}
-	if _, err := instancetype.ParseFlavorOverrides([]byte("- name: CUSTOM\n  cpu: 2\n  memoryKi: 2097152\n")); err != nil {
+	if _, err := instancetype.ParseFlavorOverrides([]byte("- name: 2XL\n  cpu: 20\n  memoryKi: 46137344\n")); err != nil {
 		t.Fatalf("complete new flavor must parse: %v", err)
+	}
+}
+
+// TestParseFlavorOverridesRejectsNamesThePlatformCannotCreate pins the name
+// rule. The NodeGroup API's spec.flavor is an uppercase-only enum (2XS, XS, S,
+// M, L, XL). A name of another shape used to parse: complete with cpu and
+// memoryKi it entered the catalogue, could win cheapest-first (the README
+// example CUSTOM did), and every launch on it was refused at admission, so
+// karpenter re-planned onto it forever. A new name of the platform's shape
+// stays accepted: that is how a flavor Clever Cloud adds is declared before a
+// release carries it.
+func TestParseFlavorOverridesRejectsNamesThePlatformCannotCreate(t *testing.T) {
+	t.Run("built-in names", func(t *testing.T) {
+		// The chart's values.schema.json only carries the pattern: it must
+		// admit every built-in flavor, or helm would refuse a valid pin.
+		for _, s := range instancetype.FlavorSizing {
+			if _, err := instancetype.ParseFlavorOverrides([]byte("- name: " + s.Name + "\n  memoryKi: 1048576\n")); err != nil {
+				t.Errorf("built-in flavor %s must be accepted: %v", s.Name, err)
+			}
+		}
+	})
+
+	t.Run("new names of the platform's shape", func(t *testing.T) {
+		for _, name := range []string{"2XL", "3XL", "9XL", "3XS"} {
+			if _, err := instancetype.ParseFlavorOverrides([]byte("- name: " + name + "\n  cpu: 20\n  memoryKi: 46137344\n")); err != nil {
+				t.Errorf("new flavor %s must be accepted: %v", name, err)
+			}
+		}
+	})
+
+	// A case mismatch names the spelling the platform would accept.
+	for name, want := range map[string]string{"2xs": "2XS", "xl": "XL", "m": "M", "2Xl": "2XL"} {
+		t.Run("case mismatch "+name, func(t *testing.T) {
+			_, err := instancetype.ParseFlavorOverrides([]byte("- name: " + name + "\n  cpu: 20\n  memoryKi: 46137344\n"))
+			if err == nil {
+				t.Fatalf("expected %q to be refused: the NodeGroup API only accepts uppercase flavors", name)
+			}
+			if suggestion := `did you mean "` + want + `"?`; !strings.Contains(err.Error(), suggestion) {
+				t.Errorf("error must suggest the uppercase spelling (%s), got: %v", suggestion, err)
+			}
+		})
+	}
+
+	// Anything else can never be a Clever Cloud flavor, whatever its case.
+	for _, name := range []string{"CUSTOM", "custom", "XXL", "XXS", "XM", "1XL", "10XL", "X", "2X", "SM", "M ", "gp-4"} {
+		t.Run("not a flavor name "+name, func(t *testing.T) {
+			_, err := instancetype.ParseFlavorOverrides([]byte("- name: \"" + name + "\"\n  cpu: 20\n  memoryKi: 46137344\n"))
+			if err == nil {
+				t.Fatalf("expected %q to be refused: the NodeGroup API can never create it", name)
+			}
+			if strings.Contains(err.Error(), "did you mean") {
+				t.Errorf("no spelling of %q is a flavor name, nothing to suggest: %v", name, err)
+			}
+			if !strings.Contains(err.Error(), "2XS, XS, S, M, L, XL") {
+				t.Errorf("error must list the flavors the NodeGroup API accepts: %v", err)
+			}
+		})
 	}
 }
 
@@ -861,6 +918,10 @@ func TestLoadFlavorsOrDegradeNeverFails(t *testing.T) {
 		// whole file is refused, its memoryKi pin included, and the gauge
 		// tells the operator to remove the key.
 		"legacy priceHourly key degrades": "- name: M\n  memoryKi: 15988992\n  priceHourly: 0.1167\n",
+		// A flavor the NodeGroup API can never create: served, it would fail
+		// every launch it won. The whole file is refused, like any other
+		// invalid one.
+		"name the platform cannot create degrades": "- name: M\n  memoryKi: 15988992\n- name: CUSTOM\n  cpu: 2\n  memoryKi: 2097152\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "flavors.yaml")

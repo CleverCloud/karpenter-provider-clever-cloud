@@ -107,8 +107,9 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 			// re-plans over the same offerings. What makes the re-plan land
 			// elsewhere is the nodegroup provider having recorded the refusal,
 			// which GetInstanceTypes reports as unavailable offerings (the
-			// quota-rejected flavor and every larger one, or the refused
-			// flavor) — the only channel back to core's scheduler.
+			// quota-rejected flavor and every larger one, or the flavor refused
+			// by the upstream operator or at admission, a flavor outside the
+			// NodeGroup CRD's enum) — the only channel back to core's scheduler.
 			return nil, cloudprovider.NewInsufficientCapacityError(err)
 		}
 		return nil, err
@@ -244,8 +245,9 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 // every flavor, with Available=false on the offerings of the flavors a launch
 // is known to fail for right now (nodegroup.Provider.Unavailable): a flavor
 // the organisation quota rejected for the quota backoff, and every flavor at
-// least as large for twice as long; a flavor the operator refused, for its
-// hold-out. Core keeps no memory of an InsufficientCapacityError, so without
+// least as large for twice as long; a flavor the operator refused, or the API
+// server's admission refused (a settings.flavors name the NodeGroup CRD's enum
+// does not carry), for its hold-out. Core keeps no memory of an InsufficientCapacityError, so without
 // this its scheduler rebuilds the claim that was just rejected on every pass,
 // and a weighted NodePool never falls back to the next one. No flavor is ever
 // left out: core's InstanceTypeNotFound drift ignores availability but not
