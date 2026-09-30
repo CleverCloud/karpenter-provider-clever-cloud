@@ -99,16 +99,16 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		quotaErr := &nodegroup.ErrQuotaExceeded{}
 		rejectedErr := &nodegroup.ErrFlavorRejected{}
 		if errors.As(err, &quotaErr) || errors.As(err, &rejectedErr) || errors.Is(err, nodegroup.ErrNodeGroupVanished) {
-			// Surfacing an InsufficientCapacityError lets the scheduler mark
-			// the offering unavailable and relax to other options instead of
-			// waiting out the 15min registration TTL. A vanish takes the same
-			// path: a plain error would make karpenter-core retry the SAME
-			// claim with the same flavor in a create→vanish loop that holds
-			// the creation mutex; ICE deletes the claim and re-plans. So does
-			// an upstream refusal of the flavor itself — core keeps no
-			// per-offering memory, so the provider holds the refused flavor out
-			// of resolveInstanceType for a few minutes to make the re-plan land
-			// somewhere else.
+			// An InsufficientCapacityError makes karpenter-core delete the
+			// claim and re-plan now instead of waiting out the 15min
+			// registration TTL; a plain error would retry the SAME claim with
+			// the same flavor (for a vanish, a create→vanish loop holding the
+			// creation mutex). Core remembers nothing of the error itself: it
+			// re-plans over the same offerings. What makes the re-plan land
+			// elsewhere is the nodegroup provider having recorded the refusal,
+			// which GetInstanceTypes reports as unavailable offerings (the
+			// quota-rejected flavor and every larger one, or the refused
+			// flavor) — the only channel back to core's scheduler.
 			return nil, cloudprovider.NewInsufficientCapacityError(err)
 		}
 		return nil, err
@@ -237,7 +237,34 @@ func (c *CloudProvider) resolveNodeGroupInstanceType(ctx context.Context, ng *ng
 }
 
 func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
-	return c.instanceTypeProvider.List(), nil
+	return c.instanceTypes(), nil
+}
+
+// instanceTypes is the catalogue as karpenter-core's scheduler must see it:
+// every flavor, with Available=false on the offerings of the flavors a launch
+// is known to fail for right now (nodegroup.Provider.Unavailable): a flavor
+// the organisation quota rejected for the quota backoff, and every flavor at
+// least as large for twice as long; a flavor the operator refused, for its
+// hold-out. Core keeps no memory of an InsufficientCapacityError, so without
+// this its scheduler rebuilds the claim that was just rejected on every pass,
+// and a weighted NodePool never falls back to the next one. No flavor is ever
+// left out: core's InstanceTypeNotFound drift ignores availability but not
+// presence, so dropping one would replace every node running it.
+//
+// Get and List describe running NodeGroups from the plain catalogue instead:
+// buildNodeClaim takes the claim's zone, region and capacity-type labels from
+// the first available offering.
+func (c *CloudProvider) instanceTypes() []*cloudprovider.InstanceType {
+	instanceTypes := c.instanceTypeProvider.List()
+	for _, it := range instanceTypes {
+		if !c.nodeGroupProvider.Unavailable(it.Name) {
+			continue
+		}
+		for _, o := range it.Offerings {
+			o.Available = false
+		}
+	}
+	return instanceTypes
 }
 
 func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim) (cloudprovider.DriftReason, error) {
@@ -303,29 +330,31 @@ func (c *CloudProvider) resolveNodeClassFromNodeClaim(ctx context.Context, nodeC
 	return nodeClass, nil
 }
 
-// resolveInstanceType picks the cheapest catalog flavor that satisfies the
-// NodeClaim's scheduling requirements and resource requests.
+// resolveInstanceType picks the cheapest available catalog flavor that
+// satisfies the NodeClaim's scheduling requirements and resource requests. It
+// reads the catalogue GetInstanceTypes serves, so a flavor the scheduler sees
+// unavailable is never launched: a claim planned before a rejection covered
+// its cheapest option falls to the next one, or fails fast with none.
 func (c *CloudProvider) resolveInstanceType(nodeClaim *karpv1.NodeClaim) (*cloudprovider.InstanceType, error) {
 	requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
-	// Flavors the upstream operator refused recently are held out: the
-	// catalogue is deliberately permissive (it offers every built-in flavor on
-	// every topology), so the refusal is the only signal that one of them is
-	// not usable on THIS cluster.
-	rejected := c.nodeGroupProvider.RejectedFlavors()
 	var best *cloudprovider.InstanceType
 	bestPrice := 0.0
-	for _, it := range c.instanceTypeProvider.List() {
-		if _, held := rejected[it.Name]; held {
-			continue
-		}
+	// Flavors that would serve the claim but are unavailable right now, so
+	// that a failure names that cause only when it is the cause.
+	unavailable := 0
+	for _, it := range c.instanceTypes() {
 		if it.Requirements.Intersects(requirements) != nil {
 			continue
 		}
 		if !resources.Fits(nodeClaim.Spec.Resources.Requests, it.Allocatable()) {
 			continue
 		}
-		offerings := it.Offerings.Available().Compatible(requirements)
+		compatible := it.Offerings.Compatible(requirements)
+		offerings := compatible.Available()
 		if len(offerings) == 0 {
+			if len(compatible) > 0 {
+				unavailable++
+			}
 			continue
 		}
 		price := offerings.Cheapest().Price
@@ -335,9 +364,9 @@ func (c *CloudProvider) resolveInstanceType(nodeClaim *karpv1.NodeClaim) (*cloud
 		}
 	}
 	if best == nil {
-		if len(rejected) > 0 {
-			return nil, fmt.Errorf("no clever cloud flavor satisfies the nodeclaim requirements and resource requests "+
-				"(%d flavor(s) currently held out after an upstream refusal)", len(rejected))
+		if unavailable > 0 {
+			return nil, fmt.Errorf("no available clever cloud flavor satisfies the nodeclaim requirements and resource requests "+
+				"(%d flavor(s) that would satisfy them are currently unavailable after a quota rejection or an upstream refusal)", unavailable)
 		}
 		return nil, fmt.Errorf("no clever cloud flavor satisfies the nodeclaim requirements and resource requests")
 	}

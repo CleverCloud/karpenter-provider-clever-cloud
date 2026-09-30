@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -85,7 +86,7 @@ func newTestControllerWithRecorder(t *testing.T, objs ...client.Object) (*garbag
 	recorder := &fakeRecorder{}
 	// The fake client serves as its own uncached reader: cache and API server
 	// agree in these tests. Staleness scenarios build the controller by hand.
-	return garbagecollection.NewController(kubeClient, kubeClient, nodegroup.NewProvider(kubeClient, recorder), recorder), kubeClient, recorder
+	return garbagecollection.NewController(kubeClient, kubeClient, nodegroup.NewProvider(kubeClient, recorder, nil, clock.RealClock{}), recorder), kubeClient, recorder
 }
 
 // managedNodeGroup builds a karpenter-managed NodeGroup backdated by age,
@@ -443,7 +444,7 @@ func TestReconcileConfirmsAbsenceUncachedBeforeDestroying(t *testing.T) {
 		testNodeClaim("claim-stale"),
 		&ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: "claim-nogroup"}, Spec: ngv1.NodeGroupSpec{Flavor: "2XS", NodeCount: 1}},
 	).Build()
-	ctrl := garbagecollection.NewController(cached, uncached, nodegroup.NewProvider(cached, recorder), recorder)
+	ctrl := garbagecollection.NewController(cached, uncached, nodegroup.NewProvider(cached, recorder, nil, clock.RealClock{}), recorder)
 
 	if _, err := ctrl.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -469,7 +470,7 @@ func TestReconcileConfirmsOwnerNamesUncached(t *testing.T) {
 	}
 	cached := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(ng).Build()
 	uncached := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(testNodeClaim("claim-owner")).Build()
-	ctrl := garbagecollection.NewController(cached, uncached, nodegroup.NewProvider(cached, recorder), recorder)
+	ctrl := garbagecollection.NewController(cached, uncached, nodegroup.NewProvider(cached, recorder, nil, clock.RealClock{}), recorder)
 
 	if _, err := ctrl.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -493,7 +494,7 @@ func TestReconcileContinuesPastDeleteFailures(t *testing.T) {
 		},
 	}).Build()
 	recorder := &fakeRecorder{}
-	ctrl := garbagecollection.NewController(kubeClient, kubeClient, nodegroup.NewProvider(kubeClient, recorder), recorder)
+	ctrl := garbagecollection.NewController(kubeClient, kubeClient, nodegroup.NewProvider(kubeClient, recorder, nil, clock.RealClock{}), recorder)
 
 	if _, err := ctrl.Reconcile(context.Background()); err == nil {
 		t.Fatal("expected the sweep to report the stuck deletion")

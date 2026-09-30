@@ -26,3 +26,21 @@ func SetQuotaCheckTimeout(d time.Duration) time.Duration {
 	quotaCheckTimeout = d
 	return prev
 }
+
+// FlavorBackoff is how long a refused flavor is held out.
+const FlavorBackoff = flavorBackoff
+
+// RejectedFlavors returns the flavors currently held out because the upstream
+// operator refused them, so tests can tell a hold-out from a quota rejection,
+// which Unavailable reports alike.
+func (p *Provider) RejectedFlavors() map[string]struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := map[string]struct{}{}
+	for flavor, hold := range p.rejectedFlavors {
+		if p.clock.Since(hold.at) < flavorBackoff {
+			out[flavor] = struct{}{}
+		}
+	}
+	return out
+}

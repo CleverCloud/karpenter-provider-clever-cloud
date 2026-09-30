@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -530,7 +531,8 @@ func (noopRecorder) Publish(...events.Event) {}
 // changed.
 func isDrifted(t *testing.T, kubeClient client.Client, nodeGroupName string) corecloudprovider.DriftReason {
 	t.Helper()
-	cp := cloudprovider.New(kubeClient, instancetype.NewProvider("par", nil, nil), nodegroup.NewProvider(kubeClient, noopRecorder{}))
+	itp := instancetype.NewProvider("par", nil, nil)
+	cp := cloudprovider.New(kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{}))
 	nodeClaim := testNodeClaim(nodeGroupName, "default")
 	nodeClaim.Status.ProviderID = nodegroup.ProviderID(nodeGroupName)
 	reason, err := cp.IsDrifted(context.Background(), nodeClaim)

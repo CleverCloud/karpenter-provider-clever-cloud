@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -41,6 +42,7 @@ import (
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodegroupstatus"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
@@ -90,6 +92,8 @@ type testEnv struct {
 	kubeClient client.WithWatch
 	provider   *nodegroup.Provider
 	recorder   *fakeRecorder
+	// clock times the provider's quota backoff and refusal hold-out.
+	clock *clocktesting.FakeClock
 }
 
 // newTestEnv builds the controller on a fake client that serves as its own
@@ -103,12 +107,14 @@ func newTestEnv(t *testing.T, objs ...client.Object) *testEnv {
 
 func newTestEnvWith(kubeClient client.WithWatch, uncached client.Reader) *testEnv {
 	recorder := &fakeRecorder{}
-	provider := nodegroup.NewProvider(kubeClient, recorder)
+	clk := clocktesting.NewFakeClock(time.Now())
+	provider := nodegroup.NewProvider(kubeClient, recorder, instancetype.NewProvider("par", nil, nil), clk)
 	return &testEnv{
 		ctrl:       nodegroupstatus.NewController(kubeClient, uncached, provider, recorder),
 		kubeClient: kubeClient,
 		provider:   provider,
 		recorder:   recorder,
+		clock:      clk,
 	}
 }
 
@@ -136,12 +142,12 @@ func (e *testEnv) reconcile(t *testing.T, name string) reconcile.Result {
 }
 
 // quotaBackoffArmed reports whether the provider's quota backoff fails the
-// next Create fast, which is what karpenter's re-plan after a failed launch
-// runs into.
+// next Create of the flavor launchedGroup uses fast, which is what karpenter's
+// re-plan after a failed launch runs into.
 func (e *testEnv) quotaBackoffArmed(t *testing.T) bool {
 	t.Helper()
 	nodeClass := &v1alpha1.CleverNodeClass{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
-	_, err := e.provider.Create(context.Background(), launchedClaim("probe"), nodeClass, "2XS")
+	_, err := e.provider.Create(context.Background(), launchedClaim("probe"), nodeClass, "XS")
 	var quotaErr *nodegroup.ErrQuotaExceeded
 	switch {
 	case errors.As(err, &quotaErr):
@@ -152,6 +158,17 @@ func (e *testEnv) quotaBackoffArmed(t *testing.T) bool {
 		t.Fatalf("probing the quota backoff: unexpected Create result %v", err)
 		return false
 	}
+}
+
+// anyUnavailable reports whether the provider reports any catalogue flavor
+// unavailable, after a quota rejection or a refusal alike.
+func (e *testEnv) anyUnavailable() bool {
+	for _, f := range instancetype.DefaultFlavors {
+		if e.provider.Unavailable(f.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *testEnv) nodeClaimExists(t *testing.T, name string) bool {
@@ -287,8 +304,17 @@ func TestReconcileFailsLaunchRejectedByQuotaAfterThePoll(t *testing.T) {
 	if !env.quotaBackoffArmed(t) {
 		t.Error("expected the late quota rejection to arm the quota backoff, like one seen within the poll")
 	}
-	if len(env.provider.RejectedFlavors()) != 0 {
-		t.Errorf("a quota rejection must not hold a flavor out, got %v", env.provider.RejectedFlavors())
+	// And the scheduler sees it, sized as one seen within the poll: the
+	// rejected XS and every larger flavor unavailable, 2XS still available.
+	if !env.provider.Unavailable("XS") || !env.provider.Unavailable("M") || env.provider.Unavailable("2XS") {
+		t.Errorf("unavailable after a late quota rejection of XS: XS=%v M=%v 2XS=%v, want true, true, false",
+			env.provider.Unavailable("XS"), env.provider.Unavailable("M"), env.provider.Unavailable("2XS"))
+	}
+	// A quota rejection, not a hold-out: once the quota backoff has passed,
+	// XS is launchable again.
+	env.clock.Step(nodegroup.QuotaBackoff)
+	if env.provider.Unavailable("XS") {
+		t.Error("a quota rejection must not hold its flavor out beyond the quota backoff")
 	}
 	if delta := metricstest.Value(t, quotaRejections) - quotaBefore; delta != 1 {
 		t.Errorf("quota_rejections_total delta = %v, want 1", delta)
@@ -315,8 +341,10 @@ func TestReconcileFailsLaunchRefusedAfterThePoll(t *testing.T) {
 	if env.nodeClaimExists(t, "claim-refused") {
 		t.Error("expected the nodeclaim of the refused group to be deleted so karpenter re-plans")
 	}
-	if _, held := env.provider.RejectedFlavors()["XS"]; !held {
-		t.Errorf("expected the refused flavor to be held out, got %v", env.provider.RejectedFlavors())
+	// Held out alone: a refusal is a verdict on the flavor, not on capacity.
+	if !env.provider.Unavailable("XS") || env.provider.Unavailable("M") {
+		t.Errorf("unavailable after a late refusal of XS: XS=%v M=%v, want true, false",
+			env.provider.Unavailable("XS"), env.provider.Unavailable("M"))
 	}
 	if env.quotaBackoffArmed(t) {
 		t.Error("a refusal that is not the quota must not arm the quota backoff")
@@ -458,7 +486,7 @@ func TestReconcileLeavesUnfollowedLaunchesAlone(t *testing.T) {
 			if !env.nodeClaimExists(t, "claim") {
 				t.Fatal("expected the nodeclaim to be kept")
 			}
-			if env.quotaBackoffArmed(t) || len(env.provider.RejectedFlavors()) != 0 {
+			if env.quotaBackoffArmed(t) || env.anyUnavailable() {
 				t.Error("expected no quota backoff and no flavor hold-out")
 			}
 			if metricstest.Value(t, quotaRejections) != quotaBefore || metricstest.Value(t, rejections) != rejectionsBefore {
@@ -566,7 +594,7 @@ func TestReconcileSurfacesATransientFailureWithoutFailingTheLaunch(t *testing.T)
 	if !env.nodeClaimExists(t, "claim-upstream") {
 		t.Fatal("a transient failure must not fail the launch")
 	}
-	if len(env.provider.RejectedFlavors()) != 0 || env.quotaBackoffArmed(t) {
+	if env.anyUnavailable() || env.quotaBackoffArmed(t) {
 		t.Error("a transient failure must not hold a flavor out or arm the quota backoff")
 	}
 	if metricstest.Value(t, quotaRejections) != quotaBefore || metricstest.Value(t, rejections) != rejectionsBefore {
