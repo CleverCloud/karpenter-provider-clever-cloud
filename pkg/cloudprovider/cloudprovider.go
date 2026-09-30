@@ -346,6 +346,11 @@ func (c *CloudProvider) resolveInstanceType(nodeClaim *karpv1.NodeClaim) (*cloud
 
 // buildNodeClaim converts a NodeGroup into the NodeClaim shape Karpenter
 // expects from the cloud provider (labels resolved, provider ID, capacity).
+// Every single-valued requirement of the instance type and of its offering
+// becomes a label. karpenter-core merges them into the NodeClaim at launch and
+// copies them onto the node at registration, which is the only way the
+// well-known ones (topology.kubernetes.io/region and /zone above all, which
+// the platform never sets) reach a Clever Cloud node.
 func (c *CloudProvider) buildNodeClaim(ng *ngv1.NodeGroup, instanceType *cloudprovider.InstanceType) *karpv1.NodeClaim {
 	labels := map[string]string{}
 	for key, req := range instanceType.Requirements {

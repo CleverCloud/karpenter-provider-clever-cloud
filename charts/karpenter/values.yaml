@@ -107,8 +107,9 @@ controller:
   env: []
 
 settings:
-  # -- Clever Cloud region/zone advertised on instance types (CKE is
-  # Paris-only today).
+  # -- Clever Cloud region, set as both topology.kubernetes.io/region and
+  # topology.kubernetes.io/zone on instance types and on the nodes Karpenter
+  # launches (CKE is single-zone, Paris-only today).
   region: par
   # -- Log verbosity: debug, info or error.
   logLevel: info

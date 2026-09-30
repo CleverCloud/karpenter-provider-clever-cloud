@@ -137,7 +137,7 @@ The controller is configured through environment variables, all set by the helm 
 
 | Name                      | Kind       | Default            | Required | Description                                                  |
 | ------------------------- | ---------- | ------------------ | -------- | ------------------------------------------------------------ |
-| `CLEVER_CLOUD_REGION`     | `String`   | `par`              | no       | Region/zone advertised on instance types (CKE is Paris-only today) |
+| `CLEVER_CLOUD_REGION`     | `String`   | `par`              | no       | Value of the `topology.kubernetes.io/region` and `topology.kubernetes.io/zone` labels on instance types and nodes (CKE is single-zone, Paris-only today) |
 | `LOG_LEVEL`               | `String`   | `info`             | no       | `debug`, `info` or `error`                                   |
 | `METRICS_PORT`            | `Integer`  | `8080`             | no       | Port of the `/metrics` endpoint                              |
 | `HEALTH_PROBE_PORT`       | `Integer`  | `8081`             | no       | Port of the liveness/readiness probes                        |
@@ -273,6 +273,38 @@ affinity:
 
 (`clever-cloud.com/cluster-node-role: worker` is **not** equivalent: on the topologies where the
 control plane is outside the cluster, the pre-existing pool is made of worker nodes too.)
+
+### Topology labels
+
+The platform puts no topology labels on its nodes. Karpenter puts both well-known ones on every node
+it launches, with the value of `CLEVER_CLOUD_REGION` (`settings.region`, `par` by default):
+`topology.kubernetes.io/region` and `topology.kubernetes.io/zone`. CKE is single-zone, so the zone is
+the region. A pod nodeSelector or node affinity, a NodePool requirement, a StorageClass
+`allowedTopologies` or a PersistentVolume node affinity on either key selects those nodes. A value
+other than the configured one matches no instance type, so Karpenter provisions nothing for it.
+
+Nodes launched by v0.12.0 or earlier carry the zone but not the region, and upgrading neither adds
+it to them nor replaces them: karpenter-core takes a NodeClaim's labels from the provider once, at
+launch, and copies them onto the node at registration. A pod that requires the region only lands on
+nodes launched after the upgrade, Karpenter launching one for it if needed. To let it use the older
+nodes right away, label them with your `CLEVER_CLOUD_REGION` (`par` below, the default: replace it
+if you changed the setting):
+
+```
+$ kubectl label nodes -l 'karpenter.sh/nodepool,!topology.kubernetes.io/region' topology.kubernetes.io/region=par
+```
+
+A NodePool that requires the region replaces its older nodes through drift under its disruption
+budgets, as it already did before the upgrade; their replacements carry the label and stay.
+
+The nodes Karpenter launches after the upgrade form a single region domain, as they already formed
+a single zone domain. A required pod anti-affinity keyed on `topology.kubernetes.io/region` therefore
+allows one matching replica across all of them, exactly as one keyed on the zone does. Before the
+upgrade no node carried the region, and a node without the topology key satisfies anti-affinity, so
+such a rule limited nothing. Its replicas beyond the first keep running where they are, but once the
+older nodes are gone (or labelled by hand) a replica that has to be rescheduled stays Pending, and
+Karpenter cannot launch a node for it. Key such a rule on `kubernetes.io/hostname` to keep one replica
+per node.
 
 ## License
 

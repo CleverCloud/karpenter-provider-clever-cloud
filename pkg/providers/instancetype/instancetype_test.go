@@ -29,6 +29,7 @@ import (
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
@@ -106,8 +107,18 @@ func TestListExposesExpectedRequirements(t *testing.T) {
 		if !it.Requirements.Has(v1alpha1.FlavorLabelKey) || !it.Requirements.Get(v1alpha1.FlavorLabelKey).Has(it.Name) {
 			t.Errorf("flavor %s: missing flavor label requirement", it.Name)
 		}
-		if !it.Requirements.Has(corev1.LabelTopologyZone) || it.Requirements.Get(corev1.LabelTopologyZone).Any() != "par" {
-			t.Errorf("flavor %s: expected zone par, got %q", it.Name, it.Requirements.Get(corev1.LabelTopologyZone).Any())
+		// Region and zone both carry the configured region, in the
+		// requirements (the labels buildNodeClaim puts on the claim) and in
+		// the offering (what core's scheduler and drift read).
+		if len(it.Offerings) != 1 {
+			t.Fatalf("flavor %s: expected one offering, got %d", it.Name, len(it.Offerings))
+		}
+		for _, key := range []string{corev1.LabelTopologyRegion, corev1.LabelTopologyZone} {
+			for where, reqs := range map[string]scheduling.Requirements{"requirements": it.Requirements, "offering": it.Offerings[0].Requirements} {
+				if !reqs.Has(key) || reqs.Get(key).Len() != 1 || !reqs.Get(key).Has("par") {
+					t.Errorf("flavor %s: expected %s %s In [par], got %s", it.Name, where, key, reqs.Get(key))
+				}
+			}
 		}
 		if !it.Requirements.Has(karpv1.CapacityTypeLabelKey) || it.Requirements.Get(karpv1.CapacityTypeLabelKey).Any() != karpv1.CapacityTypeOnDemand {
 			t.Errorf("flavor %s: expected on-demand capacity type, got %q", it.Name, it.Requirements.Get(karpv1.CapacityTypeLabelKey).Any())
@@ -769,6 +780,10 @@ func TestSynthesizeServesDegradedTypesWithoutTouchingTheCatalog(t *testing.T) {
 		}
 		if cpu := it.Capacity[corev1.ResourceCPU]; !cpu.IsZero() {
 			t.Errorf("expected zero cpu, got %v", cpu.Value())
+		}
+		// The degraded node still describes where it runs.
+		if got := it.Requirements.Get(corev1.LabelTopologyRegion); !got.Has("par") {
+			t.Errorf("region requirement = %s, want par", got)
 		}
 	})
 

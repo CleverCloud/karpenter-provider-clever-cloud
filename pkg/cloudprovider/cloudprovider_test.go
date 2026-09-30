@@ -246,6 +246,11 @@ func TestCreatePicksCheapestCompatibleFlavor(t *testing.T) {
 	if got := created.Labels[corev1.LabelTopologyZone]; got != "par" {
 		t.Errorf("unexpected zone %q", got)
 	}
+	// The returned labels are the only source of the node's topology labels:
+	// karpenter-core copies them onto it at registration.
+	if got := created.Labels[corev1.LabelTopologyRegion]; got != "par" {
+		t.Errorf("unexpected region %q", got)
+	}
 
 	ng := &ngv1.NodeGroup{}
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: nodeClaim.Name}, ng); err != nil {
