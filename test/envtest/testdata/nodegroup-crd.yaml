@@ -1,14 +1,28 @@
-# Test fixture ONLY. The real nodegroups.api.clever-cloud.com CRD is owned
-# and installed by Clever Cloud on every CKE cluster; it is deliberately not
-# vendored in this repository. This fixture mirrors just enough of its shape
-# (cluster-scoped, v1, status subresource, loose schema) for the controllers
-# to exercise a real apiserver in envtest. Keep it loose: the provider's typed
-# client is deliberately tolerant of fields the Clever Cloud operator owns.
+# The nodegroups.api.clever-cloud.com CRD exactly as Clever Kubernetes Engine
+# serves it: captured on 2026-09-30 from a CKE cluster running Kubernetes
+# 1.37.0 (kubectl get crd nodegroups.api.clever-cloud.com -o yaml).
+#
+# TEST FIXTURE ONLY. The CRD is owned by Clever Cloud and installed by the
+# platform on every CKE cluster; this repository never ships or installs it.
+# It is vendored here so that the envtest suite's apiserver admits, refuses,
+# defaults and prunes NodeGroups as a CKE apiserver does: the spec.flavor
+# enum, the reserved label prefixes, the label and taint patterns, the
+# immutability rules, the required status condition fields, and the pruning
+# of fields the schema does not declare. A schema-less stand-in accepted any
+# payload, so none of that was ever exercised before a live launch.
+#
+# Sanitised: the server-populated metadata (creationTimestamp, generation,
+# resourceVersion, uid) and the status block are removed. The spec is kept
+# verbatim, descriptions and printer columns included although the apiserver
+# needs neither to validate, so that a new capture diffs against it line for
+# line. Refresh it the same way whenever Clever Cloud changes the CRD.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   name: nodegroups.api.clever-cloud.com
 spec:
+  conversion:
+    strategy: None
   group: api.clever-cloud.com
   names:
     kind: NodeGroup
@@ -17,18 +31,214 @@ spec:
     singular: nodegroup
   scope: Cluster
   versions:
-    - name: v1
-      served: true
-      storage: true
-      subresources:
-        status: {}
-      schema:
-        openAPIV3Schema:
-          type: object
-          properties:
-            spec:
-              type: object
-              x-kubernetes-preserve-unknown-fields: true
-            status:
-              type: object
-              x-kubernetes-preserve-unknown-fields: true
+  - additionalPrinterColumns:
+    - jsonPath: .spec.nodeCount
+      name: DesiredNodeCount
+      type: integer
+    - jsonPath: .status.nodeCount
+      name: CurrentNodeCount
+      type: integer
+    - jsonPath: .spec.flavor
+      name: Flavor
+      type: string
+    - jsonPath: .status.phase
+      name: Status
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: NodeGroup is the Schema for the NodeGroups API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              NodeGroupSpec is the NodeGroup specification.
+              A single NodeGroup represents a set of Nodes of same flavor
+            properties:
+              flavor:
+                default: M
+                description: Flavor used the Nodes created in the NodeGroup (uppercase
+                  only)
+                enum:
+                - 2XS
+                - XS
+                - S
+                - M
+                - L
+                - XL
+                type: string
+                x-kubernetes-validations:
+                - message: flavor is immutable
+                  rule: self == oldSelf
+              labels:
+                additionalProperties:
+                  maxLength: 63
+                  pattern: ^([a-zA-Z0-9]([-_.a-zA-Z0-9]{0,61}[a-zA-Z0-9])?)?$
+                  type: string
+                description: |
+                  Labels to apply to all nodes in this NodeGroup.
+                  Keys must follow Kubernetes label key format.
+                  Reserved prefixes (kubernetes.io/*, node.kubernetes.io/*, clever-cloud.com/*) are not allowed.
+                type: object
+                x-kubernetes-validations:
+                - message: Label keys with reserved prefixes (kubernetes.io/, node.kubernetes.io/,
+                    clever-cloud.com/) are not allowed
+                  rule: self.all(k, !k.startsWith('kubernetes.io/') && !k.startsWith('node.kubernetes.io/')
+                    && !k.startsWith('clever-cloud.com/'))
+                - message: labels are immutable after creation
+                  rule: self == oldSelf
+              nodeCount:
+                default: 0
+                description: Number of Nodes expected in the NodeGroup
+                format: int32
+                maximum: 16
+                minimum: 0
+                type: integer
+              taints:
+                description: |
+                  Taints to apply to all nodes in this NodeGroup.
+                  Each taint prevents pods without matching tolerations from being scheduled.
+                items:
+                  properties:
+                    effect:
+                      description: The taint effect
+                      enum:
+                      - NoSchedule
+                      - PreferNoSchedule
+                      - NoExecute
+                      type: string
+                    key:
+                      description: The taint key
+                      maxLength: 253
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\/)?[a-zA-Z0-9]([-_.a-zA-Z0-9]{0,61}[a-zA-Z0-9])?$
+                      type: string
+                    value:
+                      description: The taint value (optional)
+                      maxLength: 63
+                      pattern: ^([a-zA-Z0-9]([-_.a-zA-Z0-9]{0,61}[a-zA-Z0-9])?)?$
+                      type: string
+                  required:
+                  - key
+                  - effect
+                  type: object
+                type: array
+                x-kubernetes-validations:
+                - message: taints are immutable after creation
+                  rule: self == oldSelf
+            type: object
+          status:
+            description: NodeGroupStatus defines the observed state of NodeGroup
+            properties:
+              conditions:
+                description: Status conditions for the NodeGroup
+                items:
+                  properties:
+                    lastTransitionTime:
+                      description: Last time the condition transitioned from one status
+                        to another
+                      format: date-time
+                      type: string
+                    message:
+                      description: Human-readable description of the condition
+                      type: string
+                    observedGeneration:
+                      description: Generation of the resource this condition was observed
+                        for
+                      format: int64
+                      type: integer
+                    reason:
+                      description: CamelCase reason for the condition
+                      type: string
+                    status:
+                      description: Status of the condition
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: Type of the condition (Ready, ReconcileInProgress,
+                        ReconcileFailed, Terminating)
+                      type: string
+                  required:
+                  - type
+                  - status
+                  - lastTransitionTime
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              labels:
+                additionalProperties:
+                  type: string
+                description: Current labels as reported by the upstream API
+                type: object
+              nodeCount:
+                description: Number of Nodes currently in the NodeGroup
+                format: int32
+                minimum: 0
+                type: integer
+              phase:
+                description: Summary phase computed from conditions (Synced, Creating,
+                  Scaling, QuotaExceeded, etc.)
+                type: string
+              taints:
+                description: Current taints as reported by the upstream API
+                items:
+                  properties:
+                    effect:
+                      enum:
+                      - NoSchedule
+                      - PreferNoSchedule
+                      - NoExecute
+                      type: string
+                    key:
+                      type: string
+                    value:
+                      type: string
+                  type: object
+                type: array
+              targetNodeCount:
+                description: Last synced target node count baseline for conflict detection.
+                format: int32
+                minimum: 0
+                type: integer
+              upstreamId:
+                description: |
+                  Identifier of the NodeGroup in the upstream Clever Cloud API.
+                  This is the authoritative source for the upstream resource ID.
+                type: string
+                x-kubernetes-validations:
+                - message: upstreamId is immutable once set
+                  rule: self == oldSelf
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      scale:
+        specReplicasPath: .spec.nodeCount
+        statusReplicasPath: .status.nodeCount
+      status: {}

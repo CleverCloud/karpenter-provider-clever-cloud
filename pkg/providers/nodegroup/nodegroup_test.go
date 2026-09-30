@@ -212,16 +212,24 @@ func unacknowledgedUpstreamErrorStatus() ngv1.NodeGroupStatus {
 // longer than the 1s acceptance-poll interval, so the poll observes each one.
 const statusStep = 1500 * time.Millisecond
 
+// creationPatience bounds how long setStatusOnceCreated waits for the
+// NodeGroup to appear, far longer than any Create under test takes to post it.
+const creationPatience = 20 * time.Second
+
 // setStatusOnceCreated plays the Clever Cloud operator: once the NodeGroup
 // appears in the fake client, it writes each status in turn, statusStep apart.
 // A status may carry several conditions at once, as the live operator reports
 // them. It stops early if the group is deleted in between, so a Create that
-// wrongly deletes the group fails its assertions instead of hanging the test.
+// wrongly deletes the group fails its assertions instead of hanging the test,
+// and gives up on a group that never appears within creationPatience, so a
+// Create that wrongly fails fast without posting it does not hang the test
+// until go test's timeout either.
 func setStatusOnceCreated(t *testing.T, kubeClient client.Client, name string, statuses ...ngv1.NodeGroupStatus) <-chan struct{} {
 	t.Helper()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		deadline := time.Now().Add(creationPatience)
 		for i, status := range statuses {
 			if i > 0 {
 				time.Sleep(statusStep)
@@ -230,6 +238,9 @@ func setStatusOnceCreated(t *testing.T, kubeClient client.Client, name string, s
 				ng := &ngv1.NodeGroup{}
 				if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: name}, ng); err != nil {
 					if i > 0 && apierrors.IsNotFound(err) {
+						return
+					}
+					if time.Now().After(deadline) {
 						return
 					}
 					time.Sleep(time.Millisecond)
@@ -1207,6 +1218,38 @@ func TestRefusedFlavorIsUnavailableForItsHoldOut(t *testing.T) {
 	}
 }
 
+// TestQuotaBackoffExpires pins both windows of a quota rejection to the
+// provider's clock, to the second: the rejected flavor is unavailable, and
+// fails fast, for QuotaBackoff; every flavor at least as large for twice as
+// long; a smaller one never. Nothing but freed capacity clears them earlier,
+// and nothing may keep them longer: a backoff that never expired would keep
+// those flavors out of every launch until a NodeGroup happened to be deleted.
+func TestQuotaBackoffExpires(t *testing.T) {
+	provider, _, _, clk := newClockedTestProvider(t)
+	provider.RecordLateRefusal(testNodeClaim("default-quotx"), ownedNodeGroup("default-quotx", "S", quotaRejectedStatus()))
+	requireAvailability := func(stage string, want map[string]bool) {
+		t.Helper()
+		for flavor, unavailable := range want {
+			if got := provider.Unavailable(flavor); got != unavailable {
+				t.Errorf("%s: Unavailable(%s) = %v, want %v", stage, flavor, got, unavailable)
+			}
+		}
+	}
+
+	clk.Step(nodegroup.QuotaBackoff - time.Second)
+	requireAvailability("just before the first window ends", map[string]bool{"XS": false, "S": true, "XL": true})
+	var quotaErr *nodegroup.ErrQuotaExceeded
+	if _, err := provider.Create(context.Background(), testNodeClaim("default-quots"), testNodeClass("default"), "S"); !errors.As(err, &quotaErr) {
+		t.Errorf("expected S to fail fast within its window, got %T: %v", err, err)
+	}
+	clk.Step(time.Second)
+	requireAvailability("once the first window ended", map[string]bool{"XS": false, "S": false, "XL": true})
+	clk.Step(nodegroup.QuotaBackoff - time.Second)
+	requireAvailability("just before the second window ends", map[string]bool{"S": false, "M": true, "XL": true})
+	clk.Step(time.Second)
+	requireAvailability("once the second window ended", map[string]bool{"XS": false, "S": false, "M": false, "XL": false})
+}
+
 // quotaRejectedStatus is the live shape of a quota rejection: the operator's
 // first status write, with an empty message.
 func quotaRejectedStatus() ngv1.NodeGroupStatus {
@@ -1419,6 +1462,70 @@ func TestCreateFailsWhenNodeGroupVanishesDuringAcceptance(t *testing.T) {
 	var quotaErr *nodegroup.ErrQuotaExceeded
 	if _, err := provider.Create(context.Background(), testNodeClaim("default-after"), testNodeClass("default"), "2XS"); !errors.As(err, &quotaErr) {
 		t.Errorf("expected a fast quota-backoff failure after a vanish, got %v", err)
+	}
+}
+
+// TestCreateWaitsOutInformerLag pins the other half of the vanish check. The
+// acceptance poll reads through the informer cache, which can miss a group
+// Create has just posted: a NotFound before the group was ever seen is that
+// lag, not a vanish. Read as a vanish, it would fail healthy launches as
+// ErrNodeGroupVanished — counted, announced, and recorded as a quota rejection
+// of their flavor that makes it unavailable to the scheduler.
+func TestCreateWaitsOutInformerLag(t *testing.T) {
+	const (
+		name = "default-lagged"
+		// The cache misses the group on the poll right after the create and
+		// on the next one, a second later.
+		laggingPolls = 2
+	)
+	var (
+		mu    sync.Mutex
+		polls int
+	)
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				ng, ok := obj.(*ngv1.NodeGroup)
+				if !ok || key.Name != name {
+					return c.Get(ctx, key, obj, opts...)
+				}
+				mu.Lock()
+				polls++
+				poll := polls
+				mu.Unlock()
+				if poll <= laggingPolls {
+					return apierrors.NewNotFound(schema.GroupResource{Group: "api.clever-cloud.com", Resource: "nodegroups"}, name)
+				}
+				if err := c.Get(ctx, key, obj, opts...); err != nil {
+					return err
+				}
+				// Once the cache has it, the operator's acknowledgement is there.
+				ng.Status = acknowledgedStatus()
+				return nil
+			},
+		}).
+		Build()
+	recorder := &fakeRecorder{}
+	provider := nodegroup.NewProvider(kubeClient, recorder, catalogue, clock.RealClock{})
+	vanishedBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_vanished_total")
+
+	if _, err := provider.Create(context.Background(), testNodeClaim(name), testNodeClass("default"), "2XS"); err != nil {
+		t.Fatalf("a group the cache has not caught up with is not a vanished one: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if polls != laggingPolls+1 {
+		t.Errorf("the group was polled %d times, want %d: the poll must keep waiting through the lag", polls, laggingPolls+1)
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_vanished_total") - vanishedBefore; delta != 0 {
+		t.Errorf("nodegroup_vanished_total delta = %v, want 0", delta)
+	}
+	if slices.Contains(recorder.reasons(), "NodeGroupVanished") {
+		t.Errorf("unexpected NodeGroupVanished event, got %v", recorder.reasons())
+	}
+	if provider.Unavailable("2XS") {
+		t.Error("informer lag made the launched flavor unavailable")
 	}
 }
 

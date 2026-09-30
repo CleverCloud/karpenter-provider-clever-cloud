@@ -21,7 +21,9 @@ limitations under the License.
 // classes this suite exists to catch. It also proves that every vendored CRD
 // under deploy/crds actually installs on the apiserver version we target,
 // which is the regression the automated karpenter.sh CRD sync could
-// otherwise introduce silently.
+// otherwise introduce silently. NodeGroups are served by Clever Cloud's own
+// CRD as captured from a CKE cluster (testdata), so the payloads the provider
+// writes go through the platform's real schema.
 //
 // Run with `make test-envtest` (downloads the apiserver/etcd binaries via
 // setup-envtest). Without KUBEBUILDER_ASSETS the suite skips itself so a
@@ -94,8 +96,9 @@ func TestMain(m *testing.M) {
 
 	env := &envtest.Environment{
 		// deploy/crds carries the generated CleverNodeClass CRD and the
-		// vendored karpenter.sh CRDs; testdata adds a loose NodeGroup CRD
-		// stand-in (the real one is owned by Clever Cloud, not this repo).
+		// vendored karpenter.sh CRDs; testdata adds the NodeGroup CRD as CKE
+		// serves it (owned by Clever Cloud and never shipped by this repo:
+		// a test fixture only).
 		CRDDirectoryPaths:     []string{"../../deploy/crds", "testdata"},
 		ErrorIfCRDPathMissing: true,
 	}

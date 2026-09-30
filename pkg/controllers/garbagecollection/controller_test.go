@@ -19,6 +19,7 @@ package garbagecollection_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -228,13 +229,24 @@ func TestReconcileKeepsNodeGroupWhoseOwnerIsAlive(t *testing.T) {
 	ng.OwnerReferences = []metav1.OwnerReference{
 		{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: "claim-alive", UID: types.UID("uid-claim-alive")},
 	}
-	ctrl, kubeClient := newTestController(t, ng, testNodeClaim("claim-alive"))
+	ctrl, kubeClient, recorder := newTestControllerWithRecorder(t, ng, testNodeClaim("claim-alive"))
 
 	if _, err := ctrl.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	if !nodeGroupExists(t, kubeClient, "ng-mislabeled") {
 		t.Error("expected nodegroup with a living NodeClaim owner to be retained despite its stale label")
+	}
+	// The uncached confirmation would keep the group too, since it also reads
+	// the owner names; what the owner check adds is the refusal: a label that
+	// names no living claim is an inconsistency an operator must see, on the
+	// gauge and on the group.
+	if got := metricstest.Value(t, "karpenter_clevercloud_gc_refused_nodegroups"); got != 1 {
+		t.Errorf("gc_refused_nodegroups gauge = %v, want 1", got)
+	}
+	refusals := recorder.eventsByReason("GarbageCollectionRefused")
+	if len(refusals) != 1 || !strings.Contains(refusals[0].Message, "owner is alive") {
+		t.Errorf("expected one GarbageCollectionRefused event naming the living owner, got %+v", refusals)
 	}
 }
 
@@ -340,15 +352,50 @@ func TestReconcileSurfacesReapsAndRefusals(t *testing.T) {
 }
 
 func TestReconcileSkipsAlreadyDeletingNodeGroup(t *testing.T) {
-	ctrl, kubeClient := newTestController(t, managedNodeGroup("ng-deleting", "claim-gone", 10*time.Minute, true))
+	// The Clever Cloud finalizer keeps a group it is tearing down visible for
+	// about 40 s, across sweeps. Reaping it again would send a DELETE for
+	// nothing, count and announce a reap that never happened, and — through
+	// nodegroup.Provider.Delete — forget every quota rejection on every sweep
+	// while the finalizer holds the group.
+	var mu sync.Mutex
+	deletes := 0
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(
+		managedNodeGroup("ng-deleting", "claim-gone", 10*time.Minute, true),
+	).WithInterceptorFuncs(interceptor.Funcs{
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			mu.Lock()
+			deletes++
+			mu.Unlock()
+			return cl.Delete(ctx, obj, opts...)
+		},
+	}).Build()
+	recorder := &fakeRecorder{}
+	provider := nodegroup.NewProvider(kubeClient, recorder, nil, clock.RealClock{})
+	ctrl := garbagecollection.NewController(kubeClient, kubeClient, provider, recorder)
+	rejected := managedNodeGroup("ng-rejected", "claim-rejected", 0, false)
+	rejected.Status = ngv1.NodeGroupStatus{Phase: ngv1.PhaseQuotaExceeded}
+	provider.RecordLateRefusal(testNodeClaim("claim-rejected"), rejected)
+	reapedBefore := metricstest.Value(t, "karpenter_clevercloud_gc_reaped_nodegroups_total")
 
 	if _, err := ctrl.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	// The finalizer keeps the object visible; the controller must not error
-	// on a nodegroup already being torn down by the Clever Cloud operator.
 	if !nodeGroupExists(t, kubeClient, "ng-deleting") {
 		t.Error("expected already-deleting nodegroup to still be present")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if deletes != 0 {
+		t.Errorf("sent %d DELETE requests for a nodegroup already being deleted, want 0", deletes)
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_gc_reaped_nodegroups_total") - reapedBefore; delta != 0 {
+		t.Errorf("gc_reaped_nodegroups_total delta = %v, want 0", delta)
+	}
+	if got := recorder.countReason("GarbageCollected"); got != 0 {
+		t.Errorf("GarbageCollected events = %d, want 0", got)
+	}
+	if !provider.Unavailable("2XS") {
+		t.Error("the sweep forgot a quota rejection by deleting a nodegroup already being deleted")
 	}
 }
 
@@ -477,6 +524,71 @@ func TestReconcileConfirmsOwnerNamesUncached(t *testing.T) {
 	}
 	if !nodeGroupExists(t, cached, "ng-owner-stale") {
 		t.Error("expected the nodegroup to be retained when its owner is alive on the API server")
+	}
+}
+
+// TestReconcileFailsClosedWhenTheUncachedConfirmationFails pins what an error
+// on a confirming read means: nothing. Each destructive decision here rests on
+// an object being ABSENT, and an error proves no absence — an apiserver under
+// load, a throttled request, a lost connection. Reading it as absence would
+// destroy the VM of a claim that is alive, or write off the launch of a group
+// that exists, on any transient API error. The sweep keeps the object and
+// reports the error, so the next sweep retries. Each confirmation runs alone:
+// with both in one sweep, either one's error would fail the sweep and hide the
+// other being dropped, leaving a persistent failure on that path unreported
+// (no retry, no error log).
+func TestReconcileFailsClosedWhenTheUncachedConfirmationFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// object's counterpart is missing from the cache: the claim of a
+		// group, or the group of a launched claim.
+		object  client.Object
+		wantErr string
+		kept    func(*testing.T, client.Client) bool
+	}{
+		{
+			name:    "nodeclaim confirmation before reaping a group",
+			object:  managedNodeGroup("ng-unconfirmed", "claim-unconfirmed", 10*time.Minute, false),
+			wantErr: `confirming nodeclaim "claim-unconfirmed" absence`,
+			kept: func(t *testing.T, c client.Client) bool {
+				return nodeGroupExists(t, c, "ng-unconfirmed")
+			},
+		},
+		{
+			name:    "nodegroup confirmation before writing off a launch",
+			object:  vanishedClaim("claim-nogroup", 10*time.Minute),
+			wantErr: `confirming nodegroup "claim-nogroup" absence`,
+			kept: func(t *testing.T, c client.Client) bool {
+				return nodeClaimExists(t, c, "claim-nogroup")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := &fakeRecorder{}
+			cached := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(tc.object).Build()
+			uncached := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+					return apierrors.NewInternalError(errTest)
+				},
+			}).Build()
+			ctrl := garbagecollection.NewController(cached, uncached, nodegroup.NewProvider(cached, recorder, nil, clock.RealClock{}), recorder)
+			reapedBefore := metricstest.Value(t, "karpenter_clevercloud_gc_reaped_nodegroups_total")
+			vanishedBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_vanished_total")
+
+			_, err := ctrl.Reconcile(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("Reconcile error = %v, want one reporting %s", err, tc.wantErr)
+			}
+			if !tc.kept(t, cached) {
+				t.Error("expected the object to be kept when its counterpart's absence could not be confirmed")
+			}
+			if delta := metricstest.Value(t, "karpenter_clevercloud_gc_reaped_nodegroups_total") - reapedBefore; delta != 0 {
+				t.Errorf("gc_reaped_nodegroups_total delta = %v, want 0", delta)
+			}
+			if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_vanished_total") - vanishedBefore; delta != 0 {
+				t.Errorf("nodegroup_vanished_total delta = %v, want 0", delta)
+			}
+		})
 	}
 }
 

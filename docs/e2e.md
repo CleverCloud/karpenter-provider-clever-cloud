@@ -35,10 +35,27 @@ What it pins down:
   and removing it is admitted.
 - **providerid stamping** through a real watch: managed worker nodes get
   `clevercloud://<nodegroup>`, unmanaged ones are left alone.
+- **The NodeGroup payload against Clever Cloud's own schema**: for every
+  built-in flavor, the NodeGroup `Create` builds (labels from a NodeClaim and
+  a NodeClass, the unregistered taint, the owner reference) is admitted and
+  stored exactly as sent — nothing pruned or defaulted away — and the
+  operator's first status write passes the status schema. A flavor outside
+  the CRD's `spec.flavor` enum comes back as the typed admission refusal
+  (`ErrFlavorRejected`, reason `Invalid`), built from the apiserver's real
+  error, with no NodeGroup created and the flavor held out.
+- **The nodegroupstatus watches**: a quota rejection published after the
+  launch fails the NodeClaim through the NodeClaim watch, and a Registered
+  claim next to an identical refusal is never touched.
 
-The NodeGroup CRD is owned by Clever Cloud and deliberately not vendored;
-the suite installs a loose stand-in from `test/envtest/testdata/` (the typed
-client is deliberately tolerant, so the loose schema is representative).
+The NodeGroup CRD is owned by Clever Cloud and installed by the platform;
+this repository never ships it. The suite installs a verbatim capture of it
+from a CKE cluster, `test/envtest/testdata/nodegroup-crd.yaml` (server-set
+metadata and status removed; the header records the capture date and
+Kubernetes version), so its flavor enum, reserved label prefixes, label and
+taint patterns, immutability rules and pruning apply as they do live. When
+Clever Cloud changes the CRD, refresh the fixture from a test cluster
+(`kubectl get crd nodegroups.api.clever-cloud.com -o yaml`, the same
+sanitising) and update the header.
 Without `KUBEBUILDER_ASSETS` the package skips itself, keeping plain
 `go test ./...` green.
 
