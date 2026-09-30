@@ -28,17 +28,41 @@ const (
 	ConditionTypeReconcileFailed     = "ReconcileFailed"
 	ConditionTypeTerminating         = "Terminating"
 
-	// Phases observed in status.phase.
+	// Phases observed in status.phase, a summary the operator computes from
+	// its conditions.
 	PhaseSynced        = "Synced"
 	PhaseQuotaExceeded = "QuotaExceeded"
+	PhaseUpstreamError = "UpstreamError"
 
 	// ReasonQuotaExceeded is set on the ReconcileFailed condition when the
 	// organisation vCPU/RAM quota blocks the requested capacity.
 	ReasonQuotaExceeded = "QuotaExceeded"
 
+	// ReasonUpstreamError is set on the ReconcileFailed condition when a call
+	// the operator makes to the Clever Cloud API fails. It is transient: see
+	// transientFailureReasons.
+	ReasonUpstreamError = "UpstreamError"
+
 	// MaxNodeCount is the maximum spec.nodeCount accepted by the API.
 	MaxNodeCount = 16
 )
+
+// transientFailureReasons are the ReconcileFailed reasons the operator uses
+// for a failure it keeps retrying on its own: they report trouble on the way,
+// not a decision about the NodeGroup. Measured live on CKE (2026-09-30): a
+// group carried Ready=True(Synced) + ReconcileInProgress=True(Scaling) +
+// ReconcileFailed=True(UpstreamError, "API error: RequestDidntReturnSuccess"),
+// phase=UpstreamError, and the operator retried until it succeeded about an
+// hour later.
+//
+// This is an allowlist on purpose: every reason NOT listed here stays a
+// refusal. Unknown reasons were refusals before transient ones were told
+// apart, and reading a real refusal as transient would burn karpenter's
+// 15-minute registration TTL on a group that is never coming up. Add a reason
+// only once the operator has been seen retrying it to success.
+var transientFailureReasons = map[string]bool{
+	ReasonUpstreamError: true,
+}
 
 // NodeGroupSpec is the NodeGroup specification. A single NodeGroup represents
 // a set of nodes of the same flavor. flavor, labels and taints are immutable
@@ -123,7 +147,9 @@ func (in *NodeGroup) GetCondition(conditionType string) *NodeGroupCondition {
 }
 
 // IsQuotaExceeded reports whether the upstream operator rejected the desired
-// capacity because of the organisation quota.
+// capacity because of the organisation quota. Like Refusal, it does not
+// outrank IsSynced: a Ready group's machines are up whatever else its status
+// reports.
 func (in *NodeGroup) IsQuotaExceeded() bool {
 	if in.Status.Phase == PhaseQuotaExceeded {
 		return true
@@ -134,22 +160,49 @@ func (in *NodeGroup) IsQuotaExceeded() bool {
 	return false
 }
 
-// ReconcileFailure returns the reason and message of a ReconcileFailed=True
-// condition, and whether one is present. Quota rejections are one reason among
-// several: a flavor the cluster cannot provision, a spec the operator refuses,
-// an upstream image failure all land here too. Callers must treat any of them
-// as terminal — waiting for a group the operator has already refused only
-// burns karpenter's registration TTL.
-func (in *NodeGroup) ReconcileFailure() (reason, message string, failed bool) {
-	cond := in.GetCondition(ConditionTypeReconcileFailed)
-	if cond == nil || cond.Status != corev1.ConditionTrue {
+// Refusal returns the reason and message of a ReconcileFailed=True condition
+// whose reason is not transient (transientFailureReasons), and whether one is
+// present. Quota rejections are one reason among several (IsQuotaExceeded is
+// that subset): a flavor the cluster cannot provision, a spec the operator
+// refuses, an upstream image failure, and any reason this provider has never
+// seen all land here too. Waiting for a group the operator has already refused
+// only burns karpenter's registration TTL, so callers treat these as terminal
+// — unless the group is Ready (IsSynced): the operator reports several
+// conditions at once, and Ready means the machine is up whatever else the
+// status carries.
+func (in *NodeGroup) Refusal() (reason, message string, refused bool) {
+	cond := in.reconcileFailed()
+	if cond == nil || transientFailureReasons[cond.Reason] {
 		return "", "", false
 	}
 	return cond.Reason, cond.Message, true
 }
 
+// TransientFailure returns the reason and message of a ReconcileFailed=True
+// condition whose reason the operator retries on its own
+// (transientFailureReasons), and whether one is present. It is not a refusal:
+// the NodeGroup is still in progress, exactly as if the condition were absent.
+func (in *NodeGroup) TransientFailure() (reason, message string, transient bool) {
+	cond := in.reconcileFailed()
+	if cond == nil || !transientFailureReasons[cond.Reason] {
+		return "", "", false
+	}
+	return cond.Reason, cond.Message, true
+}
+
+// reconcileFailed returns the ReconcileFailed condition when it is True.
+func (in *NodeGroup) reconcileFailed() *NodeGroupCondition {
+	cond := in.GetCondition(ConditionTypeReconcileFailed)
+	if cond == nil || cond.Status != corev1.ConditionTrue {
+		return nil
+	}
+	return cond
+}
+
 // IsSynced reports whether the upstream operator reconciled the NodeGroup to
-// its desired state.
+// its desired state. Ready=True is not exclusive: it stays set while a later
+// reconcile is in progress or failing (see transientFailureReasons for the
+// live shape), and it still means the group's machines are up.
 func (in *NodeGroup) IsSynced() bool {
 	cond := in.GetCondition(ConditionTypeReady)
 	return cond != nil && cond.Status == corev1.ConditionTrue
