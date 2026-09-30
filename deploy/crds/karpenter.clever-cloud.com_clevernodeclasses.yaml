@@ -61,18 +61,21 @@ spec:
                   NodeGroup, making them visible on nodes as soon as they join the
                   cluster (before Karpenter registration completes). The NodeGroup is the
                   ONLY path these labels take to the node, so keys must not use the
-                  clever-cloud.com/ prefix (rejected by the Clever Cloud API) or any
+                  clever-cloud.com/ prefix (rejected by the Clever Cloud API), any
                   kubernetes.io/ domain (filtered from the NodeGroup payload — including
-                  subdomains like app.kubernetes.io/ or topology.kubernetes.io/), and
-                  ValidateNodeClassLabel is the single owner of the full rule. The CEL
-                  rule below covers what CEL can express (contains subsumes both
-                  kubernetes.io/ prefixes of the older rule); label syntax degrades to
-                  ValidationSucceeded=False on the nodeclass controller.
+                  subdomains like app.kubernetes.io/ or topology.kubernetes.io/) or the
+                  karpenter.sh domain or its subdomains (owned by karpenter-core, which
+                  applies its own keys at registration), and ValidateNodeClassLabel is the
+                  single owner of the full rule. The CEL rule below covers what CEL can
+                  express (contains subsumes both kubernetes.io/ prefixes of the older
+                  rule); label syntax degrades to ValidationSucceeded=False on the
+                  nodeclass controller.
                 type: object
                 x-kubernetes-validations:
-                - message: label keys in the kubernetes.io/ domain or with the reserved
-                    prefix clever-cloud.com/ are not allowed
-                  rule: self.all(k, !k.contains('kubernetes.io/') && !k.startsWith('clever-cloud.com/'))
+                - message: label keys in the kubernetes.io/ or karpenter.sh domains
+                    or with the reserved prefix clever-cloud.com/ are not allowed
+                  rule: self.all(k, !k.contains('kubernetes.io/') && !k.startsWith('clever-cloud.com/')
+                    && !k.startsWith('karpenter.sh/') && !k.contains('.karpenter.sh/'))
             type: object
           status:
             description: CleverNodeClassStatus contains the resolved state of the

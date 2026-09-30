@@ -48,8 +48,14 @@ nodeSelector: {}
 # -- Tolerations for the controller pod. No CKE node role carries a taint
 # today, so the entry below is a no-op; it is shipped so that a topology which
 # starts tainting the only nodes the controller could run on does not silently
-# strand it in Pending. It grants no access to Karpenter-managed nodes: those
-# are excluded by `affinity`, not by a taint.
+# strand it in Pending. It must grant no access to Karpenter-managed nodes.
+# Registered ones are excluded by `affinity`, but a node only gets
+# `karpenter.sh/nodepool` when karpenter-core registers it: until then, and for
+# good on the extra node of an externally resized NodeGroup (which never
+# registers), the only thing keeping this pod off is the
+# `karpenter.sh/unregistered:NoExecute` taint. Tolerating that taint, or
+# tolerating everything (an empty key with `operator: Exists`), removes the
+# placement guarantee just as replacing `affinity` does.
 tolerations:
   - key: node-role.kubernetes.io/control-plane
     operator: Exists
@@ -66,9 +72,13 @@ tolerations:
 # exist), and on any topology added later. The rule deliberately names no
 # topology: enumerating them is the same bug deferred to the next one.
 #
-# The brief window before karpenter-core stamps the label on a brand-new node
-# is closed by the `karpenter.sh/unregistered:NoExecute` taint the provider
-# puts on every NodeGroup it creates, which this pod does not tolerate.
+# The window before karpenter-core stamps the label on a brand-new node is
+# closed by the `karpenter.sh/unregistered:NoExecute` taint the provider puts
+# on every NodeGroup it creates, which this pod does not tolerate (see
+# `tolerations`). The same taint keeps it off the extra node of an externally
+# resized NodeGroup, which never registers and, once the providerid controller
+# has stripped any copy an older NodeGroup payload left on it, does not carry
+# the label.
 #
 # Overriding this value removes the guarantee — narrow it with `nodeSelector`
 # instead.

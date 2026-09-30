@@ -22,6 +22,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/validation"
 
+	coreapis "sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis"
@@ -78,6 +79,22 @@ func ValidateNodeClassLabel(key, value string) error {
 	}
 	if strings.HasPrefix(key, "clever-cloud.com/") {
 		return fmt.Errorf("label key %q uses reserved prefix %q (rejected by the Clever Cloud API)", key, "clever-cloud.com/")
+	}
+	// The karpenter.sh domain, bare or subdomained, is karpenter-core's: it
+	// reads those keys on Nodes and applies its own at registration. On the
+	// NodeGroup they would reach EVERY node of the group — spec.labels is
+	// immutable and applied to all of them, including nodes karpenter never
+	// registers (the extra node of an externally resized group) — and core's
+	// cluster state ignores a node carrying karpenter.sh/nodepool without a
+	// provider ID; its first sync after a restart waits for every node, so one
+	// such node stops provisioning and disruption cluster-wide. From a
+	// NodeClass, karpenter.sh/registered or /initialized would reach the node
+	// at join and misreport its lifecycle to core. Spelled the way the CEL rule
+	// has to: for a valid key (a single "/") it means exactly "the prefix is
+	// karpenter.sh or a subdomain of it", and any other key it catches is
+	// invalid anyway.
+	if strings.HasPrefix(key, coreapis.Group+"/") || strings.Contains(key, "."+coreapis.Group+"/") {
+		return fmt.Errorf("label key %q uses the %s domain, which karpenter-core owns — it applies its own keys to the node at registration", key, coreapis.Group)
 	}
 	if errs := validation.IsQualifiedName(key); len(errs) > 0 {
 		return fmt.Errorf("label key %q is not a valid label key: %s", key, strings.Join(errs, "; "))

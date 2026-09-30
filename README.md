@@ -262,6 +262,10 @@ spec:
     team: platform   # visible before Karpenter registration completes
 ```
 
+Label keys may not use the `clever-cloud.com/` prefix, any `kubernetes.io/` domain, or the `karpenter.sh`
+domain (Karpenter's own; it applies those keys itself at registration): the CRD rejects them at admission, and
+the NodeClass reports anything else it cannot deliver as `ValidationSucceeded=False`.
+
 Changing a NodeClass marks the NodeClaims built from it as drifted; Karpenter then replaces those nodes rolling-style.
 
 ### Targeting Karpenter nodes

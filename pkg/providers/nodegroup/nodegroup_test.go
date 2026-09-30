@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -288,10 +289,11 @@ func TestCreateFiltersReservedNodeGroupLabels(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
+	// karpenter.sh/nodepool, stamped on every NodeClaim, is filtered too: the
+	// node receives it from karpenter-core's registration sync.
 	want := map[string]string{
-		"team":                  "data",
-		"app":                   "web",
-		karpv1.NodePoolLabelKey: "default",
+		"team": "data",
+		"app":  "web",
 	}
 	if len(ng.Spec.Labels) != len(want) {
 		t.Errorf("expected exactly %d nodegroup labels, got %+v", len(want), ng.Spec.Labels)
@@ -299,6 +301,51 @@ func TestCreateFiltersReservedNodeGroupLabels(t *testing.T) {
 	for k, v := range want {
 		if got := ng.Spec.Labels[k]; got != v {
 			t.Errorf("nodegroup label %s = %q, want %q", k, got, v)
+		}
+	}
+}
+
+// TestCreateKeepsKarpenterLabelsOutOfTheNodeGroup pins the payload against the
+// labels karpenter-core actually stamps on a NodeClaim at launch. spec.labels
+// is immutable and the platform applies it to EVERY node of the group: when
+// it carried karpenter.sh/nodepool, the extra node of an externally resized
+// group joined with that label and no provider ID (the providerid controller
+// deliberately leaves it unstamped), karpenter-core's cluster state ignored
+// it, and its first sync after the next controller restart never completed —
+// no provisioning and no disruption, cluster-wide, until the resize was
+// reverted. No karpenter.sh key may reach the payload; the provider's own
+// domain, which core also stamps (the nodeclass label), is not core's.
+func TestCreateKeepsKarpenterLabelsOutOfTheNodeGroup(t *testing.T) {
+	provider, kubeClient := newTestProvider(t)
+	nodeClaim := testNodeClaim("default-core1")
+	nodeClassLabel := karpv1.NodeClassLabelKey(schema.GroupKind{Group: "karpenter.clever-cloud.com", Kind: "CleverNodeClass"})
+	for k, v := range map[string]string{
+		karpv1.CapacityTypeLabelKey:    karpv1.CapacityTypeOnDemand,
+		corev1.LabelInstanceTypeStable: "2XS",
+		corev1.LabelTopologyZone:       "par",
+		corev1.LabelArchStable:         "amd64",
+		nodeClassLabel:                 "default",
+		"team":                         "data",
+	} {
+		nodeClaim.Labels[k] = v
+	}
+
+	done := acceptOnceCreated(t, kubeClient, nodeClaim.Name)
+	ng, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XS")
+	<-done
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	for k, v := range ng.Spec.Labels {
+		if domain := karpv1.GetLabelDomain(k); domain == "karpenter.sh" || strings.HasSuffix(domain, ".karpenter.sh") {
+			t.Errorf("nodegroup spec.labels carries karpenter-core's %s=%s: the platform applies it to every node "+
+				"of the group, including nodes that never get a provider id", k, v)
+		}
+	}
+	for _, k := range []string{"team", nodeClassLabel} {
+		if _, ok := ng.Spec.Labels[k]; !ok {
+			t.Errorf("nodegroup spec.labels lost %s, got %+v", k, ng.Spec.Labels)
 		}
 	}
 }

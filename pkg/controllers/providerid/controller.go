@@ -36,6 +36,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
@@ -55,6 +57,9 @@ type Controller struct {
 	// are dropped as soon as a node is stamped; what remains is bounded by the
 	// number of external resizes, which are anomalies, not routine.
 	warnedResized sync.Map
+	// warnedStripped dedups the log of stripNodePoolLabel the same way, in
+	// case the platform re-applies the group's labels to the node.
+	warnedStripped sync.Map
 }
 
 func NewController(kubeClient client.Client, uncached client.Reader) *Controller {
@@ -106,7 +111,8 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// Refusing every node of a resized group is not an option either: the
 	// NodeClaim would never register, and liveness would delete it — the very
 	// outcome above. So exactly one node keeps the ID and the extras are left
-	// inert, for the GC's NodeGroupExternallyResized signal to carry.
+	// inert, for the GC's NodeGroupExternallyResized signal to carry — inert
+	// includes not carrying karpenter.sh/nodepool (see stripNodePoolLabel).
 	providerID := nodegroup.ProviderID(nodeGroupName)
 	// Confirmed uncached: see the field comment on Controller.uncached.
 	siblings := &corev1.NodeList{}
@@ -122,9 +128,10 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				"refusing to stamp a provider id: another node of this nodegroup already carries it, so the id would not be unique " +
 					"(something outside karpenter resized the group; this node stays unregistered and is reported by the garbage collector)")
 		}
-		return reconcile.Result{}, nil
+		return reconcile.Result{}, c.stripNodePoolLabel(ctx, node, nodeGroupName)
 	}
 	c.warnedResized.Delete(node.Name)
+	c.warnedStripped.Delete(node.Name)
 	stored := node.DeepCopy()
 	node.Spec.ProviderID = nodegroup.ProviderID(nodeGroupName)
 	if err := c.kubeClient.Patch(ctx, node, client.MergeFrom(stored)); err != nil {
@@ -132,6 +139,43 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 	log.FromContext(ctx).WithValues("Node", node.Name, "provider-id", node.Spec.ProviderID).Info("stamped provider id on node")
 	return reconcile.Result{}, nil
+}
+
+// stripNodePoolLabel removes karpenter.sh/nodepool from a node this controller
+// refuses to stamp. NodeGroups created before that key was filtered out of the
+// payload still carry it in their immutable spec.labels, and the platform
+// applies those to every node of the group — so the extra node of a resized
+// group joins with it and, being refused, never gets a provider ID.
+// karpenter-core's cluster state ignores a node carrying karpenter.sh/nodepool
+// without a provider ID, and its first sync after a restart waits for every
+// node: one such node stops provisioning and disruption cluster-wide at the
+// next controller restart. Without the label, core tracks the node as the
+// unmanaged, tainted node it effectively is.
+//
+// Only ever called for the refused node of a managed group: the node holding
+// the provider ID got the label from core's registration sync and keeps it,
+// and nodes of unmanaged groups are not ours to touch. If the refused node
+// later takes the ID over (its sibling gone) while the NodeClaim is still
+// unregistered, the registration sync puts the label back; once the claim has
+// registered, its node's deletion goes through core's termination finalizer,
+// which deletes the claim and the whole group with it.
+func (c *Controller) stripNodePoolLabel(ctx context.Context, node *corev1.Node, nodeGroupName string) error {
+	if _, ok := node.Labels[karpv1.NodePoolLabelKey]; !ok {
+		return nil
+	}
+	stored := node.DeepCopy()
+	delete(node.Labels, karpv1.NodePoolLabelKey)
+	// A merge patch removes only that key, leaving concurrent label writes
+	// from the kubelet or the platform untouched.
+	if err := c.kubeClient.Patch(ctx, node, client.MergeFrom(stored)); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if _, warned := c.warnedStripped.LoadOrStore(node.Name, struct{}{}); !warned {
+		log.FromContext(ctx).WithValues("Node", node.Name, "NodeGroup", nodeGroupName).Info(
+			"removed " + karpv1.NodePoolLabelKey + " from a node refused a provider id: an earlier version put it in the nodegroup's " +
+				"immutable spec.labels, and on a node without a provider id it keeps karpenter-core's cluster state from syncing after a restart")
+	}
+	return nil
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
