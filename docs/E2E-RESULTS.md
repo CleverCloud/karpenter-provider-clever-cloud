@@ -179,3 +179,32 @@ creation → pods Running ranged 40–185 s (XS once took 183 s where another
 XS took 46 s — VM pool variance, not provider-side). Deletion ~30–40 s,
 drift detection < 1 s, quota rejection surfaced in ~3 s of NodeGroup
 creation.
+
+---
+
+# Node capacity re-measurement (2026-09-30)
+
+`status.capacity` read on one live node of each flavor on a CKE cluster
+running Kubernetes 1.37.0 (kernel 7.2.8, worker-only topology). These are
+the built-in catalogue's figures from this date on
+(`FlavorSizing` in `pkg/providers/instancetype`).
+
+| Flavor | cpu | Memory (Ki) | Previous seed (Ki) | Gap |
+|---|---|---|---|---|
+| 2XS | 4 | 3715344 | 3911884 | −5.0% |
+| XS | 6 | 7553664 | 7937580 | −4.8% |
+| S | 8 | 11385832 | 11957148 | −4.8% |
+| M | 10 | 15229256 | 15988992 | −4.8% |
+| L | 12 | 22896304 | 23983488 | −4.5% |
+| XL | 16 | 30584176 | 31977984 | −4.4% |
+
+On every flavor, allocatable memory is exactly capacity − 100Mi, and the
+other figures did not move: ephemeral-storage 40971488Ki (allocatable
+37759323279 bytes), 110 pods. The previous seed came from an earlier node
+image (L and XL extrapolated from M, never measured). Until a node of a
+flavor reports, karpenter packs pods against the seed. Fed the previous seed,
+karpenter-core's own scheduler promised two 1 CPU / 1700Mi pods plus 224Mi of
+DaemonSets to one 2XS, whose measured allocatable cannot hold them (a second
+node follows), and chose an XL for a 29.5Gi pod that no measured flavor
+holds — a launch repeated after every controller restart while no XL node
+runs.

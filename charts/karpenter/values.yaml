@@ -133,10 +133,15 @@ settings:
   # reprices the flavor. Pin every flavor the same way, or none: a single
   # pinned flavor can make consolidation rank sets of nodes differently from
   # what CKE bills (see the README's Flavor catalogue). Overrides always win.
-  # CPU/memory still self-correct at runtime from observed node capacity.
+  # At runtime nodes of the controller's own NodeGroups correct the memory
+  # (the smallest node of a flavor wins; prices do not follow), but only
+  # within 10% of the entry and with the same cpu: a pin further off is
+  # served as-is, and each node contradicting it is counted in
+  # karpenter_clevercloud_instancetype_observed_capacity_rejections_total.
   # Rendered into a ConfigMap mounted in the controller.
-  # Example (pin every flavor's memory to what its nodes report on the current
-  # CKE image, keep their cpu):
+  # Example (pin every flavor's memory to what its nodes report, keep their
+  # cpu; the values shown are the built-in ones, measured 2026-09-30: replace
+  # them with what your nodes report once Clever Cloud's node image moves):
   #   flavors:
   #     - { name: 2XS, memoryKi: 3715344 }
   #     - { name: XS, memoryKi: 7553664 }

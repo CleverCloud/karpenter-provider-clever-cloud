@@ -32,6 +32,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -47,6 +48,7 @@ import (
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
@@ -117,7 +119,8 @@ func TestE2E(t *testing.T) {
 
 // testProvision covers the core promise: a pending pod becomes a running pod
 // on a dedicated, correctly-labeled nodeCount:1 NodeGroup, with the claim
-// registered and the node carrying the stamped provider ID.
+// registered, the node carrying the stamped provider ID, and its capacity
+// matching the built-in catalogue the pods were packed against.
 func testProvision(t *testing.T, ctx context.Context, f *framework) {
 	poolName := f.prefix + "-main"
 	if err := f.client.Create(ctx, f.nodeClass(poolName, nil)); err != nil {
@@ -187,6 +190,46 @@ func testProvision(t *testing.T, ctx context.Context, f *framework) {
 		if want := nodegroup.ProviderID(claim.Name); node.Spec.ProviderID != want {
 			t.Errorf("node %s providerID = %q, want %q", node.Name, node.Spec.ProviderID, want)
 		}
+		checkSeedCapacity(t, node, ng.Spec.Flavor)
+	}
+	// Every node of a managed group the controller watches — in a dedicated
+	// test cluster, the suite's own — is a genuine VM: the capacity
+	// controller must have taken every report. A refusal here means the node
+	// image moved beyond the catalogue's 10% bounds, or the platform no
+	// longer names a group's nodes <nodegroup>-node<N>. The series is
+	// pre-seeded, so a missing one is a failed scrape, never a pass.
+	switch rejections, found, err := f.scrapeMetric("karpenter_clevercloud_instancetype_observed_capacity_rejections_total"); {
+	case err != nil:
+		t.Errorf("scraping observed_capacity_rejections_total: %v", err)
+	case !found:
+		t.Errorf("observed_capacity_rejections_total is not exposed by the controller, although it is pre-seeded at startup")
+	case rejections != 0:
+		t.Errorf("observed_capacity_rejections_total = %v, want 0: the controller refused the capacity report of a node of a managed group (see its log)", rejections)
+	}
+}
+
+// checkSeedCapacity compares a live node with the built-in catalogue, which
+// is what karpenter packs pods against until a node of the flavor reports.
+// The memory the kernel exposes moves with Clever Cloud's node image (the
+// seed was 4.4-5.0% above it before being re-measured): past 1% this fails,
+// so the next image change is caught here rather than by pods that do not
+// fit the node launched for them.
+func checkSeedCapacity(t *testing.T, node *corev1.Node, flavor string) {
+	t.Helper()
+	seed, ok := instancetype.SizingByName[flavor]
+	if !ok {
+		t.Errorf("node %s: flavor %q has no built-in sizing seed", node.Name, flavor)
+		return
+	}
+	if got := node.Status.Capacity.Cpu().Value(); got != seed.CPU {
+		t.Errorf("node %s (%s): capacity cpu %d, the built-in catalogue says %d", node.Name, flavor, got, seed.CPU)
+	}
+	gotKi := node.Status.Capacity.Memory().Value() / 1024
+	if deviation := float64(gotKi)/float64(seed.MemoryKi) - 1; math.Abs(deviation) > 0.01 {
+		t.Errorf("node %s (%s): capacity memory %dKi, the built-in catalogue says %dKi (%+.1f%%): the node image changed — "+
+			"re-measure FlavorSizing in pkg/providers/instancetype", node.Name, flavor, gotKi, seed.MemoryKi, deviation*100)
+	} else {
+		t.Logf("node %s (%s): capacity memory %dKi, catalogue %dKi (%+.2f%%)", node.Name, flavor, gotKi, seed.MemoryKi, deviation*100)
 	}
 }
 

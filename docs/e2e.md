@@ -91,7 +91,16 @@ kubectl --context <kubeconfig-context> -n karpenter scale deployment/karpenter -
 
 1. **Provision** — 2 pending pods → running pods; every NodeClaim
    `Registered`, its NodeGroup managed + `nodeCount: 1` + owner-referenced,
-   its node stamped with `clevercloud://<nodegroup>`.
+   its node stamped with `clevercloud://<nodegroup>`; the node's
+   `status.capacity` matches the built-in catalogue (cpu exactly, memory
+   within 1%) and the controller refused no capacity report
+   (`instancetype_observed_capacity_rejections_total` scraped and = 0; it
+   counts every node of a managed group the controller watches — in a
+   dedicated test cluster, the suite's own). The
+   memory the kernel exposes moves with Clever Cloud's node image, and a
+   fresh controller packs pods against the built-in value, so a node image
+   change fails here first: re-measure `FlavorSizing` (see
+   [E2E-RESULTS.md](E2E-RESULTS.md#node-capacity-re-measurement-2026-09-30)).
 2. **Consolidation / scale to zero** — workload deleted → claims drained,
    NodeGroups (and VMs) gone: billing stops.
 3. **Drift** — a `CleverNodeClass` label change rolls the node; the

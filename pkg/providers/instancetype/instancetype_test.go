@@ -49,8 +49,8 @@ func findInstanceType(t *testing.T, its []*corecloudprovider.InstanceType, name 
 	return nil
 }
 
-// observedL returns a plausible measured capacity/allocatable pair for the L
-// flavor that differs from the static estimate.
+// observedL returns a plausible capacity/allocatable pair for an L node that
+// differs from the catalogue entry (5% more memory, within the tolerance).
 func observedL(t *testing.T) (corev1.ResourceList, corev1.ResourceList) {
 	t.Helper()
 	capacity := corev1.ResourceList{
@@ -66,6 +66,14 @@ func observedL(t *testing.T) (corev1.ResourceList, corev1.ResourceList) {
 		corev1.ResourcePods:             resource.MustParse("110"),
 	}
 	return capacity, allocatable
+}
+
+// record feeds an observation the test expects to be accepted.
+func record(t *testing.T, p *instancetype.Provider, flavor string, capacity, allocatable corev1.ResourceList) {
+	t.Helper()
+	if _, err := p.RecordObservedCapacity(flavor, capacity, allocatable); err != nil {
+		t.Fatalf("RecordObservedCapacity(%s): %v", flavor, err)
+	}
 }
 
 func TestListReturnsFreshObjectsPerCall(t *testing.T) {
@@ -139,7 +147,7 @@ func TestGetKnownFlavor(t *testing.T) {
 	if got := it.Capacity.Cpu().Value(); got != 10 {
 		t.Errorf("expected 10 vCPU, got %d", got)
 	}
-	wantMemory := resource.MustParse("15988992Ki")
+	wantMemory := resource.MustParse("15229256Ki")
 	if it.Capacity.Memory().Cmp(wantMemory) != 0 {
 		t.Errorf("expected memory %s, got %s", wantMemory.String(), it.Capacity.Memory())
 	}
@@ -161,7 +169,7 @@ func TestRecordObservedCapacityOverridesEstimate(t *testing.T) {
 	p := instancetype.NewProvider("par", nil, nil)
 	capacity, allocatable := observedL(t)
 
-	p.RecordObservedCapacity("L", capacity, allocatable)
+	record(t, p, "L", capacity, allocatable)
 
 	it, err := p.Get("L")
 	if err != nil {
@@ -200,19 +208,19 @@ func TestRecordObservedCapacityIgnoresZero(t *testing.T) {
 		corev1.ResourceCPU:    resource.MustParse("12"),
 		corev1.ResourceMemory: resource.MustParse("0"),
 	}
-	p.RecordObservedCapacity("L", zeroCPU, zeroCPU)
-	p.RecordObservedCapacity("L", zeroMemory, zeroMemory)
+	record(t, p, "L", zeroCPU, zeroCPU)
+	record(t, p, "L", zeroMemory, zeroMemory)
 
 	it, err := p.Get("L")
 	if err != nil {
 		t.Fatalf("Get(L): %v", err)
 	}
 	if got := it.Capacity.Cpu().Value(); got != 12 {
-		t.Errorf("expected static cpu estimate 12, got %d", got)
+		t.Errorf("expected the catalogue entry's cpu 12, got %d", got)
 	}
-	wantMemory := resource.MustParse("23983488Ki")
+	wantMemory := resource.MustParse("22896304Ki")
 	if it.Capacity.Memory().Cmp(wantMemory) != 0 {
-		t.Errorf("expected static memory estimate %s, got %s", wantMemory.String(), it.Capacity.Memory())
+		t.Errorf("expected the catalogue entry's memory %s, got %s", wantMemory.String(), it.Capacity.Memory())
 	}
 	wantReserved := resource.MustParse("100Mi")
 	gotReserved := it.Overhead.KubeReserved[corev1.ResourceMemory]
@@ -236,7 +244,7 @@ func TestRecordObservedCapacityDropsExtendedResources(t *testing.T) {
 	allocatable[gpu] = resource.MustParse("1")
 	allocatable[hugepages] = resource.MustParse("512Mi")
 
-	p.RecordObservedCapacity("L", capacity, allocatable)
+	record(t, p, "L", capacity, allocatable)
 
 	it, err := p.Get("L")
 	if err != nil {
@@ -415,11 +423,11 @@ func TestDefaultFlavorsPriceTable(t *testing.T) {
 		price float64
 	}{
 		{"2XS", 1},
-		{"XS", 1.8527},
-		{"S", 2.7044},
-		{"M", 3.5582},
-		{"L", 5.0873},
-		{"XL", 6.783},
+		{"XS", 1.8554},
+		{"S", 2.7097},
+		{"M", 3.566},
+		{"L", 5.1084},
+		{"XL", 6.8212},
 	}
 	if len(instancetype.DefaultFlavors) != len(want) {
 		t.Fatalf("DefaultFlavors has %d flavors, the pinned table %d", len(instancetype.DefaultFlavors), len(want))
@@ -513,27 +521,32 @@ func TestRelativePriceKeepsConsolidationOrder(t *testing.T) {
 	}
 
 	// Overrides reprice their flavor against the unchanged 2XS reference.
-	// The README's settings.flavors example pins every flavor to the memory
-	// its nodes report on the current CKE image, which keeps the property;
-	// the same pin on M alone does not, which is why the docs say to pin
-	// every flavor the same way, or none.
-	measuredMemoryKi := map[string]int64{
-		"2XS": 3715344, "XS": 7553664, "S": 11385832, "M": 15229256, "L": 22896304, "XL": 30584176,
+	// When the node image moves, the README tells operators to pin every
+	// flavor to the memory its nodes then report. Pinning every flavor to
+	// what the previous image reported (the seed before the 2026-09-30
+	// measurements, 4.4-5.0% above today's) keeps the property; the same
+	// pin on XL alone, or 5% below its built-in memory, does not, which is
+	// why the docs say to pin every flavor the same way, or none.
+	previousImageMemoryKi := map[string]int64{
+		"2XS": 3911884, "XS": 7937580, "S": 11957148, "M": 15988992, "L": 23983488, "XL": 31977984,
 	}
 	var allPinned []instancetype.FlavorOverride
 	for _, s := range instancetype.FlavorSizing {
-		allPinned = append(allPinned, instancetype.FlavorOverride{Name: s.Name, MemoryKi: ptr(measuredMemoryKi[s.Name])})
+		allPinned = append(allPinned, instancetype.FlavorOverride{Name: s.Name, MemoryKi: ptr(previousImageMemoryKi[s.Name])})
 	}
 	pinned, skipped := instancetype.ApplyOverrides(instancetype.DefaultFlavors, allPinned)
 	if len(skipped) != 0 {
 		t.Fatalf("unexpected skipped overrides: %v", skipped)
 	}
 	if n := orderMismatches(t, pinned, served); n != 0 {
-		t.Errorf("pinning every flavor to its measured memory orders %d pairs of flavor sets differently from the public prices", n)
+		t.Errorf("pinning every flavor to the previous image's memory orders %d pairs of flavor sets differently from the public prices", n)
 	}
-	mOnly, _ := instancetype.ApplyOverrides(instancetype.DefaultFlavors, []instancetype.FlavorOverride{{Name: "M", MemoryKi: ptr(measuredMemoryKi["M"])}})
-	if n := orderMismatches(t, mOnly, served); n == 0 {
-		t.Error("pinning M alone was expected to reorder some flavor sets; if it no longer does, revisit the README's pin-every-flavor advice")
+	xl := instancetype.SizingByName["XL"].MemoryKi
+	for name, memoryKi := range map[string]int64{"the previous image's": previousImageMemoryKi["XL"], "5% less": xl * 95 / 100} {
+		xlOnly, _ := instancetype.ApplyOverrides(instancetype.DefaultFlavors, []instancetype.FlavorOverride{{Name: "XL", MemoryKi: ptr(memoryKi)}})
+		if n := orderMismatches(t, xlOnly, served); n == 0 {
+			t.Errorf("pinning XL alone to %s memory was expected to reorder some flavor sets; if it no longer does, revisit the README's pin-every-flavor advice", name)
+		}
 	}
 }
 
@@ -560,7 +573,7 @@ func TestApplyOverrides(t *testing.T) {
 	base := instancetype.DefaultFlavors
 
 	t.Run("memory only reprices the flavor", func(t *testing.T) {
-		got, skipped := instancetype.ApplyOverrides(base, []instancetype.FlavorOverride{{Name: "M", MemoryKi: ptr(int64(15229256))}})
+		got, skipped := instancetype.ApplyOverrides(base, []instancetype.FlavorOverride{{Name: "M", MemoryKi: ptr(int64(15988992))}})
 		if len(skipped) != 0 {
 			t.Fatalf("unexpected skipped: %v", skipped)
 		}
@@ -568,25 +581,25 @@ func TestApplyOverrides(t *testing.T) {
 			t.Fatalf("expected %d flavors, got %d", len(base), len(got))
 		}
 		m := findFlavor(t, got, "M")
-		if m.CPU != 10 || m.MemoryKi != 15229256 {
+		if m.CPU != 10 || m.MemoryKi != 15988992 {
 			t.Errorf("expected only memoryKi overridden, got %+v", m)
 		}
 		// The price follows the pinned memory, not the seed's.
-		if want := instancetype.RelativePrice(10, 15229256); m.Price != want {
+		if want := instancetype.RelativePrice(10, 15988992); m.Price != want {
 			t.Errorf("M price = %v, want %v derived from the pinned memoryKi", m.Price, want)
 		}
-		if seed := findFlavor(t, base, "M"); m.Price >= seed.Price {
-			t.Errorf("less memory must cost less: pinned M at %v, seed M at %v", m.Price, seed.Price)
+		if seed := findFlavor(t, base, "M"); m.Price <= seed.Price {
+			t.Errorf("more memory must cost more: pinned M at %v, seed M at %v", m.Price, seed.Price)
 		}
 	})
 
 	t.Run("cpu only reprices the flavor", func(t *testing.T) {
 		got, _ := instancetype.ApplyOverrides(base, []instancetype.FlavorOverride{{Name: "M", CPU: ptr(int64(99))}})
 		m := findFlavor(t, got, "M")
-		if m.CPU != 99 || m.MemoryKi != 15988992 {
+		if m.CPU != 99 || m.MemoryKi != 15229256 {
 			t.Errorf("expected only cpu overridden, got %+v", m)
 		}
-		if want := instancetype.RelativePrice(99, 15988992); m.Price != want {
+		if want := instancetype.RelativePrice(99, 15229256); m.Price != want {
 			t.Errorf("M price = %v, want %v derived from the pinned cpu", m.Price, want)
 		}
 	})
@@ -599,7 +612,7 @@ func TestApplyOverrides(t *testing.T) {
 			t.Fatalf("unexpected skipped: %v", skipped)
 		}
 		l := findFlavor(t, got, "L")
-		if l.CPU != 12 || l.MemoryKi != 23983488 || l.Price != findFlavor(t, base, "L").Price {
+		if l.CPU != 12 || l.MemoryKi != 22896304 || l.Price != findFlavor(t, base, "L").Price {
 			t.Errorf("expected L seeded from sizing table and priced like the built-in L, got %+v", l)
 		}
 	})
@@ -642,7 +655,7 @@ func findFlavor(t *testing.T, flavors []instancetype.Flavor, name string) instan
 }
 
 func TestNewProviderOverlaysOverridesOnTheSeed(t *testing.T) {
-	p := instancetype.NewProvider("par", nil, []instancetype.FlavorOverride{{Name: "M", MemoryKi: ptr(int64(15229256))}})
+	p := instancetype.NewProvider("par", nil, []instancetype.FlavorOverride{{Name: "M", MemoryKi: ptr(int64(15988992))}})
 
 	if got := len(p.List()); got != len(instancetype.DefaultFlavors) {
 		t.Fatalf("a memory-only override must not change the catalogue size: got %d flavors, want %d", got, len(instancetype.DefaultFlavors))
@@ -651,10 +664,10 @@ func TestNewProviderOverlaysOverridesOnTheSeed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get(M): %v", err)
 	}
-	if want := resource.MustParse("15229256Ki"); m.Capacity.Memory().Cmp(want) != 0 {
+	if want := resource.MustParse("15988992Ki"); m.Capacity.Memory().Cmp(want) != 0 {
 		t.Errorf("expected the pinned M memory %s, got %s", want.String(), m.Capacity.Memory())
 	}
-	if want := instancetype.RelativePrice(10, 15229256); m.Offerings[0].Price != want {
+	if want := instancetype.RelativePrice(10, 15988992); m.Offerings[0].Price != want {
 		t.Errorf("the offering must carry the price of the pinned sizing %v, got %v", want, m.Offerings[0].Price)
 	}
 	if got := m.Capacity.Cpu().Value(); got != 10 {
@@ -684,7 +697,10 @@ func TestProviderConcurrentAccess(t *testing.T) {
 					return
 				}
 				_, _ = p.Get("M")
-				p.RecordObservedCapacity("L", capacity, allocatable)
+				if _, err := p.RecordObservedCapacity("L", capacity, allocatable); err != nil {
+					t.Errorf("RecordObservedCapacity: %v", err)
+					return
+				}
 			}
 		}()
 	}
@@ -695,7 +711,7 @@ func TestRecordObservedCapacityDeepCopies(t *testing.T) {
 	p := instancetype.NewProvider("par", nil, nil)
 	capacity, allocatable := observedL(t)
 
-	p.RecordObservedCapacity("L", capacity, allocatable)
+	record(t, p, "L", capacity, allocatable)
 
 	// Mutating the caller's lists after recording must not affect the catalog.
 	capacity[corev1.ResourceCPU] = resource.MustParse("999")
@@ -788,7 +804,7 @@ func TestSynthesizeServesDegradedTypesWithoutTouchingTheCatalog(t *testing.T) {
 	})
 
 	t.Run("observed capacity enriches the synthesis", func(t *testing.T) {
-		p.RecordObservedCapacity("CUSTOM",
+		record(t, p, "CUSTOM",
 			corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6"), corev1.ResourceMemory: resource.MustParse("8Gi")},
 			corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6"), corev1.ResourceMemory: resource.MustParse("7Gi")},
 		)
@@ -840,11 +856,11 @@ func TestLoadFlavorsOrDegradeNeverFails(t *testing.T) {
 		// override: the file loaded "successfully", the gauge stayed 0 and
 		// the operator's pin never applied. Strict parsing turns it into
 		// the same loud degradation as any other invalid file.
-		"mistyped field key degrades instead of silently no-oping": "- name: M\n  memory: 15229256\n",
+		"mistyped field key degrades instead of silently no-oping": "- name: M\n  memory: 15988992\n",
 		// A file written for a release that still took priceHourly: the
 		// whole file is refused, its memoryKi pin included, and the gauge
 		// tells the operator to remove the key.
-		"legacy priceHourly key degrades": "- name: M\n  memoryKi: 15229256\n  priceHourly: 0.1167\n",
+		"legacy priceHourly key degrades": "- name: M\n  memoryKi: 15988992\n  priceHourly: 0.1167\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "flavors.yaml")
@@ -863,7 +879,7 @@ func TestLoadFlavorsOrDegradeNeverFails(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Get(M): %v", err)
 			}
-			if want := resource.MustParse("15988992Ki"); m.Capacity.Memory().Cmp(want) != 0 {
+			if want := resource.MustParse("15229256Ki"); m.Capacity.Memory().Cmp(want) != 0 {
 				t.Errorf("expected the base M memory %s, got %s", want.String(), m.Capacity.Memory())
 			}
 			if want := findFlavor(t, instancetype.DefaultFlavors, "M").Price; m.Offerings[0].Price != want {
