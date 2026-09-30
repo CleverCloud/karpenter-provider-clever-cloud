@@ -23,13 +23,18 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
+	mrand "math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -64,10 +69,16 @@ const (
 	runLabelKey = "e2e.karpenter.clever-cloud.com/run"
 )
 
+// errControllerExited is the cause of the scenario context's cancellation
+// when the controller subprocess exits without the suite asking it to.
+var errControllerExited = errors.New("the controller exited unexpectedly")
+
 // framework carries everything one suite run needs: a pinned kubeconfig, a
 // direct (uncached) client, the controller subprocess and unique names.
 type framework struct {
-	t              *testing.T
+	// t is the (sub)test's *testing.T in the suite; the harness tests record
+	// what the cleanup reports through it.
+	t              testing.TB
 	client         client.Client
 	clientset      *kubernetes.Clientset
 	restCfg        *rest.Config
@@ -77,10 +88,40 @@ type framework struct {
 	prefix    string // "e2e-<runID>", prefixes every cluster-scoped object name
 	namespace string
 
-	metricsPort int
-	healthPort  int
-	artifacts   string
-	logPath     string
+	metricsPort int // set by startController
+	healthPort  int // set by startController
+	// recheckAfter is how long after the cleanup the run's NodeGroups are
+	// looked for once more (E2E_CLEANUP_RECHECK); 0 skips the re-check.
+	recheckAfter time.Duration
+	artifacts    string
+	logPath      string
+
+	// ctrl is the controller subprocess, set by startController. A pointer:
+	// withT copies the framework, and every copy must see the same process.
+	ctrl *controller
+}
+
+// controller tracks the out-of-cluster controller subprocess.
+type controller struct {
+	pid int
+	// exited is closed once the process has been reaped, after an unexpected
+	// exit has been reported.
+	exited chan struct{}
+	// stopping is set before the suite stops the process on purpose: an exit
+	// after it is expected.
+	stopping atomic.Bool
+	// crashed is set when the process exited while the suite still needed it.
+	crashed atomic.Bool
+}
+
+// dead reports whether the controller process has exited.
+func (c *controller) dead() bool {
+	select {
+	case <-c.exited:
+		return true
+	default:
+		return false
+	}
 }
 
 func newFramework(t *testing.T) *framework {
@@ -99,13 +140,19 @@ func newFramework(t *testing.T) *framework {
 	runID := hex.EncodeToString(buf)
 
 	f := &framework{
-		t:           t,
-		runID:       runID,
-		prefix:      "e2e-" + runID,
-		namespace:   "e2e-" + runID,
-		metricsPort: envInt("E2E_METRICS_PORT", 8090),
-		healthPort:  envInt("E2E_HEALTH_PORT", 8091),
-		artifacts:   envString("E2E_ARTIFACTS", filepath.Join(os.TempDir(), "karpenter-e2e")),
+		t:            t,
+		runID:        runID,
+		prefix:       "e2e-" + runID,
+		namespace:    "e2e-" + runID,
+		recheckAfter: 2 * time.Minute,
+		artifacts:    envString("E2E_ARTIFACTS", filepath.Join(os.TempDir(), "karpenter-e2e")),
+	}
+	if v := os.Getenv("E2E_CLEANUP_RECHECK"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			t.Fatalf("E2E_CLEANUP_RECHECK=%q: want a duration such as 7m, or 0 to skip the re-check", v)
+		}
+		f.recheckAfter = d
 	}
 	if err := os.MkdirAll(f.artifacts, 0o755); err != nil {
 		t.Fatalf("creating artifacts dir: %v", err)
@@ -161,13 +208,170 @@ func envString(key, fallback string) string {
 	return fallback
 }
 
-func envInt(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
+// minPickedPort is the lowest port reserveControllerPorts picks on its own,
+// clear of the ports local services are commonly configured on.
+const minPickedPort = 10000
+
+// reserveControllerPorts returns the controller's metrics and health ports:
+// E2E_METRICS_PORT / E2E_HEALTH_PORT (read through getenv) when set, free
+// ports drawn by pick (portOutside in the suite) otherwise, so two suites
+// (against sibling clusters) never compete for a fixed default. A picked port
+// lies outside the kernel's ephemeral range: the kernel draws the source port
+// of every outbound connection from that range (the suite's readiness dials,
+// the controller's own apiserver connections), and one of them could take an
+// ephemeral port between its release here and the controller's bind,
+// crashing the controller for nothing. Each port is bound here the way the
+// controller binds it (every interface): a port another process holds is an
+// error now, naming it, rather than a controller panic. Every override is
+// bound before any port is picked, so a pick that draws an override's port
+// finds it taken and draws again, instead of taking it and failing the
+// override as if another process held it. The binds are released on return,
+// right before the controller starts; startController then checks the
+// controller really holds both.
+func reserveControllerPorts(getenv func(string) string, pick func(lo, hi int) int) (metrics, health int, err error) {
+	var listeners []net.Listener
+	defer func() {
+		for _, l := range listeners {
+			_ = l.Close()
+		}
+	}()
+	lo, hi, err := ephemeralPortRange()
+	if err != nil {
+		return 0, 0, err
+	}
+	keys := [2]string{"E2E_METRICS_PORT", "E2E_HEALTH_PORT"}
+	var ports [2]int
+	for i, key := range keys {
+		v := getenv(key)
+		if v == "" {
+			continue
+		}
+		port, err := strconv.Atoi(v)
+		if err != nil || port < 1 || port > 65535 {
+			return 0, 0, fmt.Errorf("%s=%q is not a TCP port (1-65535)", key, v)
+		}
+		if port == ports[0] {
+			return 0, 0, fmt.Errorf("%s=%d is also %s: the metrics and health ports must differ", key, port, keys[0])
+		}
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			return 0, 0, fmt.Errorf("%s=%d: the port is not free: %w", key, port, err)
+		}
+		listeners = append(listeners, l)
+		ports[i] = port
+	}
+	for i, key := range keys {
+		if ports[i] != 0 {
+			continue
+		}
+		for range 64 {
+			// 0 (the kernel picks an ephemeral port) only when the
+			// ephemeral range leaves no port to pick outside it.
+			port := pick(lo, hi)
+			l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+			if err != nil {
+				if port == 0 {
+					return 0, 0, fmt.Errorf("reserving a port for %s: %w", key, err)
+				}
+				continue // taken, by another process or an override: draw again
+			}
+			listeners = append(listeners, l)
+			ports[i] = l.Addr().(*net.TCPAddr).Port
+			break
+		}
+		if ports[i] == 0 {
+			return 0, 0, fmt.Errorf("reserving a port for %s: no free port found outside the ephemeral range %d-%d; set %s", key, lo, hi, key)
 		}
 	}
-	return fallback
+	return ports[0], ports[1], nil
+}
+
+// ephemeralPortRange returns the kernel's ephemeral port range
+// (net.ipv4.ip_local_port_range, which IPv6 shares): the ports it hands out
+// as the source port of an outbound connection and to a bind on port 0.
+func ephemeralPortRange() (lo, hi int, err error) {
+	const path = "/proc/sys/net/ipv4/ip_local_port_range"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	fields := strings.Fields(string(raw))
+	if len(fields) == 2 {
+		lo, errLo := strconv.Atoi(fields[0])
+		hi, errHi := strconv.Atoi(fields[1])
+		if errLo == nil && errHi == nil && lo <= hi {
+			return lo, hi, nil
+		}
+	}
+	return 0, 0, fmt.Errorf("%s: unexpected content %q", path, raw)
+}
+
+// portOutside returns a random port in [minPickedPort, 65535] outside
+// [lo, hi], or 0 when there is none.
+func portOutside(lo, hi int) int {
+	below := max(0, lo-minPickedPort)      // minPickedPort .. lo-1
+	aboveStart := max(hi+1, minPickedPort) // aboveStart .. 65535
+	above := max(0, 65535-aboveStart+1)
+	if below+above == 0 {
+		return 0
+	}
+	n := mrand.IntN(below + above)
+	if n < below {
+		return minPickedPort + n
+	}
+	return aboveStart + n - below
+}
+
+// listensOn reports whether process pid holds a listening TCP socket on
+// port. The suite already requires Linux (Pdeathsig), so it reads /proc: the
+// kernel's socket tables give the inode of every listener on the port, and
+// the process's file descriptors say whether one of them is its own.
+func listensOn(pid, port int) (bool, error) {
+	inodes := map[string]bool{}
+	for _, table := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		raw, err := os.ReadFile(table)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // IPv6 disabled on this host
+		}
+		if err != nil {
+			return false, err
+		}
+		for _, line := range strings.Split(string(raw), "\n")[1:] {
+			// sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode ...
+			fields := strings.Fields(line)
+			if len(fields) < 10 || fields[3] != "0A" { // 0A: TCP_LISTEN
+				continue
+			}
+			_, hexPort, ok := strings.Cut(fields[1], ":")
+			if !ok {
+				continue
+			}
+			if p, err := strconv.ParseUint(hexPort, 16, 16); err == nil && int(p) == port {
+				inodes[fields[9]] = true
+			}
+		}
+	}
+	if len(inodes) == 0 {
+		return false, nil
+	}
+	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+	fds, err := os.ReadDir(fdDir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil // the process is gone; its exit is reported by startController's watcher
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, fd := range fds {
+		target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
+		if err != nil {
+			continue // closed since the listing
+		}
+		if inode, ok := strings.CutPrefix(target, "socket:["); ok && inodes[strings.TrimSuffix(inode, "]")] {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // checkCluster refuses to run against anything that does not look like the
@@ -216,7 +420,7 @@ func (f *framework) applyCRDs(ctx context.Context) {
 	f.t.Logf("applied %d CRDs", len(entries))
 }
 
-func repoRoot(t *testing.T) string {
+func repoRoot(t testing.TB) string {
 	t.Helper()
 	dir, err := os.Getwd()
 	if err != nil {
@@ -236,9 +440,13 @@ func repoRoot(t *testing.T) string {
 
 // startController builds the controller from the working tree and runs it
 // out-of-cluster against the pinned kubeconfig — the `make run` shape used by
-// every manual validation run. It returns a stop function that must run after
-// cleanup (cleanup needs a live controller to drain NodeClaims).
-func (f *framework) startController(ctx context.Context) func() {
+// every manual validation run. It returns a context derived from ctx that is
+// cancelled, with the exit as its cause, the moment the controller exits on
+// its own: the scenarios run on it, so a dead controller aborts them at once
+// instead of leaving each wait to time out against a cluster nobody
+// reconciles. The stop function it also returns must run after cleanup
+// (cleanup needs a live controller to drain NodeClaims).
+func (f *framework) startController(ctx context.Context) (context.Context, func()) {
 	f.t.Helper()
 	root := repoRoot(f.t)
 	bin := filepath.Join(f.artifacts, fmt.Sprintf("controller-%s", f.runID))
@@ -254,6 +462,11 @@ func (f *framework) startController(ctx context.Context) func() {
 		f.t.Fatalf("creating controller log file: %v", err)
 	}
 
+	f.metricsPort, f.healthPort, err = reserveControllerPorts(os.Getenv, portOutside)
+	if err != nil {
+		_ = logFile.Close()
+		f.t.Fatalf("reserving the controller ports: %v", err)
+	}
 	cmd := exec.Command(bin)
 	cmd.Dir = root
 	cmd.Stdout = logFile
@@ -270,39 +483,105 @@ func (f *framework) startController(ctx context.Context) func() {
 		fmt.Sprintf("HEALTH_PROBE_PORT=%d", f.healthPort),
 	)
 	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
 		f.t.Fatalf("starting controller: %v", err)
 	}
-	f.t.Logf("controller started (pid %d, log %s)", cmd.Process.Pid, f.logPath)
+	// An exit the suite did not ask for (a panic, a port another process
+	// took before the controller bound it) fails the suite from the watcher,
+	// as it happens, with the log tail: Errorf and Logf are safe from any
+	// goroutine while the test runs.
+	ctrl, ctx, cancel := watchController(ctx, cmd, func(exitErr error) {
+		f.t.Errorf("%v: failing the suite now", exitErr)
+		f.dumpControllerLog()
+	})
+	f.ctrl = ctrl
+	f.t.Logf("controller started (pid %d, metrics port %d, health port %d, log %s)", ctrl.pid, f.metricsPort, f.healthPort, f.logPath)
 
+	// A healthy answer alone proves nothing: another local process may
+	// listen on the port, and the controller only binds its ports once it
+	// runs its manager. The controller must be the one listening on both.
 	healthURL := fmt.Sprintf("http://127.0.0.1:%d/healthz", f.healthPort)
+	var last string
 	if err := wait.PollUntilContextTimeout(ctx, time.Second, 90*time.Second, true, func(ctx context.Context) (bool, error) {
-		resp, err := http.Get(healthURL)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 		if err != nil {
+			return false, err
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			last = err.Error()
 			return false, nil
 		}
-		defer resp.Body.Close()
-		return resp.StatusCode == http.StatusOK, nil
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			last = "GET /healthz: " + resp.Status
+			return false, nil
+		}
+		for _, port := range []int{f.healthPort, f.metricsPort} {
+			owned, err := listensOn(ctrl.pid, port)
+			if err != nil {
+				return false, fmt.Errorf("checking which process listens on port %d: %w", port, err)
+			}
+			if !owned {
+				last = fmt.Sprintf("port %d is not held by the controller (pid %d): another process listens on it, or the controller has not bound it yet", port, ctrl.pid)
+				return false, nil
+			}
+		}
+		return true, nil
 	}); err != nil {
+		ctrl.stopping.Store(true)
 		_ = cmd.Process.Kill()
+		<-ctrl.exited
+		cause := context.Cause(ctx)
+		cancel(nil)
+		_ = logFile.Close()
+		if ctrl.crashed.Load() {
+			// The watcher already failed the suite with the log tail.
+			f.t.Fatalf("controller never became healthy: %v", cause)
+		}
 		f.dumpControllerLog()
-		f.t.Fatalf("controller never became healthy on %s: %v", healthURL, err)
+		f.t.Fatalf("controller never became healthy on %s: %v (last: %s)", healthURL, err, last)
 	}
 
-	return func() {
+	return ctx, func() {
+		ctrl.stopping.Store(true)
 		// SIGINT lets the manager stop cleanly; escalate if it lingers.
 		_ = cmd.Process.Signal(syscall.SIGINT)
-		done := make(chan struct{})
-		go func() { _, _ = cmd.Process.Wait(); close(done) }()
 		select {
-		case <-done:
+		case <-ctrl.exited:
 		case <-time.After(30 * time.Second):
 			_ = cmd.Process.Kill()
+			<-ctrl.exited
 		}
+		cancel(nil)
 		_ = logFile.Close()
-		if f.t.Failed() {
+		// A crash printed the tail when it happened.
+		if f.t.Failed() && !ctrl.crashed.Load() {
 			f.dumpControllerLog()
 		}
 	}
+}
+
+// watchController runs the only Wait of the started process cmd. It returns
+// the controller handle and a context derived from ctx that, when the
+// process exits before stopping is set, is cancelled with the exit as its
+// cause, right after onCrash has reported that exit. exited is closed only
+// once onCrash has returned, so a stop that waits on it never races a crash
+// report.
+func watchController(ctx context.Context, cmd *exec.Cmd, onCrash func(exitErr error)) (*controller, context.Context, context.CancelCauseFunc) {
+	ctrl := &controller{pid: cmd.Process.Pid, exited: make(chan struct{})}
+	ctx, cancel := context.WithCancelCause(ctx)
+	go func() {
+		_ = cmd.Wait()
+		if !ctrl.stopping.Load() {
+			ctrl.crashed.Store(true)
+			exitErr := fmt.Errorf("%w (pid %d, %s)", errControllerExited, ctrl.pid, cmd.ProcessState)
+			onCrash(exitErr)
+			cancel(exitErr)
+		}
+		close(ctrl.exited)
+	}()
+	return ctrl, ctx, cancel
 }
 
 // dumpControllerLog surfaces the tail of the controller log into the test
@@ -327,20 +606,36 @@ func (f *framework) dumpControllerLog() {
 
 // eventually polls cond until it reports done or the timeout elapses; the
 // last message is included in the failure. All waits go through this so a
-// suite-context deadline aborts them promptly and cleanup still runs.
+// suite-context deadline or the controller's death aborts them promptly,
+// naming which, and cleanup still runs.
 func (f *framework) eventually(ctx context.Context, timeout time.Duration, what string, cond func(ctx context.Context) (bool, string)) {
 	f.t.Helper()
 	start := time.Now()
+	if err := waitUntil(ctx, 5*time.Second, timeout, cond); err != nil {
+		f.t.Fatalf("%s: %v", what, err)
+	}
+	f.t.Logf("%s: reached in %s", what, time.Since(start).Round(time.Second))
+}
+
+// waitUntil polls cond every interval until it reports done (nil) or the
+// wait ends. The error then says why, with cond's last message: the cause of
+// ctx's cancellation (the controller's exit, the suite deadline) when ctx
+// ended it, the timeout otherwise.
+func waitUntil(ctx context.Context, interval, timeout time.Duration, cond func(ctx context.Context) (bool, string)) error {
+	start := time.Now()
 	var last string
-	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, interval, timeout, true, func(ctx context.Context) (bool, error) {
 		var done bool
 		done, last = cond(ctx)
 		return done, nil
 	})
-	if err != nil {
-		f.t.Fatalf("%s: not reached within %s (last: %s)", what, timeout, last)
+	if err == nil {
+		return nil
 	}
-	f.t.Logf("%s: reached in %s", what, time.Since(start).Round(time.Second))
+	if cause := context.Cause(ctx); cause != nil {
+		return fmt.Errorf("aborted after %s: %w (last: %s)", time.Since(start).Round(time.Second), cause, last)
+	}
+	return fmt.Errorf("not reached within %s (last: %s)", timeout, last)
 }
 
 // metric returns the summed value of a provider metric across its label
@@ -538,6 +833,9 @@ func (f *framework) claimsOfPool(ctx context.Context, pool string) []karpv1.Node
 	return claims.Items
 }
 
+// decoyName names the garbage collection scenario's hand-made NodeGroup.
+func (f *framework) decoyName() string { return f.prefix + "-decoy" }
+
 // runNodeGroups lists NodeGroups whose name carries this run's prefix,
 // failing the test on error — for scenario assertions.
 func (f *framework) runNodeGroups(ctx context.Context) []ngv1.NodeGroup {
@@ -571,9 +869,11 @@ func (f *framework) tryRunNodeGroups(ctx context.Context) ([]ngv1.NodeGroup, err
 // ownerless NodeGroups (nothing can drain those), then NodePools (karpenter
 // drains claims and deletes NodeGroups), then NodeClasses (their finalizer
 // waits on the claims), then a direct sweep of any NodeGroup left carrying
-// the run prefix. It uses a fresh context so it still runs after the suite
-// deadline expired, and never aborts on a transient API error — this is the
-// last line of defense against VMs that bill hourly.
+// the run prefix, and recheckAfter later a second look for one. An ownerless
+// group met at any of these steps goes through deleteOwnerless, which fails
+// the run for any but the decoy. It uses a fresh context so it still runs
+// after the suite deadline expired, and never aborts on a transient API
+// error — this is the last line of defense against VMs that bill hourly.
 func (f *framework) cleanupAll() {
 	f.t.Helper()
 	if os.Getenv("E2E_KEEP") != "" {
@@ -588,21 +888,16 @@ func (f *framework) cleanupAll() {
 		f.t.Errorf("cleanup: deleting namespace %s: %v", f.namespace, err)
 	}
 
-	// Hand-made groups without a NodeClaim owner (the GC decoy) can only be
-	// deleted directly — karpenter never drains them, and waiting on them
-	// would burn the whole graceful budget below.
+	// Groups without a NodeClaim owner (the GC decoy, a group the platform
+	// re-created) can only be deleted directly — karpenter never drains
+	// them, and waiting on them would burn the whole graceful budget below.
+	// ownerless holds the uids already dealt with, so no step reports or
+	// waits on one twice.
+	ownerless := map[types.UID]bool{}
 	if groups, err := f.tryRunNodeGroups(ctx); err != nil {
 		f.t.Errorf("cleanup: listing nodegroups for the ownerless sweep: %v", err)
 	} else {
-		for i := range groups {
-			ng := &groups[i]
-			if len(nodegroup.NodeClaimOwners(ng)) == 0 && ng.DeletionTimestamp.IsZero() {
-				f.t.Logf("cleanup: deleting ownerless nodegroup %s directly", ng.Name)
-				if err := f.client.Delete(ctx, ng); err != nil && !apierrors.IsNotFound(err) {
-					f.t.Errorf("cleanup: deleting ownerless nodegroup %s: %v", ng.Name, err)
-				}
-			}
-		}
+		f.sweepOwnerless(ctx, groups, ownerless)
 	}
 
 	pools := &karpv1.NodePoolList{}
@@ -618,31 +913,16 @@ func (f *framework) cleanupAll() {
 
 	// Wait for karpenter to drain every claim of this run — this is the
 	// normal, graceful path that also deletes the NodeGroups (and VMs).
-	// Groups already carrying a deletion timestamp are the platform's to
-	// finish; only claim-backed live groups are worth the graceful wait.
 	deadline := 15 * time.Minute
 	err := wait.PollUntilContextTimeout(ctx, 10*time.Second, deadline, true, func(ctx context.Context) (bool, error) {
-		claims := &karpv1.NodeClaimList{}
-		if err := f.client.List(ctx, claims); err != nil {
-			return false, nil
-		}
-		for _, c := range claims.Items {
-			if strings.HasPrefix(c.Name, f.prefix) {
-				return false, nil
-			}
-		}
-		groups, err := f.tryRunNodeGroups(ctx)
-		if err != nil {
-			return false, nil
-		}
-		for _, ng := range groups {
-			if ng.DeletionTimestamp.IsZero() {
-				return false, nil
-			}
-		}
-		return true, nil
+		return f.drainDone(ctx, ownerless)
 	})
-	if err != nil {
+	drained := !errors.Is(err, errControllerExited)
+	switch {
+	case !drained:
+		f.t.Errorf("cleanup: the controller is dead, so nothing drains the claims of run %s: deleting their nodegroups directly — "+
+			"run hack/e2e-cleanup.sh afterwards for the claims, nodes and nodeclasses left on their finalizers", f.runID)
+	case err != nil:
 		f.t.Errorf("cleanup: claims/nodegroups of run %s still present after %s", f.runID, deadline)
 	}
 
@@ -657,24 +937,44 @@ func (f *framework) cleanupAll() {
 		}
 	}
 
-	// Last-resort direct sweep: anything still carrying the run prefix.
+	// Last-resort direct sweep: anything still carrying the run prefix. The
+	// uids it sees tell the re-check a group that survived from one that
+	// reappeared — as long as one of its two listings succeeded (swept).
+	seen := map[types.UID]bool{}
+	swept := false
 	groups, err2 := f.tryRunNodeGroups(ctx)
 	if err2 != nil {
 		f.t.Errorf("cleanup: listing nodegroups for the final sweep: %v — LEFTOVERS MAY BILL HOURLY, run hack/e2e-cleanup.sh", err2)
+	} else {
+		swept = true
 	}
 	for i := range groups {
 		ng := &groups[i]
+		seen[ng.UID] = true
 		if !ng.DeletionTimestamp.IsZero() {
 			continue
 		}
-		f.t.Errorf("cleanup: nodegroup %s survived the graceful path, deleting directly (check why!)", ng.Name)
+		if len(nodegroup.NodeClaimOwners(ng)) == 0 && !ownerless[ng.UID] {
+			f.deleteOwnerless(ctx, ng, ownerless) // appeared after the graceful wait
+			continue
+		}
+		if drained {
+			f.t.Errorf("cleanup: nodegroup %s survived the graceful path, deleting directly (check why!)", ng.Name)
+		} else {
+			// Expected: the graceful path was skipped, the failure is already reported.
+			f.t.Logf("cleanup: deleting nodegroup %s directly (the controller is dead)", ng.Name)
+		}
 		if err := f.client.Delete(ctx, ng); err != nil && !apierrors.IsNotFound(err) {
 			f.t.Errorf("cleanup: direct delete of nodegroup %s failed: %v — DELETE IT MANUALLY, IT BILLS HOURLY", ng.Name, err)
 		}
 	}
-	if leftovers, err := f.tryRunNodeGroups(ctx); err == nil {
+	if leftovers, err := f.tryRunNodeGroups(ctx); err != nil {
+		f.t.Logf("cleanup: listing nodegroups to verify the final sweep: %v", err)
+	} else {
+		swept = true
 		var live []string
 		for _, ng := range leftovers {
+			seen[ng.UID] = true
 			if ng.DeletionTimestamp.IsZero() {
 				live = append(live, ng.Name)
 			}
@@ -695,6 +995,126 @@ func (f *framework) cleanupAll() {
 					f.t.Errorf("cleanup: deleting orphaned node object %s: %v", nodes.Items[i].Name, err)
 				}
 			}
+		}
+	}
+
+	f.recheckNodeGroups(seen, swept)
+}
+
+// drainDone is the graceful wait's condition: no NodeClaim of the run left
+// and no live NodeGroup of the run backed by one. Groups already carrying a
+// deletion timestamp are the platform's to finish, and an ownerless group is
+// never karpenter's to drain: it goes through deleteOwnerless at once, so a
+// group re-created during the wait is reported and deleted instead of holding
+// the wait to its deadline. Nothing drains once the controller is dead:
+// waiting would only delay the direct sweep by the whole budget.
+func (f *framework) drainDone(ctx context.Context, ownerless map[types.UID]bool) (bool, error) {
+	f.t.Helper()
+	if f.ctrl.dead() {
+		return false, errControllerExited
+	}
+	groups, err := f.tryRunNodeGroups(ctx)
+	if err != nil {
+		return false, nil
+	}
+	if f.sweepOwnerless(ctx, groups, ownerless) {
+		return false, nil
+	}
+	claims := &karpv1.NodeClaimList{}
+	if err := f.client.List(ctx, claims); err != nil {
+		return false, nil
+	}
+	for _, c := range claims.Items {
+		if strings.HasPrefix(c.Name, f.prefix) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// sweepOwnerless hands every live group of groups that has no NodeClaim
+// owner, and that no earlier step dealt with, to deleteOwnerless. It reports
+// whether a live group backed by a NodeClaim remains: karpenter drains those.
+func (f *framework) sweepOwnerless(ctx context.Context, groups []ngv1.NodeGroup, ownerless map[types.UID]bool) (claimBacked bool) {
+	f.t.Helper()
+	for i := range groups {
+		ng := &groups[i]
+		if !ng.DeletionTimestamp.IsZero() || ownerless[ng.UID] {
+			continue // terminating, or dealt with (the final sweep retries a failed delete)
+		}
+		if len(nodegroup.NodeClaimOwners(ng)) > 0 {
+			claimBacked = true
+			continue
+		}
+		f.deleteOwnerless(ctx, ng, ownerless)
+	}
+	return claimBacked
+}
+
+// deleteOwnerless deletes a live NodeGroup of the run that has no NodeClaim
+// owner, and records its uid in ownerless. Every group karpenter launches
+// carries the owner reference of its NodeClaim, and the only ownerless group
+// the suite makes is the garbage collection decoy, which carries the run
+// label. Any other is a group the platform re-created after a deletion (seen
+// once, about 6 minutes after it, during an upstream incident: same name, a
+// new uid, no labels or owner references, a fresh VM): no provider path acts
+// on it, so it fails the run, logged with what tells it apart.
+func (f *framework) deleteOwnerless(ctx context.Context, ng *ngv1.NodeGroup, ownerless map[types.UID]bool) {
+	f.t.Helper()
+	ownerless[ng.UID] = true
+	if ng.Name == f.decoyName() && ng.Labels[runLabelKey] == f.runID {
+		f.t.Logf("cleanup: deleting the garbage collection decoy %s directly", ng.Name)
+	} else {
+		f.t.Errorf("cleanup: nodegroup %s has no NodeClaim owner (uid %s, created %s, labels %v), deleting it — "+
+			"the run makes no ownerless group but its decoy, so the platform most likely re-created a group deleted earlier in the run",
+			ng.Name, ng.UID, ng.CreationTimestamp.UTC().Format(time.RFC3339), ng.Labels)
+	}
+	if err := f.client.Delete(ctx, ng); err != nil && !apierrors.IsNotFound(err) {
+		f.t.Errorf("cleanup: deleting ownerless nodegroup %s: %v", ng.Name, err)
+	}
+}
+
+// recheckNodeGroups looks for the run's NodeGroups once more, recheckAfter
+// the cleanup, which only checked their absence at one instant. The platform
+// was once seen re-creating a deleted NodeGroup about 6 minutes after its
+// deletion, during an upstream incident: same name, a new uid, no labels or
+// owner references, and a fresh VM. No provider path acts on a group without
+// the managed label, so nothing would ever delete it: a live group of the run
+// at this point fails the run and is deleted again. seen holds the uids the
+// cleanup's final sweep listed; swept is false when neither of its listings
+// succeeded, and seen then tells nothing.
+func (f *framework) recheckNodeGroups(seen map[types.UID]bool, swept bool) {
+	f.t.Helper()
+	if f.recheckAfter <= 0 {
+		return
+	}
+	f.t.Logf("cleanup: looking again for nodegroups of run %s in %s (E2E_CLEANUP_RECHECK)", f.runID, f.recheckAfter)
+	time.Sleep(f.recheckAfter)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	groups, err := f.tryRunNodeGroups(ctx)
+	if err != nil {
+		f.t.Errorf("cleanup re-check: listing nodegroups: %v — run hack/e2e-cleanup.sh", err)
+		return
+	}
+	for i := range groups {
+		ng := &groups[i]
+		switch {
+		case !ng.DeletionTimestamp.IsZero():
+			f.t.Logf("cleanup re-check: nodegroup %s is still terminating; its VM bills until the platform finishes the teardown (hack/e2e-cleanup.sh waits for it)", ng.Name)
+			continue
+		case !swept:
+			f.t.Errorf("cleanup re-check: nodegroup %s is still present (uid %s, created %s, labels %v, nodeclaim owners %v), deleting it — "+
+				"the final sweep could not list nodegroups, so whether it survived the cleanup or reappeared is unknown",
+				ng.Name, ng.UID, ng.CreationTimestamp.UTC().Format(time.RFC3339), ng.Labels, nodegroup.NodeClaimOwners(ng))
+		case seen[ng.UID]:
+			f.t.Errorf("cleanup re-check: nodegroup %s (uid %s) survived the cleanup's direct delete, trying again", ng.Name, ng.UID)
+		default:
+			f.t.Errorf("cleanup re-check: nodegroup %s REAPPEARED after the cleanup (uid %s, created %s, labels %v, nodeclaim owners %v), deleting it again — "+
+				"a group the platform re-created carries neither labels nor owners", ng.Name, ng.UID, ng.CreationTimestamp.UTC().Format(time.RFC3339), ng.Labels, nodegroup.NodeClaimOwners(ng))
+		}
+		if err := f.client.Delete(ctx, ng); err != nil && !apierrors.IsNotFound(err) {
+			f.t.Errorf("cleanup re-check: deleting nodegroup %s failed: %v — DELETE IT MANUALLY, IT BILLS HOURLY", ng.Name, err)
 		}
 	}
 }

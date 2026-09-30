@@ -53,6 +53,8 @@ import (
 )
 
 func TestE2E(t *testing.T) {
+	f := newFramework(t)
+
 	timeout := 40 * time.Minute
 	if v := os.Getenv("E2E_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -62,14 +64,15 @@ func TestE2E(t *testing.T) {
 		timeout = d
 	}
 	// The suite context must expire long enough before go test's own
-	// -timeout for the cleanup (fresh 20-minute context) and the controller
-	// stop to finish — a go test timeout kills the process without running
-	// cleanups, which would leak billing VMs. Enforce it instead of hoping.
-	const cleanupReserve = 22 * time.Minute
+	// -timeout for the cleanup (fresh 20-minute context, then the
+	// E2E_CLEANUP_RECHECK wait) and the controller stop to finish — a go
+	// test timeout kills the process without running cleanups, which would
+	// leak billing VMs. Enforce it instead of hoping.
+	cleanupReserve := 22*time.Minute + f.recheckAfter
 	if deadline, ok := t.Deadline(); ok {
 		budget := time.Until(deadline) - cleanupReserve
 		if budget < 5*time.Minute {
-			t.Fatalf("go test -timeout leaves only %s for the suite after the %s cleanup reserve; raise -timeout or lower E2E_TIMEOUT", budget.Round(time.Minute), cleanupReserve)
+			t.Fatalf("go test -timeout leaves only %s for the suite after the %s cleanup reserve; raise -timeout or lower E2E_TIMEOUT or E2E_CLEANUP_RECHECK", budget.Round(time.Minute), cleanupReserve)
 		}
 		if timeout > budget {
 			t.Logf("clamping E2E_TIMEOUT %s -> %s to preserve the cleanup reserve inside go test -timeout", timeout, budget.Round(time.Minute))
@@ -79,15 +82,15 @@ func TestE2E(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	f := newFramework(t)
 	f.checkCluster(ctx)
 	f.applyCRDs(ctx)
 
 	// t.Cleanup, not defer: cleanups also run when a subtest goroutine
 	// panics, where plain defers on this goroutine would not. LIFO order:
 	// cleanupAll first (needs the live controller to drain claims), then
-	// the controller stop.
-	stop := f.startController(ctx)
+	// the controller stop. From here on the suite runs on the controller's
+	// context, which its unexpected exit cancels.
+	ctx, stop := f.startController(ctx)
 	t.Cleanup(stop)
 	t.Cleanup(f.cleanupAll)
 
@@ -330,7 +333,7 @@ func testGarbageCollection(t *testing.T, ctx context.Context, f *framework) {
 	// node counts as reschedulable capacity and consolidation moves the
 	// inflate pod onto it, deleting the claim the reap step needs (observed
 	// on the first live run).
-	decoyName := f.prefix + "-decoy"
+	decoyName := f.decoyName()
 	decoy := &ngv1.NodeGroup{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   decoyName,
