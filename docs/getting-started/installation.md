@@ -6,7 +6,7 @@ This guide walks you through deploying the Karpenter provider for Clever Cloud o
 
 - A running [CKE cluster](https://www.clever.cloud/developers/doc/kubernetes/) (Kubernetes ≥ 1.34)
 - `kubectl` pointing at your cluster, with cluster-admin access
-- `helm` v3.x
+- `helm` ≥ 3.14 (Helm 4 works too): the [upgrade](#upgrading) commands rely on `--reset-then-reuse-values`, which Helm 3.14 introduced
 
 > **Note:** No Clever Cloud API token or credentials are required, and no egress beyond the cluster's API server. The provider drives the in-cluster NodeGroup API (`nodegroups.api.clever-cloud.com/v1`) that every CKE cluster serves and makes no call to any Clever Cloud HTTP endpoint; the Clever Cloud operator upstream turns NodeGroups into VMs.
 
@@ -99,17 +99,19 @@ Upgrade the CRDs first, then the controller release:
 ```sh
 helm upgrade karpenter-crd \
   oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/karpenter-crd \
-  --version <version> --namespace karpenter
+  --version <version> --namespace karpenter --reset-then-reuse-values
 helm upgrade karpenter \
   oci://ghcr.io/clevercloud/karpenter-provider-clever-cloud/karpenter \
-  --version <version> --namespace karpenter --reuse-values
+  --version <version> --namespace karpenter --reset-then-reuse-values
 ```
+
+`--reset-then-reuse-values` takes the new chart's defaults and re-applies only the values you set yourself, whereas `--reuse-values` replaces the new defaults with the previous release's, so every default a release changes silently keeps its old value (v0.12.0's placement fix never reaches a `--reuse-values` upgrade from v0.11.0: on `DEDICATED_COMPUTE` and `DISTRIBUTED` the controller stays `Pending`). An explicit values file (`-f` alone, with no reuse or reset flag) works as well, provided it holds every value you have customized and nothing else: Helm then reuses none of the previous release's values, so anything set at an earlier install or upgrade and missing from the file is dropped, and a full copy of an older `values.yaml` pins every default the same way.
 
 If you did not install the CRD chart, apply the CRDs by hand instead (Helm does not upgrade CRDs shipped in the main chart's `crds/` directory), from a checkout of the matching release tag: `kubectl apply -f deploy/crds/`.
 
-> **Note:** Earlier releases shipped a dynamic pricing refresher that polled Clever Cloud's public API (`settings.pricing`, on by default). It is gone: the catalogue is the built-in one plus `settings.flavors`. A `--reuse-values` upgrade that still carries `settings.pricing` renders fine and the values are ignored, the egress rule to `api.clever-cloud.com` can be dropped, and alerts on `karpenter_clevercloud_pricing_refresh_failures_total` or `karpenter_clevercloud_pricing_last_successful_refresh_timestamp_seconds` must be deleted — those series no longer exist.
+> **Note:** Earlier releases shipped a dynamic pricing refresher that polled Clever Cloud's public API (`settings.pricing`, on by default). It is gone: the catalogue is the built-in one plus `settings.flavors`. An upgrade that still carries `settings.pricing` (in your values file, or reused from the previous release) renders fine and the values are ignored, the egress rule to `api.clever-cloud.com` can be dropped, and alerts on `karpenter_clevercloud_pricing_refresh_failures_total` or `karpenter_clevercloud_pricing_last_successful_refresh_timestamp_seconds` must be deleted — those series no longer exist.
 
-> **Note:** Flavor prices are now a unitless cost relative to `2XS` (see [Flavor catalogue](../../README.md#flavor-catalogue)), and `settings.flavors` no longer takes `priceHourly`. Remove it from your values before upgrading: `helm upgrade` refuses it (`additional properties 'priceHourly' not allowed`). With `--reuse-values`, pass the corrected list explicitly, since a list given with `-f` or `--set-json` replaces the reused one: for example `--set-json 'settings.flavors=[]'` drops the overrides. An overrides ConfigMap written outside the chart that still carries it is refused as a whole by the controller, which then runs on the built-in catalogue without any override and sets `karpenter_clevercloud_instancetype_flavors_config_invalid` to 1. Figures that were in EUR/hour must be rescaled: dashboards and alerts on karpenter-core's `karpenter_nodepools_cost_total`, and a NodeOverlay's `price` or fixed `priceAdjustment`.
+> **Note:** Flavor prices are now a unitless cost relative to `2XS` (see [Flavor catalogue](../../README.md#flavor-catalogue)), and `settings.flavors` no longer takes `priceHourly`. Remove it from your values before upgrading: `helm upgrade` refuses it (`additional properties 'priceHourly' not allowed`). The `--reset-then-reuse-values` upgrade above reuses the list you set earlier, so pass the corrected list explicitly, since a list given with `-f` or `--set-json` replaces the reused one: for example `--set-json 'settings.flavors=[]'` drops the overrides. An overrides ConfigMap written outside the chart that still carries it is refused as a whole by the controller, which then runs on the built-in catalogue without any override and sets `karpenter_clevercloud_instancetype_flavors_config_invalid` to 1. Figures that were in EUR/hour must be rescaled: dashboards and alerts on karpenter-core's `karpenter_nodepools_cost_total`, and a NodeOverlay's `price` or fixed `priceAdjustment`.
 
 > **Note:** Releases installed from the pre-rename chart (`helm install karpenter-clevercloud charts/karpenter-clevercloud`) cannot be upgraded in place: the chart rename changes the Deployment's immutable selector labels. Uninstall the old release first, then install fresh under the new name — the CRDs and your NodePools/NodeClasses are untouched by that operation.
 
@@ -134,3 +136,4 @@ kubectl delete namespace karpenter
   ```sh
   kubectl apply -f examples/v1/general-purpose.yaml
   ```
+- [Observability](../observability.md) — every metric and event the provider publishes, what each one means and what to do when it moves, with suggested alert expressions.

@@ -70,7 +70,7 @@ cluster (sequentially, to stay inside the organisation quota):
 |---|---|---|
 | v1/general-purpose + workloads/inflate | 2 pods → one 2XS node, pods Running | 42 s |
 | v1/small-flavors | 5Gi pod skips 2XS, lands on XS | 33 s |
-| v1/large-instances | 10Gi pod → M node (L/XL blocked by org quota, as documented) | 175 s |
+| v1/large-instances | 10Gi pod → M node (L/XL blocked by org quota, as documented — see the correction below) | 175 s |
 | v1/flavor-pinned | XS provisioned although 2XS is cheaper (pool pinned via `clever-cloud.com/flavor`) | 41 s |
 | v1/cpu-limit | exactly 2 nodes (8 vCPU cap), 5th pod Pending, log `all available instance types exceed limits for nodepool` | — |
 | v1/team-dedicated + workloads/team-workload | node carries taint `team=platform:NoSchedule`, NodePool label `team` and NodeClass label `cost-center` | 41 s |
@@ -83,6 +83,14 @@ cluster (sequentially, to stay inside the organisation quota):
 | workloads/flavor-selector | plain nodeSelector `clever-cloud.com/flavor: XS` → XS node | 41 s |
 | workloads/prefer-small | preferred affinity steers provisioning to 2XS | 42 s |
 | workloads/disruption-budget | deployment + PDB schedule onto existing capacity, PDB active | 8 s |
+
+> **Correction (2026-09-30):** the org quota is not what kept L and XL out of
+> `v1/large-instances` in this run and the second one: they were never even
+> attempted, because the example's own NodePool limits (16 vCPU / 16Gi)
+> excluded them. karpenter-core never launches an instance type whose
+> capacity exceeds the pool's remaining limits, and L and XL both carry more
+> than 16Gi of memory. The 10Gi pod landing on M stands — M is the cheapest
+> allowed flavor that fits it. The example's limits now admit L and XL.
 
 One finding from testing: a `topologySpreadConstraint` on
 `kubernetes.io/hostname` does **not** force one replica per node (with a
@@ -125,7 +133,7 @@ All 15 scenarios passed. Times are pod-pending → pod-Running.
 | — drift | `Drifted` < 1 s after NodeClass patch; replacement NodeGroup carries `environment=production`; full roll | 53 s |
 | — scale to zero | last node consolidated away, zero managed NodeGroups | 31 s |
 | v1/small-flavors | 5Gi pod skips 2XS, lands on XS | 46 s |
-| v1/large-instances | 10Gi pod → M node (L/XL quota-blocked) | 185 s |
+| v1/large-instances | 10Gi pod → M node (L/XL quota-blocked — see the 2026-09-30 correction under the first run) | 185 s |
 | v1/flavor-pinned | XS provisioned (NodeGroup `spec.flavor=XS`) despite cheaper 2XS | 183 s |
 | v1/cpu-limit | exactly 2× 2XS (`status.resources.cpu=8` at the cap), 5th pod Pending | — |
 | v1/team-dedicated + team-workload | node carries `team=platform:NoSchedule` taint + `team` label | 42 s |

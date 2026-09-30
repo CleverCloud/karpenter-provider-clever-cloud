@@ -15,9 +15,9 @@ kubectl scale deployment inflate --replicas=3
 
 | Example | Demonstrates |
 |---|---|
-| [general-purpose.yaml](v1/general-purpose.yaml) | Whole flavor catalog, cheapest-fit, consolidation |
+| [general-purpose.yaml](v1/general-purpose.yaml) | Whole flavor catalog within its limits (2XS–M), cheapest-fit, consolidation |
 | [small-flavors.yaml](v1/small-flavors.yaml) | Restricting to the smallest flavors (2XS, XS) |
-| [large-instances.yaml](v1/large-instances.yaml) | Restricting to large flavors (M+); quota caveats |
+| [large-instances.yaml](v1/large-instances.yaml) | Restricting to large flavors (M+); limits sized to admit them, quota caveats |
 | [flavor-pinned.yaml](v1/flavor-pinned.yaml) | Pinning a pool to one flavor via `clever-cloud.com/flavor` |
 | [cpu-limit.yaml](v1/cpu-limit.yaml) | Hard cap on the total CPU/memory a pool may provision |
 | [team-dedicated.yaml](v1/team-dedicated.yaml) | Dedicated tainted+labeled nodes for one team |
@@ -47,4 +47,7 @@ outside the cluster).
 
 Mind the organisation quota (default 40 vCPU / 40 GB RAM **including the
 control plane**): apply one NodePool example at a time when experimenting on
-a small org, and keep `limits` conservative.
+a small org, and keep `limits` conservative. Limits also decide which flavors
+a pool can launch at all: Karpenter never launches a flavor whose capacity
+exceeds the pool's remaining limits, so a `memory: 16Gi` pool never gets an L
+or an XL node, whatever its requirements allow.

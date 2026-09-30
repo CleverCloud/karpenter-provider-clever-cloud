@@ -1,6 +1,7 @@
 # This example NodePool will provision general purpose instances across the
-# whole Clever Cloud flavor catalog, always picking the cheapest flavor that
-# fits, and consolidating nodes as soon as they are empty or underutilized.
+# Clever Cloud flavor catalog, always picking the cheapest flavor that fits,
+# and consolidating nodes as soon as they are empty or underutilized. Its
+# limits keep it to 2XS through M (see below).
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
@@ -25,8 +26,13 @@ spec:
           operator: In
           values: ["on-demand"]
       expireAfter: Never
-  # Keep well under the organisation quota (40 vCPU / 40 GB RAM, control
-  # plane included): a 3-node S control plane already consumes 24 GB of it.
+  # Size these against the organisation quota (default 40 vCPU / 40 GB RAM,
+  # control plane included): a 3-node S control plane alone consumes 24 vCPU
+  # / 36 GB of it. Limits also filter flavors: Karpenter never launches one
+  # whose capacity exceeds the pool's remaining limits, so at 16Gi this pool
+  # never launches L or XL (24 and 32 GB). Raise memory to 32Gi or more and
+  # cpu accordingly (L is 12 vCPU, XL 16, and each node counts against both),
+  # quota permitting, to let them in.
   limits:
     cpu: "16"
     memory: 16Gi
