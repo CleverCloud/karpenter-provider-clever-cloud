@@ -253,18 +253,19 @@ func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCla
 	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaim.Spec.NodeClassRef.Name}, nodeClass); err != nil {
 		return "", client.IgnoreNotFound(err)
 	}
-	// Only compare hashes produced by the same generation of Hash(). A
-	// NodeGroup stamped by an older controller carries a hash that is not
-	// comparable to the current one, and treating the difference as drift
-	// would replace every node in the fleet on a controller upgrade. The
-	// nodeclass controller re-stamps those NodeGroups; until it does, they
-	// simply do not drift.
+	// Compare like with like: a NodeGroup stamped by an older generation of
+	// Hash() is checked against what THAT generation computes for the current
+	// spec. Comparing it with today's Hash() would read as drift on every
+	// NodeGroup at once after a controller upgrade; skipping it would hide a
+	// NodeClass edit made before the nodeclass controller re-stamped the group
+	// (it only re-stamps stamps that still match). A stamp from a generation
+	// this controller cannot compute (a newer controller's, after a rollback),
+	// or no stamp at all, proves nothing either way: no drift.
 	hash, hasHash := ng.Annotations[v1alpha1.NodeClassHashLabelKey]
-	version, hasVersion := ng.Annotations[v1alpha1.NodeClassHashVersionAnnotationKey]
-	if !hasHash || !hasVersion || version != v1alpha1.NodeClassHashVersion {
+	if !hasHash {
 		return "", nil
 	}
-	if hash != nodeClass.Hash() {
+	if match, known := nodeClass.HashMatches(ng.Annotations[v1alpha1.NodeClassHashVersionAnnotationKey], hash); known && !match {
 		return NodeClassDrifted, nil
 	}
 	return "", nil

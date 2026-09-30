@@ -49,10 +49,11 @@ const (
 	NodePoolLabelKey      = apis.Group + "/nodepool"
 	NodeClassHashLabelKey = apis.Group + "/clevernodeclass-hash"
 	// NodeClassHashVersionAnnotationKey records which generation of Hash()
-	// produced NodeClassHashLabelKey. Drift is only evaluated when the
-	// NodeGroup's generation matches the running controller's: without it,
-	// any change to Hash() or to CleverNodeClassSpec silently reads as drift
-	// on every existing NodeGroup and replaces the whole fleet.
+	// produced NodeClassHashLabelKey (absent: v1). The stamp is only ever
+	// compared with what its own generation computes for the current spec
+	// (CleverNodeClass.HashMatches): without it, any change to Hash() or to
+	// CleverNodeClassSpec silently reads as drift on every existing NodeGroup
+	// and replaces the whole fleet.
 	NodeClassHashVersionAnnotationKey = apis.Group + "/clevernodeclass-hash-version"
 
 	// TerminationFinalizer protects CleverNodeClasses that still back NodeClaims.

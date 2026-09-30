@@ -618,40 +618,80 @@ func TestCreateRefusesTerminatingNodeClass(t *testing.T) {
 	}
 }
 
-// TestIsDriftedIgnoresForeignHashVersions is the fleet-roll guard. A NodeGroup
-// stamped by an older generation of Hash() carries a value that is not
-// comparable to the current one; comparing them anyway would report drift on
-// every NodeGroup at once and replace every node — real, hourly-billed VMs —
-// the first time CleverNodeClassSpec or the hashing changes.
-func TestIsDriftedIgnoresForeignHashVersions(t *testing.T) {
+// TestIsDriftedComparesStampsWithTheirOwnGeneration pins drift across hash
+// generations. A NodeGroup stamped by an older generation of Hash() is
+// compared with what THAT generation computes for the current spec: never with
+// today's Hash(), which would report drift on every NodeGroup at once and
+// replace every node — real, hourly-billed VMs — on a controller upgrade; and
+// never skipped, which would hide a NodeClass edit made before the nodeclass
+// controller migrated the stamp. The stamps are what controllers up to
+// v0.11.x (generation v1, no version annotation) wrote, pinned by
+// TestHashGenerationsMatchTheirStamps in pkg/apis/v1alpha1.
+func TestIsDriftedComparesStampsWithTheirOwnGeneration(t *testing.T) {
+	const (
+		v1StampTeamData    = "3789529822245891689"  // labels: {team: data}
+		v1StampEmptyLabels = "14514438007709706818" // labels: {}
+	)
 	for _, tc := range []struct {
 		name        string
+		labels      map[string]string
 		annotations map[string]string
+		want        corecloudprovider.DriftReason
 	}{
 		{
-			name: "stale hash version",
+			name:        "v1 stamp of the current spec",
+			labels:      map[string]string{"team": "data"},
+			annotations: map[string]string{v1alpha1.NodeClassHashLabelKey: v1StampTeamData},
+		},
+		{
+			name:   "explicit v1 stamp of the current spec",
+			labels: map[string]string{"team": "data"},
 			annotations: map[string]string{
-				v1alpha1.NodeClassHashLabelKey:             "hash-from-an-older-generation",
+				v1alpha1.NodeClassHashLabelKey:             v1StampTeamData,
 				v1alpha1.NodeClassHashVersionAnnotationKey: "v1",
 			},
 		},
 		{
-			name: "no hash version at all",
+			name:        "v1 stamp of labels: {}, line dropped since",
+			labels:      nil,
+			annotations: map[string]string{v1alpha1.NodeClassHashLabelKey: v1StampEmptyLabels},
+		},
+		{
+			name:        "v1 stamp of an edited NodeClass",
+			labels:      map[string]string{"team": "ml"},
+			annotations: map[string]string{v1alpha1.NodeClassHashLabelKey: v1StampTeamData},
+			want:        cloudprovider.NodeClassDrifted,
+		},
+		{
+			name:   "explicit v1 stamp of an edited NodeClass",
+			labels: map[string]string{"team": "ml"},
 			annotations: map[string]string{
-				v1alpha1.NodeClassHashLabelKey: "hash-from-an-older-generation",
+				v1alpha1.NodeClassHashLabelKey:             v1StampTeamData,
+				v1alpha1.NodeClassHashVersionAnnotationKey: "v1",
+			},
+			want: cloudprovider.NodeClassDrifted,
+		},
+		{
+			name:   "stamp from a generation this controller does not know",
+			labels: map[string]string{"team": "data"},
+			annotations: map[string]string{
+				v1alpha1.NodeClassHashLabelKey:             "stamp-from-a-newer-controller",
+				v1alpha1.NodeClassHashVersionAnnotationKey: "v99",
 			},
 		},
 		{
 			name:        "no hash at all",
+			labels:      map[string]string{"team": "data"},
 			annotations: map[string]string{v1alpha1.NodeClassHashVersionAnnotationKey: v1alpha1.NodeClassHashVersion},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			nodeClass := readyNodeClass("default")
+			nodeClass.Spec.Labels = tc.labels
 			cp, kubeClient := newTestProvider(t, nodeClass)
 			ng := &ngv1.NodeGroup{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        "default-foreign",
+					Name:        "default-stamped",
 					Labels:      map[string]string{v1alpha1.ManagedLabelKey: "true"},
 					Annotations: tc.annotations,
 				},
@@ -660,16 +700,15 @@ func TestIsDriftedIgnoresForeignHashVersions(t *testing.T) {
 			if err := kubeClient.Create(context.Background(), ng); err != nil {
 				t.Fatal(err)
 			}
-			nodeClaim := testNodeClaim("default-foreign")
-			nodeClaim.Status.ProviderID = "clevercloud://default-foreign"
+			nodeClaim := testNodeClaim("default-stamped")
+			nodeClaim.Status.ProviderID = "clevercloud://default-stamped"
 
 			reason, err := cp.IsDrifted(context.Background(), nodeClaim)
 			if err != nil {
 				t.Fatalf("IsDrifted: %v", err)
 			}
-			if reason != "" {
-				t.Errorf("expected no drift for an incomparable hash, got %q: this would replace "+
-					"every node in the fleet on a controller upgrade", reason)
+			if reason != tc.want {
+				t.Errorf("IsDrifted = %q, want %q", reason, tc.want)
 			}
 		})
 	}
