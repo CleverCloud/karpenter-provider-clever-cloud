@@ -62,7 +62,7 @@ kubectl apply -f examples/v1/general-purpose.yaml
 | `settings.disableLeaderElection` | `false` | For single-replica dev setups |
 | `settings.batchMaxDuration` / `batchIdleDuration` | `10s` / `1s` | Pod batching windows |
 | `settings.featureGates.nodeRepair` | `false` | Enable node auto-repair |
-| `settings.flavors` | `[]` | Per-flavor overrides overlaid on the built-in catalogue (`name` required; `cpu`/`memoryKi`/`priceHourly` optional). Empty = built-in catalogue unchanged. Mounted via a ConfigMap; overrides always win |
+| `settings.flavors` | `[]` | Per-flavor overrides overlaid on the built-in catalogue (`name` required; `cpu`/`memoryKi` optional). No price field: prices are derived from cpu and memoryKi, so pin every flavor the same way or none, and a leftover `priceHourly` fails schema validation. Empty = built-in catalogue unchanged. Mounted via a ConfigMap; overrides always win |
 | `controller.resources` | 200m/256Mi, limit 512Mi | Controller container resources |
 | `controller.env` | `[]` | Extra environment variables |
 | `service.enabled` | `true` | ClusterIP service exposing `/metrics` |
@@ -85,7 +85,13 @@ The controller talks to nothing but the cluster's Kubernetes API: it needs no
 Clever Cloud API token and no egress beyond the API server. Earlier releases
 had a `settings.pricing` block (a dynamic pricing refresher, since removed); a
 `--reuse-values` upgrade that still carries it renders fine and the values are
-ignored.
+ignored. The opposite holds for `priceHourly`, which `settings.flavors`
+entries no longer accept: a reused entry that still carries it makes the
+upgrade above fail schema validation (`additional properties 'priceHourly' not
+allowed`). Pass the corrected list explicitly, since a list given with `-f` or
+`--set-json` replaces the reused one: `--set-json 'settings.flavors=[]'` drops
+the overrides (see the
+[upgrade notes](../../docs/getting-started/installation.md#upgrading)).
 
 Before uninstalling for good, scale your Karpenter-backed workloads down
 (or delete the NodePools) so the provisioned NodeGroups are cleaned up

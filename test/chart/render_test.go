@@ -236,6 +236,45 @@ func TestLegacyPricingValuesAreIgnored(t *testing.T) {
 	})
 }
 
+// TestFlavorPriceHourlyIsRefused pins the opposite choice for a key removed
+// from settings.flavors. Prices are derived from cpu and memoryKi now, and the
+// controller refuses a whole overrides file that still sets priceHourly: it
+// would run on the built-in catalogue without ANY of the operator's
+// overrides. The schema must refuse the key first, so that `helm upgrade`
+// fails loudly instead of rolling out a controller that silently lost them.
+// The same override without it must keep rendering into the ConfigMap.
+func TestFlavorPriceHourlyIsRefused(t *testing.T) {
+	render := func(t *testing.T, values string) (string, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "values.yaml")
+		if err := os.WriteFile(path, []byte(values), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return helmTemplateArgs(t, "--values", path)
+	}
+
+	t.Run("legacy priceHourly", func(t *testing.T) {
+		out, err := render(t, "settings:\n  flavors:\n    - name: M\n      memoryKi: 15229256\n      priceHourly: 0.1167\n")
+		if err == nil {
+			t.Fatal("a settings.flavors entry carrying priceHourly must fail values.schema.json validation, " +
+				"but it rendered: the controller would then refuse the whole overrides file")
+		}
+		if !strings.Contains(out, "priceHourly") {
+			t.Errorf("the schema violation must name priceHourly so the operator can remove it, got:\n%s", out)
+		}
+	})
+
+	t.Run("cpu and memoryKi only", func(t *testing.T) {
+		out, err := render(t, "settings:\n  flavors:\n    - name: M\n      memoryKi: 15229256\n")
+		if err != nil {
+			t.Fatalf("a valid override must render: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "memoryKi: 15229256") {
+			t.Errorf("the override did not reach the flavors ConfigMap:\n%s", out)
+		}
+	})
+}
+
 // TestDefaultPlacementIsTopologyIndependent is the regression lock: the
 // default placement must exclude Karpenter-managed nodes without naming a
 // single CKE topology.

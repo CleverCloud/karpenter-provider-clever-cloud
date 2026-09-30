@@ -149,28 +149,60 @@ The controller is configured through environment variables, all set by the helm 
 
 ### Flavor catalogue
 
-The controller ships a built-in catalogue (`2XS`…`XL`) with measured/estimated capacities and
-the documented public-beta prices; it fetches neither prices nor the flavor list at runtime.
-`settings.flavors` lets you **overlay per-flavor overrides** on top of that built-in catalogue —
-the chart renders it into a ConfigMap mounted at `/etc/karpenter/flavors/flavors.yaml` and points
-`FLAVORS_CONFIG_PATH` at it. Every field except `name` is optional: set only what you want to pin,
-the rest fall through to the built-in value.
+The controller ships a built-in catalogue (`2XS`…`XL`) with measured/estimated capacities; it
+fetches nothing at runtime. `settings.flavors` lets you **overlay per-flavor overrides** on top of
+that built-in catalogue — the chart renders it into a ConfigMap mounted at
+`/etc/karpenter/flavors/flavors.yaml` and points `FLAVORS_CONFIG_PATH` at it. Every field except
+`name` is optional: set only what you want to pin, the rest fall through to the built-in value.
 
 ```yaml
 settings:
   flavors:
-    - name: M             # required, as accepted by the NodeGroup API (uppercase)
-      priceHourly: 0.1167 # pin the price; cpu/memoryKi keep their built-in values
-    - name: CUSTOM        # a flavor absent from the built-in catalogue must supply all fields
-      cpu: 2
-      memoryKi: 2097152
-      priceHourly: 0.01
+    # name is required, as accepted by the NodeGroup API (uppercase). This pins every flavor's
+    # memoryKi to the kernel-visible memory its nodes report on the current CKE image, known
+    # before one has run; cpu keeps its built-in value.
+    - { name: 2XS, memoryKi: 3715344 }
+    - { name: XS, memoryKi: 7553664 }
+    - { name: S, memoryKi: 11385832 }
+    - { name: M, memoryKi: 15229256 }
+    - { name: L, memoryKi: 22896304 }
+    - { name: XL, memoryKi: 30584176 }
 ```
 
+A name outside the built-in catalogue adds a flavor and must set both `cpu` and `memoryKi`; the
+NodeGroup API only accepts `2XS`…`XL` today, though, so in practice overrides adjust those six.
 `cpu`/`memoryKi` self-correct at runtime from observed node capacity, so they only need to be
-close enough for the scheduler to pick a flavor; prices are used as-is for cost-based
-consolidation. Overrides always win. Leave `settings.flavors` empty to use the built-in
-catalogue unchanged.
+close enough for the scheduler to pick a flavor. Overrides always win. Leave `settings.flavors`
+empty to use the built-in catalogue unchanged.
+
+**Prices are relative, not a currency.** Karpenter only compares and adds up offering prices, to
+launch the cheapest flavor that fits and to consolidate onto cheaper capacity, so every flavor is
+priced by its size relative to the built-in `2XS`:
+
+```text
+price = 1/3 × cpu / cpu(2XS) + 2/3 × memoryKi / memoryKi(2XS)      (2XS = 1.0)
+```
+
+| Flavor | 2XS | XS | S | M | L | XL |
+|---|---|---|---|---|---|---|
+| Price | 1.0 | 1.8527 | 2.7044 | 3.5582 | 5.0873 | 6.783 |
+
+Memory weighs twice as much as cpu because that is how CKE's public worker prices are built (a GB of
+memory costs as much as two vCPUs). With these weights and the built-in sizing, whenever CKE bills
+one set of up to four nodes less than another, its relative price is lower too, so consolidation
+never swaps nodes for capacity that really costs more.
+
+There is no price to configure: an override's price is derived from its resulting `cpu` and
+`memoryKi`, so pinning a flavor's memory also reprices it, still relative to the built-in `2XS`.
+The guarantee above then only holds while the pinned values stay proportionate across flavors.
+Pinning all six the same way, as in the example, keeps it; pinning one alone can break it. Pinned
+alone to its value above, `M` makes two `M` nodes look cheaper than an `XS` and an `L`, which CKE
+bills less, and `XL` makes merging four small nodes into one `XL` look like a saving although
+that `XL` really costs more. Pin every flavor the same way, or none.
+
+The price-based figures karpenter-core reports (the `karpenter_nodepools_cost_total` metric,
+`savings: $…` in disruption logs and events) use this unit too, whatever their label says, and so
+does a NodeOverlay's `price` or fixed `priceAdjustment` (a percentage adjustment is unit-free).
 
 ### NodePool
 

@@ -20,8 +20,9 @@ limitations under the License.
 // Capacity figures for 2XS/XS/S/M were measured on live CKE nodes
 // (status.capacity); L and XL are derived from the documented specs
 // (https://www.clever.cloud/developers/doc/kubernetes/) using the same
-// kernel-visible-memory ratio as the measured flavors. Prices are the
-// documented public-beta worker prices (EUR/hour, June 2026). The served
+// kernel-visible-memory ratio as the measured flavors. Offering prices are
+// not a currency: they are a unitless cost relative to the smallest flavor,
+// derived from each flavor's cpu and memory (RelativePrice). The served
 // catalogue is this static seed with the operator's settings.flavors overrides
 // on top: nothing is fetched from a Clever Cloud endpoint at runtime.
 package instancetype
@@ -49,13 +50,10 @@ import (
 )
 
 const (
-	// DefaultVCPURate is the documented public CKE worker price per vCPU per
-	// hour (EUR). With DefaultRAMRate it prices the seed flavors through
-	// ComputePrice.
-	DefaultVCPURate = 0.00277777777
-	// DefaultRAMRate is the documented public CKE worker price per nominal GB
-	// of RAM per hour (EUR).
-	DefaultRAMRate = 0.00555555555
+	// cpuPriceWeight and memoryPriceWeight are the shares of cpu and memory in
+	// RelativePrice. They sum to 1, so the reference flavor costs exactly 1.
+	cpuPriceWeight    = 1.0 / 3
+	memoryPriceWeight = 2.0 / 3
 )
 
 // Flavor describes one Clever Cloud node flavor.
@@ -66,18 +64,19 @@ type Flavor struct {
 	CPU int64 `json:"cpu"`
 	// MemoryKi is the kernel-visible memory capacity in KiB.
 	MemoryKi int64 `json:"memoryKi"`
-	// PriceHourly is the worker price in EUR/hour.
-	PriceHourly float64 `json:"priceHourly"`
+	// Price is the unitless relative cost RelativePrice(CPU, MemoryKi).
+	// ApplyOverrides recomputes it from the final CPU and MemoryKi, so it
+	// always matches the sizing it is served with.
+	Price float64 `json:"price"`
 }
 
-// Sizing is the static per-flavor seed: vCPU count, kernel-visible memory
-// (KiB) and the NOMINAL advertised memory (GB) used only by the price
-// formula. CPU and MemoryKi additionally self-correct at runtime via
-// RecordObservedCapacity; NominalGB has no runtime source.
+// Sizing is the static per-flavor seed: vCPU count and kernel-visible memory
+// (KiB). Both price the flavor through RelativePrice. The capacity advertised
+// for a flavor also self-corrects at runtime via RecordObservedCapacity; the
+// price does not follow, so it stays stable for the controller's lifetime.
 type Sizing struct {
-	CPU       int64
-	MemoryKi  int64
-	NominalGB float64
+	CPU      int64
+	MemoryKi int64
 }
 
 var (
@@ -88,15 +87,20 @@ var (
 		Name string
 		Sizing
 	}{
-		{"2XS", Sizing{CPU: 4, MemoryKi: 3911884, NominalGB: 4}},
-		{"XS", Sizing{CPU: 6, MemoryKi: 7937580, NominalGB: 8}},
-		{"S", Sizing{CPU: 8, MemoryKi: 11957148, NominalGB: 12}},
-		{"M", Sizing{CPU: 10, MemoryKi: 15988992, NominalGB: 16}},
+		{"2XS", Sizing{CPU: 4, MemoryKi: 3911884}},
+		{"XS", Sizing{CPU: 6, MemoryKi: 7937580}},
+		{"S", Sizing{CPU: 8, MemoryKi: 11957148}},
+		{"M", Sizing{CPU: 10, MemoryKi: 15988992}},
 		// L and XL capacities are estimated from documented specs (24/32 GB)
 		// applying the measured kernel-visible ratio of the M flavor.
-		{"L", Sizing{CPU: 12, MemoryKi: 23983488, NominalGB: 24}},
-		{"XL", Sizing{CPU: 16, MemoryKi: 31977984, NominalGB: 32}},
+		{"L", Sizing{CPU: 12, MemoryKi: 23983488}},
+		{"XL", Sizing{CPU: 16, MemoryKi: 31977984}},
 	}
+
+	// priceReference is the flavor every price is relative to: the smallest
+	// built-in one (FlavorSizing is ordered smallest-to-largest), which costs
+	// exactly 1.
+	priceReference = FlavorSizing[0].Sizing
 
 	// SizingByName indexes FlavorSizing for O(1) lookup by flavor name.
 	SizingByName = func() map[string]Sizing {
@@ -108,17 +112,16 @@ var (
 	}()
 
 	// DefaultFlavors is the built-in CKE flavor catalog, the base the
-	// settings.flavors overrides are overlaid on. Prices are kept as literals
-	// (audited public beta values); TestDefaultFlavorsMatchSeed pins them
-	// against FlavorSizing and the default rates so the two never drift.
-	DefaultFlavors = []Flavor{
-		{Name: "2XS", CPU: 4, MemoryKi: 3911884, PriceHourly: 0.0333},
-		{Name: "XS", CPU: 6, MemoryKi: 7937580, PriceHourly: 0.0611},
-		{Name: "S", CPU: 8, MemoryKi: 11957148, PriceHourly: 0.0889},
-		{Name: "M", CPU: 10, MemoryKi: 15988992, PriceHourly: 0.1167},
-		{Name: "L", CPU: 12, MemoryKi: 23983488, PriceHourly: 0.1667},
-		{Name: "XL", CPU: 16, MemoryKi: 31977984, PriceHourly: 0.2222},
-	}
+	// settings.flavors overrides are overlaid on. It is derived from
+	// FlavorSizing, prices included, so the two cannot drift;
+	// TestDefaultFlavorsPriceTable pins the prices that result.
+	DefaultFlavors = func() []Flavor {
+		flavors := make([]Flavor, 0, len(FlavorSizing))
+		for _, s := range FlavorSizing {
+			flavors = append(flavors, Flavor{Name: s.Name, CPU: s.CPU, MemoryKi: s.MemoryKi, Price: RelativePrice(s.CPU, s.MemoryKi)})
+		}
+		return flavors
+	}()
 
 	// All flavors share the same disk and pod capacity (measured).
 	ephemeralStorage = resource.MustParse("40971488Ki")
@@ -130,24 +133,40 @@ var (
 	evictionEphemeralThreshold = resource.MustParse("4097149Ki")
 )
 
-// ComputePrice returns the EUR/hour worker price for a flavor:
+// RelativePrice is the price of every offering: the unitless cost of a flavor
+// with cpu vCPUs and memoryKi KiB of kernel-visible memory, relative to the
+// smallest built-in flavor (priceReference, which costs exactly 1):
 //
-//	price = cpu*vcpuRate + nominalGB*ramRate
+//	price = 1/3 * cpu/cpuRef + 2/3 * memoryKi/memoryKiRef
 //
-// rounded to 4 decimals (the precision of the documented catalog).
-func ComputePrice(cpu int64, nominalGB, vcpuRate, ramRate float64) float64 {
-	return math.Round((float64(cpu)*vcpuRate+nominalGB*ramRate)*1e4) / 1e4
+// rounded to 4 decimals. karpenter-core only compares and sums offering
+// prices (cheapest-first launches, consolidation savings, and balanced
+// scoring, which divides by the NodePool total), so their unit does not
+// matter; their ordering does. In CKE's public worker price structure a
+// nominal GB of memory costs as much as two vCPUs, so memory makes up 2/3 of
+// the reference flavor's price and cpu 1/3. With those weights, whenever the
+// public prices rank one combination of up to four built-in flavors strictly
+// below another, so does the relative price
+// (TestRelativePriceKeepsConsolidationOrder). Equal weights would invert 12 of
+// those comparisons and consolidate several small nodes into an L or XL that
+// really costs more. The reference is fixed, so an override reprices its
+// flavor alone: a catalogue keeps this property only while its cpu and
+// memoryKi pins stay proportionate across flavors.
+func RelativePrice(cpu, memoryKi int64) float64 {
+	price := cpuPriceWeight*float64(cpu)/float64(priceReference.CPU) +
+		memoryPriceWeight*float64(memoryKi)/float64(priceReference.MemoryKi)
+	return math.Round(price*1e4) / 1e4
 }
 
 // FlavorOverride is a partial, per-flavor override loaded from settings.flavors
-// (FLAVORS_CONFIG_PATH). Only Name is required; every other field is optional
-// and, when set, replaces the corresponding value from the base catalog (the
-// built-in seed). Unset fields fall through.
+// (FLAVORS_CONFIG_PATH). Only Name is required; CPU and MemoryKi are optional
+// and, when set, replace the corresponding value from the base catalog (the
+// built-in seed). Unset fields fall through. There is no price field: the
+// price is always derived from the resulting cpu and memoryKi.
 type FlavorOverride struct {
-	Name        string   `json:"name"`
-	CPU         *int64   `json:"cpu,omitempty"`
-	MemoryKi    *int64   `json:"memoryKi,omitempty"`
-	PriceHourly *float64 `json:"priceHourly,omitempty"`
+	Name     string `json:"name"`
+	CPU      *int64 `json:"cpu,omitempty"`
+	MemoryKi *int64 `json:"memoryKi,omitempty"`
 }
 
 // observedCapacity is the live capacity reported by a node of a flavor.
@@ -180,7 +199,7 @@ func NewProvider(region string, base []Flavor, overrides []FlavorOverride) *Prov
 	flavors, skipped := ApplyOverrides(base, overrides)
 	for _, name := range skipped {
 		log.Log.WithName("instancetype").Info(
-			"skipping flavor override: not in base/seed and missing cpu, memoryKi or priceHourly",
+			"skipping flavor override: not in base/seed and missing cpu or memoryKi",
 			"flavor", name)
 	}
 	return &Provider{
@@ -227,14 +246,15 @@ func LoadFlavorsOrDegrade(path string) []FlavorOverride {
 
 // ParseFlavorOverrides unmarshals a YAML list of partial flavor overrides and
 // validates it. Unknown or duplicate keys fail parsing (strict mode): every
-// field here is optional, so a mistyped key ("price" for "priceHourly") would
+// field here is optional, so a mistyped key ("memory" for "memoryKi") would
 // otherwise decode into an all-nil override that passes every bound below —
-// a silent no-op instead of the operator's intended pin. Each entry must have
-// a non-empty, unique name; any field that is set must satisfy its bound
-// (cpu > 0, memoryKi > 0, priceHourly >= 0). A name outside the static sizing
-// seed introduces a new flavor and must set all three fields — without the
-// price bound an unpriced new flavor would enter the catalogue at 0 EUR/h and
-// win every cheapest-first decision. The list must not be empty.
+// a silent no-op instead of the operator's intended pin. The same rule
+// refuses the priceHourly key earlier releases accepted: prices are derived
+// now, and a file that still sets one is invalid as a whole rather than
+// applied without it. Each entry must have a non-empty, unique name; any
+// field that is set must be > 0. A name outside the static sizing seed
+// introduces a new flavor and must set both cpu and memoryKi, which are all
+// it is sized and priced from. The list must not be empty.
 func ParseFlavorOverrides(data []byte) ([]FlavorOverride, error) {
 	var overrides []FlavorOverride
 	if err := yaml.UnmarshalStrict(data, &overrides); err != nil {
@@ -258,12 +278,9 @@ func ParseFlavorOverrides(data []byte) ([]FlavorOverride, error) {
 		if o.MemoryKi != nil && *o.MemoryKi <= 0 {
 			return nil, fmt.Errorf("flavor %q: memoryKi must be > 0", o.Name)
 		}
-		if o.PriceHourly != nil && *o.PriceHourly < 0 {
-			return nil, fmt.Errorf("flavor %q: priceHourly must be >= 0", o.Name)
-		}
 		if _, seeded := SizingByName[o.Name]; !seeded {
-			if o.CPU == nil || o.MemoryKi == nil || o.PriceHourly == nil {
-				return nil, fmt.Errorf("flavor %q is not in the built-in catalogue: a new flavor must set cpu, memoryKi and priceHourly", o.Name)
+			if o.CPU == nil || o.MemoryKi == nil {
+				return nil, fmt.Errorf("flavor %q is not in the built-in catalogue: a new flavor must set cpu and memoryKi", o.Name)
 			}
 		}
 	}
@@ -273,11 +290,14 @@ func ParseFlavorOverrides(data []byte) ([]FlavorOverride, error) {
 // ApplyOverrides overlays per-flavor overrides on top of a base catalog and
 // returns the merged catalog plus the names of overrides that had to be skipped
 // (a brand-new flavor absent from both the base and the static sizing seed must
-// supply cpu, memoryKi and priceHourly; otherwise it cannot be constructed).
+// supply cpu and memoryKi; otherwise it cannot be constructed).
 //
 // Field resolution per flavor (highest precedence first): the override field,
-// then the base value, then the static sizing seed. The base catalog's order is
-// preserved; override-only flavors are appended in override order.
+// then the base value, then the static sizing seed. Every flavor's price is
+// then recomputed from its final cpu and memoryKi, so pinning a flavor's
+// memory reprices it, and a Price carried by the base is never served. The
+// base catalog's order is preserved; override-only flavors are appended in
+// override order.
 func ApplyOverrides(base []Flavor, overrides []FlavorOverride) ([]Flavor, []string) {
 	byName := make(map[string]Flavor, len(base))
 	order := make([]string, 0, len(base)+len(overrides))
@@ -300,45 +320,29 @@ func ApplyOverrides(base []Flavor, overrides []FlavorOverride) ([]Flavor, []stri
 	result := make([]Flavor, 0, len(order))
 	for _, name := range order {
 		f, ok := byName[name]
-		fromScratch := false
 		if !ok {
 			// No base entry: seed from the static sizing table if known,
 			// otherwise rely entirely on the override fields below.
+			f = Flavor{Name: name}
 			if s, seeded := SizingByName[name]; seeded {
-				f = Flavor{
-					Name:        name,
-					CPU:         s.CPU,
-					MemoryKi:    s.MemoryKi,
-					PriceHourly: ComputePrice(s.CPU, s.NominalGB, DefaultVCPURate, DefaultRAMRate),
-				}
-			} else {
-				f = Flavor{Name: name}
-				fromScratch = true
+				f.CPU, f.MemoryKi = s.CPU, s.MemoryKi
 			}
 		}
-		o, hasOverride := overrideByName[name]
-		if hasOverride {
+		if o, hasOverride := overrideByName[name]; hasOverride {
 			if o.CPU != nil {
 				f.CPU = *o.CPU
 			}
 			if o.MemoryKi != nil {
 				f.MemoryKi = *o.MemoryKi
 			}
-			if o.PriceHourly != nil {
-				f.PriceHourly = *o.PriceHourly
-			}
 		}
-		// A from-scratch flavor must get its price from the override: the
-		// zero value would otherwise pass the < 0 gate and enter the
-		// catalogue free of charge, capturing every cheapest-first decision.
-		if fromScratch && (!hasOverride || o.PriceHourly == nil) {
+		// A from-scratch flavor missing cpu or memoryKi stops here: it has
+		// nothing to be sized or priced from.
+		if f.CPU <= 0 || f.MemoryKi <= 0 {
 			skipped = append(skipped, name)
 			continue
 		}
-		if f.CPU <= 0 || f.MemoryKi <= 0 || f.PriceHourly < 0 {
-			skipped = append(skipped, name)
-			continue
-		}
+		f.Price = RelativePrice(f.CPU, f.MemoryKi)
 		result = append(result, f)
 	}
 	return result, skipped
@@ -430,7 +434,7 @@ func (p *Provider) Synthesize(flavor string) *cloudprovider.InstanceType {
 	if s, seeded := SizingByName[flavor]; seeded {
 		f.CPU = s.CPU
 		f.MemoryKi = s.MemoryKi
-		f.PriceHourly = ComputePrice(s.CPU, s.NominalGB, DefaultVCPURate, DefaultRAMRate)
+		f.Price = RelativePrice(s.CPU, s.MemoryKi)
 	}
 	it := p.newInstanceType(f)
 	if it.Capacity.Memory().IsZero() {
@@ -487,7 +491,7 @@ func (p *Provider) newInstanceType(f Flavor) *cloudprovider.InstanceType {
 					scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeOnDemand),
 					scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, p.region),
 				),
-				Price:     f.PriceHourly,
+				Price:     f.Price,
 				Available: true,
 			},
 		},
