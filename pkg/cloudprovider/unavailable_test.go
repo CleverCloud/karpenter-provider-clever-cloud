@@ -136,7 +136,7 @@ func newClockedOperatorProvider(t *testing.T, operator *fakeOperator, clk clock.
 		WithInterceptorFuncs(interceptor.Funcs{Create: operator.create}).
 		Build()
 	itp := instancetype.NewProvider("par", nil, nil)
-	return cloudprovider.New(kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clk)), kubeClient
+	return cloudprovider.New(kubeClient, kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clk)), kubeClient
 }
 
 // claimFor is a NodeClaim restricted to the given flavors, requesting memory.
@@ -178,21 +178,24 @@ func requireAvailability(t *testing.T, cp *cloudprovider.CloudProvider, want map
 	}
 }
 
-// launchAll does what karpenter-core's launch controller does with each claim
-// the scheduler planned: Create, and on an InsufficientCapacityError move on
-// (core deletes the claim). It returns how many pods landed on an accepted
-// NodeGroup and the flavors launched.
-func launchAll(t *testing.T, cp *cloudprovider.CloudProvider, results coresched.Results, prefix string) (int, []string) {
+// launchAll does what karpenter-core does with each claim the scheduler
+// planned: persist it, Create, and on an InsufficientCapacityError delete it
+// and move on. It returns how many pods landed on an accepted NodeGroup and
+// the flavors launched.
+func launchAll(t *testing.T, cp *cloudprovider.CloudProvider, kubeClient client.Client, results coresched.Results, prefix string) (int, []string) {
 	t.Helper()
 	placed, flavors := 0, []string{}
 	for i, planned := range results.NewNodeClaims {
 		nodeClaim := planned.ToNodeClaim()
 		nodeClaim.Name = fmt.Sprintf("%s-c%d", prefix, i)
 		nodeClaim.UID = types.UID("uid-" + nodeClaim.Name)
-		created, err := cp.Create(context.Background(), nodeClaim)
+		created, err := cp.Create(context.Background(), stored(t, kubeClient, nodeClaim))
 		if err != nil {
 			if !corecloudprovider.IsInsufficientCapacityError(err) {
 				t.Fatalf("Create %s: want success or an InsufficientCapacityError, got %T: %v", nodeClaim.Name, err, err)
+			}
+			if err := kubeClient.Delete(context.Background(), nodeClaim); err != nil {
+				t.Fatalf("deleting nodeclaim %s: %v", nodeClaim.Name, err)
 			}
 			continue
 		}
@@ -210,23 +213,23 @@ func launchAll(t *testing.T, cp *cloudprovider.CloudProvider, results coresched.
 // the backoff, which used to be global.
 func TestQuotaRejectionMarksLargerFlavorsUnavailable(t *testing.T) {
 	operator := &fakeOperator{headroomGB: 10}
-	cp, _ := newOperatorProvider(t, operator)
+	cp, kubeClient := newOperatorProvider(t, operator)
 	ctx := context.Background()
 
 	// The claim karpenter-core builds for ten 2Gi pods: only L and XL hold it.
-	if _, err := cp.Create(ctx, claimFor("default-big01", "20Gi", "L", "XL")); !corecloudprovider.IsInsufficientCapacityError(err) {
+	if _, err := cp.Create(ctx, stored(t, kubeClient, claimFor("default-big01", "20Gi", "L", "XL"))); !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected the quota to reject the L, got %T: %v", err, err)
 	}
 	requireAvailability(t, cp, map[string]bool{"2XS": true, "XS": true, "S": true, "M": true, "L": false, "XL": false})
 
-	if _, err := cp.Create(ctx, claimFor("default-big02", "20Gi", "L", "XL")); !corecloudprovider.IsInsufficientCapacityError(err) {
+	if _, err := cp.Create(ctx, stored(t, kubeClient, claimFor("default-big02", "20Gi", "L", "XL"))); !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected a claim only covered flavors hold to fail fast, got %T: %v", err, err)
 	}
 	if got := operator.createCount(); got != 1 {
 		t.Errorf("NodeGroups created = %d, want 1: a covered flavor must not reach the API", got)
 	}
 
-	created, err := cp.Create(ctx, claimFor("default-small", "1Gi", "2XS", "XS", "S", "M", "L", "XL"))
+	created, err := cp.Create(ctx, stored(t, kubeClient, claimFor("default-small", "1Gi", "2XS", "XS", "S", "M", "L", "XL")))
 	if err != nil {
 		t.Fatalf("a claim the remaining quota holds must launch, got %T: %v", err, err)
 	}
@@ -243,9 +246,9 @@ func TestQuotaRejectionMarksLargerFlavorsUnavailable(t *testing.T) {
 // available.
 func TestRefusedFlavorIsReportedUnavailable(t *testing.T) {
 	operator := &fakeOperator{headroomGB: 100, refused: map[string]bool{"S": true}}
-	cp, _ := newOperatorProvider(t, operator)
+	cp, kubeClient := newOperatorProvider(t, operator)
 
-	if _, err := cp.Create(context.Background(), claimFor("default-refs1", "1Gi", "S")); !corecloudprovider.IsInsufficientCapacityError(err) {
+	if _, err := cp.Create(context.Background(), stored(t, kubeClient, claimFor("default-refs1", "1Gi", "S"))); !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected the refusal to fail the launch, got %T: %v", err, err)
 	}
 	requireAvailability(t, cp, map[string]bool{"2XS": true, "XS": true, "S": false, "M": true, "L": true, "XL": true})
@@ -258,9 +261,9 @@ func TestFreedCapacityRestoresAvailability(t *testing.T) {
 	running := managedNodeGroup("default-run01", "XS")
 	running.Status = syncedStatus()
 	operator := &fakeOperator{headroomGB: 10}
-	cp, _ := newOperatorProvider(t, operator, running)
+	cp, kubeClient := newOperatorProvider(t, operator, running)
 
-	if _, err := cp.Create(context.Background(), claimFor("default-big01", "10Gi", "S")); !corecloudprovider.IsInsufficientCapacityError(err) {
+	if _, err := cp.Create(context.Background(), stored(t, kubeClient, claimFor("default-big01", "10Gi", "S"))); !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected the quota to reject the S, got %T: %v", err, err)
 	}
 	requireAvailability(t, cp, map[string]bool{"2XS": true, "XS": true, "S": false, "M": false, "L": false, "XL": false})
@@ -282,9 +285,9 @@ func TestRunningNodeOfAnUnavailableFlavorKeepsItsLabels(t *testing.T) {
 	running := managedNodeGroup("default-run01", "L")
 	running.Status = syncedStatus()
 	operator := &fakeOperator{headroomGB: 10}
-	cp, _ := newOperatorProvider(t, operator, running)
+	cp, kubeClient := newOperatorProvider(t, operator, running)
 
-	if _, err := cp.Create(context.Background(), claimFor("default-big01", "20Gi", "L")); !corecloudprovider.IsInsufficientCapacityError(err) {
+	if _, err := cp.Create(context.Background(), stored(t, kubeClient, claimFor("default-big01", "20Gi", "L"))); !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected the quota to reject the L, got %T: %v", err, err)
 	}
 	got, err := cp.Get(context.Background(), nodegroup.ProviderID(running.Name))
@@ -331,7 +334,7 @@ func TestUnavailableFlavorDoesNotDriftRunningNodes(t *testing.T) {
 		t.Fatalf("launched flavor = %q, want L", got)
 	}
 	// The next L does not fit what is left.
-	if _, err := cp.Create(context.Background(), claimFor("default-l4rg2", "20Gi", "L")); !corecloudprovider.IsInsufficientCapacityError(err) {
+	if _, err := cp.Create(context.Background(), stored(t, kubeClient, claimFor("default-l4rg2", "20Gi", "L"))); !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected the quota to reject the second L, got %T: %v", err, err)
 	}
 	requireAvailability(t, cp, map[string]bool{"2XS": true, "XS": true, "S": true, "M": true, "L": false, "XL": false})
@@ -392,7 +395,7 @@ func TestSchedulerFallsBackToASmallerFlavorAfterAQuotaRejection(t *testing.T) {
 	if len(first.NewNodeClaims) != 1 {
 		t.Fatalf("first pass: want the ten pods on one claim, got %d claims", len(first.NewNodeClaims))
 	}
-	if placed, _ := launchAll(t, cp, first, "pass1"); placed != 0 {
+	if placed, _ := launchAll(t, cp, kubeClient, first, "pass1"); placed != 0 {
 		t.Fatalf("first pass: %d pods placed, want the quota to reject the claim", placed)
 	}
 
@@ -404,7 +407,7 @@ func TestSchedulerFallsBackToASmallerFlavorAfterAQuotaRejection(t *testing.T) {
 			}
 		}
 	}
-	placed, flavors := launchAll(t, cp, second, "pass2")
+	placed, flavors := launchAll(t, cp, kubeClient, second, "pass2")
 	if placed == 0 {
 		t.Fatalf("second pass: no pod placed with 10 GB of quota left (claims launched: %v)", flavors)
 	}
@@ -441,7 +444,7 @@ func TestWeightedNodePoolFallsBackFromARefusedFlavor(t *testing.T) {
 	if len(first.NewNodeClaims) != 1 || first.NewNodeClaims[0].NodePoolName != preferred.Name {
 		t.Fatalf("first pass: want one claim on %s, got %d", preferred.Name, len(first.NewNodeClaims))
 	}
-	if placed, _ := launchAll(t, cp, first, "pass1"); placed != 0 {
+	if placed, _ := launchAll(t, cp, kubeClient, first, "pass1"); placed != 0 {
 		t.Fatal("first pass: expected the operator to refuse 2XS")
 	}
 
@@ -453,7 +456,7 @@ func TestWeightedNodePoolFallsBackFromARefusedFlavor(t *testing.T) {
 		}
 		t.Fatalf("second pass: want one claim on %s, got claims on %v (pod error: %v)", fallback.Name, pools, second.PodErrors[pod])
 	}
-	placed, flavors := launchAll(t, cp, second, "pass2")
+	placed, flavors := launchAll(t, cp, kubeClient, second, "pass2")
 	if placed != 1 || len(flavors) != 1 || flavors[0] != "XS" {
 		t.Errorf("second pass: placed %d pod(s) on %v, want the pod on the next-cheapest flavor XS", placed, flavors)
 	}
@@ -493,7 +496,7 @@ func TestExhaustedQuotaCostsOneRejectionAWindow(t *testing.T) {
 			}
 			n := operator.createCount()
 			results := provisioningPass(t, cp, kubeClient, cluster, np, pods...)
-			if placed, flavors := launchAll(t, cp, results, fmt.Sprintf("w%dp%d", w, pass)); placed != 0 {
+			if placed, flavors := launchAll(t, cp, kubeClient, results, fmt.Sprintf("w%dp%d", w, pass)); placed != 0 {
 				t.Fatalf("window %d: %d pods placed on %v with no quota left", w, placed, flavors)
 			}
 			if operator.createCount() == n {
@@ -528,9 +531,9 @@ func TestExhaustedQuotaCostsOneRejectionAWindow(t *testing.T) {
 // rejection that has nothing to do with it.
 func TestResolveFailureNamesUnavailabilityOnlyWhenItIsTheCause(t *testing.T) {
 	operator := &fakeOperator{headroomGB: 10}
-	cp, _ := newOperatorProvider(t, operator)
+	cp, kubeClient := newOperatorProvider(t, operator)
 	ctx := context.Background()
-	if _, err := cp.Create(ctx, claimFor("default-big01", "20Gi", "L")); !corecloudprovider.IsInsufficientCapacityError(err) {
+	if _, err := cp.Create(ctx, stored(t, kubeClient, claimFor("default-big01", "20Gi", "L"))); !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected the quota to reject the L, got %T: %v", err, err)
 	}
 
@@ -543,7 +546,7 @@ func TestResolveFailureNamesUnavailabilityOnlyWhenItIsTheCause(t *testing.T) {
 		{name: "the claim's own requirements rule every flavor out", claim: claimFor("default-tiny1", "20Gi", "2XS")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := cp.Create(ctx, tc.claim)
+			_, err := cp.Create(ctx, stored(t, kubeClient, tc.claim))
 			if !corecloudprovider.IsInsufficientCapacityError(err) {
 				t.Fatalf("expected an InsufficientCapacityError, got %T: %v", err, err)
 			}

@@ -72,7 +72,7 @@ func newTestProviderWithBase(t *testing.T, base []instancetype.Flavor, objs ...c
 		Build()
 	itp := instancetype.NewProvider("par", base, nil)
 	ngp := nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{})
-	return cloudprovider.New(kubeClient, itp, ngp), kubeClient, itp
+	return cloudprovider.New(kubeClient, kubeClient, itp, ngp), kubeClient, itp
 }
 
 // managedNodeGroup seeds a NodeGroup as this provider would have created it.
@@ -123,6 +123,17 @@ func testNodeClaim(name string) *karpv1.NodeClaim {
 			},
 		},
 	}
+}
+
+// stored persists nodeClaim, as karpenter-core does before it asks the cloud
+// provider to launch it: Create reads the claim back from the API server right
+// before the launch, and launches nothing for a claim that is gone.
+func stored(t *testing.T, kubeClient client.Client, nodeClaim *karpv1.NodeClaim) *karpv1.NodeClaim {
+	t.Helper()
+	if err := kubeClient.Create(context.Background(), nodeClaim); err != nil {
+		t.Fatalf("storing nodeclaim %s: %v", nodeClaim.Name, err)
+	}
+	return nodeClaim
 }
 
 // condTrue builds a True condition of the given type, as the Clever Cloud
@@ -237,7 +248,7 @@ func TestCreatePicksCheapestCompatibleFlavor(t *testing.T) {
 			}
 		}
 	}()
-	created, err := cp.Create(context.Background(), nodeClaim)
+	created, err := cp.Create(context.Background(), stored(t, kubeClient, nodeClaim))
 	<-done
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -295,7 +306,7 @@ func TestCreateRespectsMemoryRequests(t *testing.T) {
 			}
 		}
 	}()
-	created, err := cp.Create(context.Background(), nodeClaim)
+	created, err := cp.Create(context.Background(), stored(t, kubeClient, nodeClaim))
 	<-done
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -325,7 +336,7 @@ func TestCreateQuotaExceededReturnsInsufficientCapacity(t *testing.T) {
 			}
 		}
 	}()
-	_, err := cp.Create(context.Background(), nodeClaim)
+	_, err := cp.Create(context.Background(), stored(t, kubeClient, nodeClaim))
 	<-done
 	if err == nil {
 		t.Fatal("expected error")
@@ -354,14 +365,14 @@ func TestQuotaBackoffFailsFastUntilCapacityFreed(t *testing.T) {
 			}
 		}
 	}()
-	if _, err := cp.Create(context.Background(), nodeClaim); !corecloudprovider.IsInsufficientCapacityError(err) {
+	if _, err := cp.Create(context.Background(), stored(t, kubeClient, nodeClaim)); !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected InsufficientCapacityError, got %v", err)
 	}
 
 	// Within the backoff window the next Create must fail fast without
 	// creating a NodeGroup.
 	second := testNodeClaim("default-quotb")
-	if _, err := cp.Create(context.Background(), second); !corecloudprovider.IsInsufficientCapacityError(err) {
+	if _, err := cp.Create(context.Background(), stored(t, kubeClient, second)); !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected fast InsufficientCapacityError, got %v", err)
 	}
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: second.Name}, &ngv1.NodeGroup{}); err == nil {
@@ -397,7 +408,7 @@ func TestQuotaBackoffFailsFastUntilCapacityFreed(t *testing.T) {
 			}
 		}
 	}()
-	if _, err := cp.Create(context.Background(), third); err != nil {
+	if _, err := cp.Create(context.Background(), stored(t, kubeClient, third)); err != nil {
 		t.Fatalf("expected Create to succeed after capacity freed, got %v", err)
 	}
 	<-done
@@ -422,7 +433,7 @@ func TestDeleteOfALateQuotaRejectionKeepsTheBackoff(t *testing.T) {
 		Build()
 	itp := instancetype.NewProvider("par", nil, nil)
 	ngp := nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{})
-	cp := cloudprovider.New(kubeClient, itp, ngp)
+	cp := cloudprovider.New(kubeClient, kubeClient, itp, ngp)
 
 	claim := testNodeClaim(rejected.Name)
 	claim.Status.ProviderID = nodegroup.ProviderID(rejected.Name)
@@ -435,7 +446,7 @@ func TestDeleteOfALateQuotaRejectionKeepsTheBackoff(t *testing.T) {
 	}
 
 	next := testNodeClaim("default-next1")
-	if _, err := cp.Create(context.Background(), next); !corecloudprovider.IsInsufficientCapacityError(err) {
+	if _, err := cp.Create(context.Background(), stored(t, kubeClient, next)); !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected a fast InsufficientCapacityError, got %v", err)
 	}
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: next.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
@@ -726,7 +737,7 @@ func TestCreateVanishedNodeGroupReturnsInsufficientCapacity(t *testing.T) {
 			}
 		}
 	}()
-	_, err := cp.Create(context.Background(), nodeClaim)
+	_, err := cp.Create(context.Background(), stored(t, kubeClient, nodeClaim))
 	<-done
 	if !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("expected InsufficientCapacityError on vanish, got %T: %v", err, err)
@@ -765,7 +776,7 @@ func TestLegacyNodeClassLabelKeepsProvisioningWithoutDelivery(t *testing.T) {
 
 			nodeClaim := testNodeClaim("default-legacy")
 			done := setStatusOnceCreated(t, kubeClient, nodeClaim.Name, syncedStatus())
-			created, err := cp.Create(ctx, nodeClaim)
+			created, err := cp.Create(ctx, stored(t, kubeClient, nodeClaim))
 			if err != nil {
 				// Before waiting on done: a refused launch creates no group,
 				// and the status writer would wait for one forever.
@@ -815,9 +826,9 @@ func TestCreateRefusesUnknownReadiness(t *testing.T) {
 	// launch machines: Ready has to be affirmatively True, not merely
 	// not-False.
 	unknown := &v1alpha1.CleverNodeClass{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
-	cp, _ := newTestProvider(t, unknown)
+	cp, kubeClient := newTestProvider(t, unknown)
 
-	_, err := cp.Create(context.Background(), testNodeClaim("default-unrdy"))
+	_, err := cp.Create(context.Background(), stored(t, kubeClient, testNodeClaim("default-unrdy")))
 	if err == nil {
 		t.Fatal("expected an error for a NodeClass with unknown readiness")
 	}
@@ -842,7 +853,7 @@ func TestCreateRefusesTerminatingNodeClass(t *testing.T) {
 	}
 
 	nodeClaim := testNodeClaim("default-term1")
-	_, err := cp.Create(context.Background(), nodeClaim)
+	_, err := cp.Create(context.Background(), stored(t, kubeClient, nodeClaim))
 	if err == nil {
 		t.Fatal("expected an error for a terminating NodeClass")
 	}
@@ -985,9 +996,9 @@ func TestCreateAdoptionDescribesTheExistingFlavor(t *testing.T) {
 			Phase:      ngv1.PhaseSynced,
 		},
 	}
-	cp, _, itp := newTestProviderWithCatalog(t, readyNodeClass("default"), existing)
+	cp, kubeClient, itp := newTestProviderWithCatalog(t, readyNodeClass("default"), existing)
 
-	created, err := cp.Create(context.Background(), nodeClaim)
+	created, err := cp.Create(context.Background(), stored(t, kubeClient, nodeClaim))
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -1029,7 +1040,7 @@ func TestCreateFlavorRefusalReturnsInsufficientCapacity(t *testing.T) {
 	nodeClaim := testNodeClaim("default-refused")
 
 	done := markRefused(t, kubeClient, nodeClaim.Name, "FlavorNotAvailable")
-	_, err := cp.Create(context.Background(), nodeClaim)
+	_, err := cp.Create(context.Background(), stored(t, kubeClient, nodeClaim))
 	<-done
 
 	if err == nil {
@@ -1052,7 +1063,7 @@ func TestCreateAvoidsARefusedFlavor(t *testing.T) {
 	// 2XS is the cheapest flavor satisfying the claim; get it refused.
 	refused := testNodeClaim("default-refused")
 	done := markRefused(t, kubeClient, refused.Name, "FlavorNotAvailable")
-	if _, err := cp.Create(context.Background(), refused); err == nil {
+	if _, err := cp.Create(context.Background(), stored(t, kubeClient, refused)); err == nil {
 		t.Fatal("expected the refusal to fail the launch")
 	}
 	<-done
@@ -1070,7 +1081,7 @@ func TestCreateAvoidsARefusedFlavor(t *testing.T) {
 			}
 		}
 	}()
-	created, err := cp.Create(context.Background(), next)
+	created, err := cp.Create(context.Background(), stored(t, kubeClient, next))
 	<-syncDone
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -1116,7 +1127,7 @@ func TestCreateAdmissionRefusalRelaxesToAnotherFlavor(t *testing.T) {
 		t.Fatalf("an override named like a Clever Cloud flavor must parse: %v", err)
 	}
 	itp := instancetype.NewProvider("par", nil, overrides)
-	cp := cloudprovider.New(kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{}))
+	cp := cloudprovider.New(kubeClient, kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{}))
 	claim := func(name string) *karpv1.NodeClaim {
 		nodeClaim := testNodeClaim(name)
 		nodeClaim.Spec.Requirements[0].Values = append(nodeClaim.Spec.Requirements[0].Values, "3XS")
@@ -1124,7 +1135,7 @@ func TestCreateAdmissionRefusalRelaxesToAnotherFlavor(t *testing.T) {
 	}
 
 	refused := claim("default-refused")
-	_, err = cp.Create(context.Background(), refused)
+	_, err = cp.Create(context.Background(), stored(t, kubeClient, refused))
 	if !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("an admission refusal must fail the launch with an InsufficientCapacityError so core re-plans, got %T: %v", err, err)
 	}
@@ -1150,7 +1161,7 @@ func TestCreateAdmissionRefusalRelaxesToAnotherFlavor(t *testing.T) {
 
 	next := claim("default-next")
 	done := setStatusOnceCreated(t, kubeClient, next.Name, syncedStatus())
-	created, err := cp.Create(context.Background(), next)
+	created, err := cp.Create(context.Background(), stored(t, kubeClient, next))
 	if err != nil {
 		// Before waiting on done: a refused launch creates no group, and the
 		// status writer would wait for one forever.
@@ -1174,7 +1185,7 @@ func TestCreateUpstreamErrorDoesNotWalkTheCatalogue(t *testing.T) {
 
 	incident := testNodeClaim("default-incident")
 	done := setStatusOnceCreated(t, kubeClient, incident.Name, upstreamErrorStatus(false), syncedStatus())
-	created, err := cp.Create(context.Background(), incident)
+	created, err := cp.Create(context.Background(), stored(t, kubeClient, incident))
 	<-done
 	if err != nil {
 		t.Fatalf("a transient upstream failure must not fail the launch, got %T: %v (ICE=%v)",
@@ -1187,7 +1198,7 @@ func TestCreateUpstreamErrorDoesNotWalkTheCatalogue(t *testing.T) {
 	// The next launch still gets the cheapest flavor: nothing was held out.
 	next := testNodeClaim("default-next")
 	syncDone := setStatusOnceCreated(t, kubeClient, next.Name, syncedStatus())
-	created, err = cp.Create(context.Background(), next)
+	created, err = cp.Create(context.Background(), stored(t, kubeClient, next))
 	<-syncDone
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -1224,7 +1235,7 @@ func TestCreateAdoptsReadyGroupDuringUpstreamError(t *testing.T) {
 	cp, kubeClient := newTestProvider(t, readyNodeClass("default"), existing)
 	timeoutsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
 
-	created, err := cp.Create(context.Background(), nodeClaim)
+	created, err := cp.Create(context.Background(), stored(t, kubeClient, nodeClaim))
 	if err != nil {
 		t.Fatalf("adopting a Ready group must succeed, got %T: %v (ICE=%v)",
 			err, err, corecloudprovider.IsInsufficientCapacityError(err))

@@ -402,6 +402,41 @@ func TestCreateBuildsNodeGroupForNodeClaim(t *testing.T) {
 	}
 }
 
+// TestResolveAndCreateBuildsWhatTheResolverDecides pins the contract of the
+// resolver cloudprovider.Create decides its launch with once it holds the
+// creation lock: its error fails the launch as it is, with nothing created,
+// and the NodeGroup is built from the NodeClass and the flavor it returns.
+func TestResolveAndCreateBuildsWhatTheResolverDecides(t *testing.T) {
+	provider, kubeClient := newTestProvider(t)
+	ctx := context.Background()
+
+	unwanted := testNodeClaim("default-gone1")
+	errGone := errors.New("nodeclaim default-gone1 is being deleted")
+	_, err := provider.ResolveAndCreate(ctx, unwanted, func(context.Context) (*v1alpha1.CleverNodeClass, string, error) {
+		return nil, "", errGone
+	})
+	if !errors.Is(err, errGone) {
+		t.Fatalf("want the resolver's error as it is, got %T: %v", err, err)
+	}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: unwanted.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
+		t.Errorf("a failed resolution must create nothing, got %v", err)
+	}
+
+	nodeClaim := testNodeClaim("default-rslv1")
+	nodeClass := testNodeClass("resolved")
+	done := acceptOnceCreated(t, kubeClient, nodeClaim.Name)
+	ng, err := provider.ResolveAndCreate(ctx, nodeClaim, func(context.Context) (*v1alpha1.CleverNodeClass, string, error) {
+		return nodeClass, "S", nil
+	})
+	<-done
+	if err != nil {
+		t.Fatalf("ResolveAndCreate: %v", err)
+	}
+	if ng.Spec.Flavor != "S" || ng.Labels[v1alpha1.NodeClassLabelKey] != nodeClass.Name {
+		t.Errorf("nodegroup built with flavor %q from nodeclass %q, want S from %q", ng.Spec.Flavor, ng.Labels[v1alpha1.NodeClassLabelKey], nodeClass.Name)
+	}
+}
+
 func TestCreateFiltersReservedNodeGroupLabels(t *testing.T) {
 	provider, kubeClient := newTestProvider(t)
 	nodeClass := testNodeClass("default")

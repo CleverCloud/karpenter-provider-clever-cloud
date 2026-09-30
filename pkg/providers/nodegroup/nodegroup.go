@@ -148,7 +148,8 @@ type Provider struct {
 	// Ready outlasted the 15s window on every healthy launch, so launches ran
 	// 15 s apart, and karpenter-core, whose cluster state stays unsynced
 	// while any NodeClaim lacks a provider ID, paused disruption cluster-wide
-	// for as long as the queue lasted.
+	// for as long as the queue lasted. What a launch creates is decided under
+	// it too (ResolveAndCreate), never before the wait.
 	createMu sync.Mutex
 
 	// mu guards what the provider learned from the operator's refusals, which
@@ -413,22 +414,47 @@ func NodeClaimOwners(ng *ngv1.NodeGroup) []string {
 	return names
 }
 
-// Create creates the NodeGroup backing a NodeClaim and waits for the Clever
-// Cloud operator's decision on it. It returns ErrQuotaExceeded (after cleaning
-// up the NodeGroup) when the organisation quota rejects it, and
-// ErrFlavorRejected on any other refusal, by the operator or by the API
-// server's admission of the flavor. A group the operator acknowledged is
-// returned at once, before its VM is up; the nodegroupstatus controller
-// follows it from there.
+// Resolver decides what a launch creates once it holds the creation lock: the
+// NodeClass the NodeGroup is built from and the flavor it runs. Its error
+// fails the launch as it is, before anything reaches the API. It runs with
+// createMu held, so it must not create a NodeGroup itself.
+type Resolver func(ctx context.Context) (*v1alpha1.CleverNodeClass, string, error)
+
+// Create creates the NodeGroup backing a NodeClaim from nodeClass with flavor
+// and waits for the Clever Cloud operator's decision on it. It returns
+// ErrQuotaExceeded (after cleaning up the NodeGroup) when the organisation
+// quota rejects it, and ErrFlavorRejected on any other refusal, by the
+// operator or by the API server's admission of the flavor. A group the
+// operator acknowledged is returned at once, before its VM is up; the
+// nodegroupstatus controller follows it from there.
 // It is idempotent: an already-existing NodeGroup owned by the same NodeClaim
 // is reused.
 func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.CleverNodeClass, flavor string) (*ngv1.NodeGroup, error) {
+	return p.ResolveAndCreate(ctx, nodeClaim, func(context.Context) (*v1alpha1.CleverNodeClass, string, error) {
+		return nodeClass, flavor, nil
+	})
+}
+
+// ResolveAndCreate is Create with the NodeClass and the flavor decided by
+// resolve once createMu is held, immediately before the NodeGroup is created.
+// A launch waits on createMu behind every launch queued ahead of it, and what
+// it decided before the wait can be stale once it gets the lock: a launch
+// ahead had that flavor refused or quota-rejected, the NodeClass started
+// terminating, the NodeClaim was deleted. Only a decision taken under the
+// lock sees what the launches ahead just learned.
+func (p *Provider) ResolveAndCreate(ctx context.Context, nodeClaim *karpv1.NodeClaim, resolve Resolver) (*ngv1.NodeGroup, error) {
 	p.createMu.Lock()
 	defer p.createMu.Unlock()
-	// Checked under createMu: a claim resolved before a rejection that landed
-	// while it waited here must not repeat it. Only the flavors the rejection
-	// covers fail fast; a smaller one may fit and goes to the API. No event on
-	// the fast-fail: karpenter-core already publishes an
+	nodeClass, flavor, err := resolve(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Checked under createMu, after resolve: a flavor fixed before the wait
+	// (Create) may have been rejected by a launch ahead in the queue, and a
+	// late rejection (RecordLateRefusal, which does not take createMu) can
+	// land between a resolver's own check and this one. Only the flavors the
+	// rejection covers fail fast; a smaller one may fit and goes to the API.
+	// No event on the fast-fail: karpenter-core already publishes an
 	// InsufficientCapacityError event per attempt, and claims get fresh names
 	// each retry so per-claim dedupe cannot bound the volume.
 	if err := p.quotaFastFail(flavor); err != nil {
