@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/clock"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -41,6 +42,7 @@ import (
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
 
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis"
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
@@ -1426,6 +1428,133 @@ func TestCreateNonQuotaRejectionIsTerminal(t *testing.T) {
 	// of looping: karpenter-core keeps no per-offering memory of an ICE.
 	if _, held := provider.RejectedFlavors()["2XS"]; !held {
 		t.Errorf("expected 2XS to be held out after the refusal, got %v", provider.RejectedFlavors())
+	}
+}
+
+// invalidNodeGroup is the error the API server returns when the NodeGroup CRD's
+// schema refuses a create: 422 Invalid, one cause per failing field.
+func invalidNodeGroup(name string, errs ...*field.Error) error {
+	return apierrors.NewInvalid(schema.GroupKind{Group: apis.CleverCloudGroup, Kind: "NodeGroup"}, name, errs)
+}
+
+// refuseCreateWith returns a client whose NodeGroup creates all fail with
+// err, as the API server fails them at admission: nothing is stored.
+func refuseCreateWith(err error) client.Client {
+	return fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*ngv1.NodeGroup); ok {
+					return err
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).
+		Build()
+}
+
+// TestCreateAdmissionRefusalOfTheFlavorIsTerminal covers a flavor the
+// NodeGroup API does not accept at all: spec.flavor is an enum (2XS..XL), and
+// a settings.flavors override can add a name outside it. The API server
+// refuses such a create with 422 Invalid before the operator ever sees it.
+// Returned as a plain error, karpenter-core retried the same claim until its
+// 5-minute launch timeout and re-planned onto the same cheapest flavor,
+// forever. It must be the same typed refusal as the operator's, with the same
+// hold-out, count and event.
+func TestCreateAdmissionRefusalOfTheFlavorIsTerminal(t *testing.T) {
+	nodeClaim := testNodeClaim("default-2xl")
+	// The error measured against a kube-apiserver serving the live CRD: the
+	// enum refusal, plus a cause without a field for the CEL rules skipped.
+	kubeClient := refuseCreateWith(invalidNodeGroup(nodeClaim.Name,
+		field.NotSupported(field.NewPath("spec", "flavor"), "2XL", []string{"2XS", "XS", "S", "M", "L", "XL"}),
+		field.Invalid(nil, nil, "some validation rules were not checked because the object was invalid; correct the existing errors to complete validation"),
+	))
+	recorder := &fakeRecorder{}
+	provider := nodegroup.NewProvider(kubeClient, recorder, catalogue, clock.RealClock{})
+	rejectionsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total")
+	timeoutsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
+
+	_, err := provider.Create(context.Background(), nodeClaim, testNodeClass("default"), "2XL")
+
+	var rejected *nodegroup.ErrFlavorRejected
+	if !errors.As(err, &rejected) {
+		t.Fatalf("an admission refusal of the flavor must be an *ErrFlavorRejected, got %T: %v", err, err)
+	}
+	if rejected.Flavor != "2XL" || rejected.Reason != string(metav1.StatusReasonInvalid) {
+		t.Errorf("refusal = %+v, want flavor 2XL and reason Invalid", rejected)
+	}
+	// The API server's own explanation travels with the refusal.
+	if want := `Unsupported value: "2XL": supported values: "2XS", "XS", "S", "M", "L", "XL"`; rejected.Message != want {
+		t.Errorf("refusal message = %q, want the API server's %q", rejected.Message, want)
+	}
+	if _, held := provider.RejectedFlavors()["2XL"]; !held {
+		t.Errorf("expected 2XL to be held out after the admission refusal, got %v", provider.RejectedFlavors())
+	}
+	if !provider.Unavailable("2XL") {
+		t.Error("the refused 2XL must be reported unavailable, so that the scheduler plans around it")
+	}
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total") - rejectionsBefore; delta != 1 {
+		t.Errorf("rejections_total delta = %v, want 1", delta)
+	}
+	// Nothing was created, so there is nothing to wait for.
+	if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_acceptance_timeouts_total") - timeoutsBefore; delta != 0 {
+		t.Errorf("acceptance_timeouts_total delta = %v, want 0: no NodeGroup exists to poll", delta)
+	}
+	published := recorder.eventsWithReason("NodeGroupRejected")
+	if len(published) != 1 {
+		t.Fatalf("expected one NodeGroupRejected event on the nodeclaim, got %v", recorder.reasons())
+	}
+	for _, want := range []string{"2XL", "at admission", "settings.flavors"} {
+		if !strings.Contains(published[0].Message, want) {
+			t.Errorf("event message must mention %q: %s", want, published[0].Message)
+		}
+	}
+}
+
+// TestCreateOtherAdmissionErrorsAreNotFlavorRefusals keeps the mapping narrow.
+// A payload the CRD refuses for another field fails whatever the flavor, so
+// holding the flavor out would only walk the catalogue one flavor per launch,
+// and the launch is no capacity problem another flavor solves. That holds when
+// the flavor is refused too: the API server reports every schema error at
+// once, and the re-plan onto an accepted flavor would fail on the other field
+// all the same. An error that is not Invalid says nothing about the flavor at
+// all.
+func TestCreateOtherAdmissionErrorsAreNotFlavorRefusals(t *testing.T) {
+	for name, apiErr := range map[string]error{
+		"invalid labels": invalidNodeGroup("default-other",
+			field.Invalid(field.NewPath("spec", "labels"), nil, "Label keys with reserved prefixes (kubernetes.io/, node.kubernetes.io/, clever-cloud.com/) are not allowed")),
+		// The error a kube-apiserver serving the live CRD returns for a
+		// flavor outside the enum and a label value its pattern refuses.
+		"invalid flavor and label value": invalidNodeGroup("default-other",
+			field.NotSupported(field.NewPath("spec", "flavor"), "2XL", []string{"2XS", "XS", "S", "M", "L", "XL"}),
+			field.Invalid(field.NewPath("spec", "labels", "a"), "bad value!", "spec.labels.a in body should match '^([a-zA-Z0-9]([-_.a-zA-Z0-9]{0,61}[a-zA-Z0-9])?)?$'"),
+			field.Invalid(nil, nil, "some validation rules were not checked because the object was invalid; correct the existing errors to complete validation"),
+		),
+		"forbidden": apierrors.NewForbidden(schema.GroupResource{Group: apis.CleverCloudGroup, Resource: "nodegroups"}, "default-other", errors.New("denied")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			provider := nodegroup.NewProvider(refuseCreateWith(apiErr), &fakeRecorder{}, catalogue, clock.RealClock{})
+			rejectionsBefore := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total")
+
+			_, err := provider.Create(context.Background(), testNodeClaim("default-other"), testNodeClass("default"), "M")
+
+			var rejected *nodegroup.ErrFlavorRejected
+			if err == nil || errors.As(err, &rejected) {
+				t.Fatalf("expected a plain error, got %T: %v", err, err)
+			}
+			if !errors.Is(err, apiErr) {
+				t.Errorf("the API server's error must stay wrapped for karpenter-core to log, got %v", err)
+			}
+			if held := provider.RejectedFlavors(); len(held) != 0 {
+				t.Errorf("nothing may be held out, got %v", held)
+			}
+			if provider.Unavailable("M") {
+				t.Error("M must stay available: the error is no refusal of the flavor")
+			}
+			if delta := metricstest.Value(t, "karpenter_clevercloud_nodegroup_rejections_total") - rejectionsBefore; delta != 0 {
+				t.Errorf("rejections_total delta = %v, want 0", delta)
+			}
+		})
 	}
 }
 

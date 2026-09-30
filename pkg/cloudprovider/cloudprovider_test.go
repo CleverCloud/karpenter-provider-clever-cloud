@@ -19,6 +19,7 @@ package cloudprovider_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -26,17 +27,21 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
 
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis"
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	cloudprovider "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/cloudprovider"
@@ -1074,6 +1079,86 @@ func TestCreateAvoidsARefusedFlavor(t *testing.T) {
 		t.Errorf("expected the refused flavor to be skipped, got %q again", got)
 	} else if got != "XS" {
 		t.Errorf("expected the next-cheapest flavor XS, got %q", got)
+	}
+}
+
+// platformFlavors is the enum the live NodeGroup CRD restricts spec.flavor to.
+var platformFlavors = []string{"2XS", "XS", "S", "M", "L", "XL"}
+
+// TestCreateAdmissionRefusalRelaxesToAnotherFlavor drives a settings.flavors
+// override through to the launch. 3XS has the platform's naming, so it parses
+// (a flavor Clever Cloud might add is declared that way), and it is the
+// cheapest flavor of the catalogue; but the NodeGroup API does not carry it,
+// so the API server refuses its create at admission. Previously that was a
+// plain error: karpenter-core retried the claim until its launch timeout and
+// re-planned onto 3XS again, forever, without a node ever launching. The
+// launch must fail as an InsufficientCapacityError, and the next one land on
+// the cheapest flavor the platform accepts.
+func TestCreateAdmissionRefusalRelaxesToAnotherFlavor(t *testing.T) {
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(readyNodeClass("default")).
+		WithStatusSubresource(&v1alpha1.CleverNodeClass{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			// The CRD's enum, as the API server enforces it.
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if ng, ok := obj.(*ngv1.NodeGroup); ok && !slices.Contains(platformFlavors, ng.Spec.Flavor) {
+					return apierrors.NewInvalid(schema.GroupKind{Group: apis.CleverCloudGroup, Kind: "NodeGroup"}, ng.Name, field.ErrorList{
+						field.NotSupported(field.NewPath("spec", "flavor"), ng.Spec.Flavor, platformFlavors),
+					})
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	overrides, err := instancetype.ParseFlavorOverrides([]byte("- name: 3XS\n  cpu: 2\n  memoryKi: 1857672\n"))
+	if err != nil {
+		t.Fatalf("an override named like a Clever Cloud flavor must parse: %v", err)
+	}
+	itp := instancetype.NewProvider("par", nil, overrides)
+	cp := cloudprovider.New(kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{}))
+	claim := func(name string) *karpv1.NodeClaim {
+		nodeClaim := testNodeClaim(name)
+		nodeClaim.Spec.Requirements[0].Values = append(nodeClaim.Spec.Requirements[0].Values, "3XS")
+		return nodeClaim
+	}
+
+	refused := claim("default-refused")
+	_, err = cp.Create(context.Background(), refused)
+	if !corecloudprovider.IsInsufficientCapacityError(err) {
+		t.Fatalf("an admission refusal must fail the launch with an InsufficientCapacityError so core re-plans, got %T: %v", err, err)
+	}
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: refused.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
+		t.Errorf("no NodeGroup may exist for a refused create, got %v", err)
+	}
+	// The scheduler learns of the refusal through the offerings: 3XS stays in
+	// the catalogue, unavailable, and 2XS stays available.
+	its, err := cp.GetInstanceTypes(context.Background(), topologyNodePool("default"))
+	if err != nil {
+		t.Fatalf("GetInstanceTypes: %v", err)
+	}
+	available := map[string]bool{}
+	for _, it := range its {
+		available[it.Name] = len(it.Offerings.Available()) > 0
+	}
+	if isAvailable, served := available["3XS"]; !served || isAvailable {
+		t.Errorf("3XS must be served with no available offering after its admission refusal, got served=%v available=%v", served, isAvailable)
+	}
+	if !available["2XS"] {
+		t.Error("2XS must stay available: the refusal concerns 3XS only")
+	}
+
+	next := claim("default-next")
+	done := setStatusOnceCreated(t, kubeClient, next.Name, syncedStatus())
+	created, err := cp.Create(context.Background(), next)
+	if err != nil {
+		// Before waiting on done: a refused launch creates no group, and the
+		// status writer would wait for one forever.
+		t.Fatalf("the re-plan must launch on a flavor the platform accepts: %v", err)
+	}
+	<-done
+	if got := created.Labels[corev1.LabelInstanceTypeStable]; got != "2XS" {
+		t.Errorf("expected the re-plan to skip the refused 3XS for the cheapest accepted flavor 2XS, got %q", got)
 	}
 }
 

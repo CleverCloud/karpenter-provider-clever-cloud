@@ -173,8 +173,19 @@ settings:
     - { name: XL, memoryKi: 30584176 }
 ```
 
-A name outside the built-in catalogue adds a flavor and must set both `cpu` and `memoryKi`; the
-NodeGroup API only accepts `2XS`…`XL` today, though, so in practice overrides adjust those six.
+A name outside the built-in catalogue adds a flavor and must set both `cpu` and `memoryKi`. Names
+are Clever Cloud flavor names, uppercase as the NodeGroup API takes them: a new one must follow the
+platform's naming (`M`, or `S` or `L` optionally prefixed by `X` or `2X` to `9X`, such as `2XL`).
+Anything else (`2xs`, `CUSTOM`) could never be created, and `helm` refuses it. An overrides file
+written outside the chart that carries one is refused as a whole (the error for `2xs` asks
+`did you mean "2XS"?`), and the controller runs on the built-in catalogue without any override, as
+for any invalid file. The NodeGroup API only accepts `2XS`…`XL` today (the `spec.flavor` enum of
+its CRD), so in practice overrides adjust those six: add a flavor only once that enum carries it.
+Until then, every launch on it is refused at admission and the refused flavor is
+[unavailable](docs/observability.md#unavailable-flavors) to Karpenter's scheduler 5 minutes at a
+time, with a `NodeGroupRejected` event on the NodeClaim and
+`karpenter_clevercloud_nodegroup_rejections_total` counting each refusal. The launch fails over to
+another flavor when the claim allows one; pods that only that flavor fits stay pending.
 Overrides always win over the built-in values. Leave `settings.flavors` empty to use the built-in
 catalogue unchanged.
 

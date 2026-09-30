@@ -62,7 +62,7 @@ kubectl apply -f examples/v1/general-purpose.yaml
 | `settings.disableLeaderElection` | `false` | For single-replica dev setups |
 | `settings.batchMaxDuration` / `batchIdleDuration` | `10s` / `1s` | Pod batching windows |
 | `settings.featureGates.nodeRepair` | `false` | Enable node auto-repair |
-| `settings.flavors` | `[]` | Per-flavor overrides overlaid on the built-in catalogue (`name` required; `cpu`/`memoryKi` optional). No price field: prices are derived from cpu and memoryKi, so pin every flavor the same way or none, and a leftover `priceHourly` fails schema validation. Empty = built-in catalogue unchanged. Mounted via a ConfigMap; overrides always win. Nodes of the controller's own NodeGroups then correct memory within 10% of the entry (same cpu required; prices do not follow); a pin further off is served as-is and its nodes are counted as refused reports |
+| `settings.flavors` | `[]` | Per-flavor overrides overlaid on the built-in catalogue (`name` required; `cpu`/`memoryKi` optional). A name must be a Clever Cloud flavor name, uppercase: `2XS`…`XL`, or a new flavor (which must set `cpu` and `memoryKi`) named the same way, such as `2XL`; the schema refuses any other (`2xs`, `CUSTOM`), which the NodeGroup API could never create. The NodeGroup API accepts only `2XS`…`XL` today: a new flavor it does not accept yet is refused at every launch and held out of provisioning 5 minutes at a time. No price field: prices are derived from cpu and memoryKi, so pin every flavor the same way or none, and a leftover `priceHourly` fails schema validation. Empty = built-in catalogue unchanged. Mounted via a ConfigMap; overrides always win. Nodes of the controller's own NodeGroups then correct memory within 10% of the entry (same cpu required; prices do not follow); a pin further off is served as-is and its nodes are counted as refused reports |
 | `controller.resources` | 200m/256Mi, limit 512Mi | Controller container resources |
 | `controller.env` | `[]` | Extra environment variables |
 | `service.enabled` | `true` | ClusterIP service exposing `/metrics` |
@@ -101,8 +101,11 @@ previous release, renders fine and the values are ignored. The opposite holds
 for `priceHourly`, which `settings.flavors` entries no longer accept: an entry
 that still carries it, from your values file or reused from the previous
 release, makes the upgrade above fail schema validation (`additional
-properties 'priceHourly' not allowed`). Pass the corrected list explicitly,
-since a list given with `-f` or `--set-json` replaces the reused one:
+properties 'priceHourly' not allowed`). So does an entry whose `name` is not a
+Clever Cloud flavor name (`does not match pattern`), such as a lowercase `2xs`
+or a made-up `CUSTOM`: earlier releases accepted it, but the NodeGroup API
+refused every launch on it. Pass the corrected list explicitly, since a list
+given with `-f` or `--set-json` replaces the reused one:
 `--set-json 'settings.flavors=[]'` drops the overrides (see the
 [upgrade notes](../../docs/getting-started/installation.md#upgrading)).
 

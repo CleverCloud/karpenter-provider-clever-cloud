@@ -33,6 +33,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -96,11 +97,13 @@ func (e *ErrQuotaExceeded) Error() string {
 
 // ErrFlavorRejected is returned by Create when the upstream operator refuses
 // the NodeGroup for a reason that is not the organisation quota — a flavor the
-// cluster cannot provision, a spec it will not accept. It is terminal: waiting
-// for a group the operator has already refused only burns karpenter's
-// registration TTL, and retrying the same flavor reproduces it. A failure the
-// operator retries on its own (ngv1.NodeGroup.TransientFailure, e.g. a Clever
-// Cloud API error) is not a refusal and never produces this error.
+// cluster cannot provision, a spec it will not accept — and when the API
+// server refuses its flavor at admission (Reason "Invalid": the NodeGroup CRD
+// restricts spec.flavor to an enum). It is terminal: waiting for a group the
+// operator has already refused only burns karpenter's registration TTL, and
+// retrying the same flavor reproduces it. A failure the operator retries on
+// its own (ngv1.NodeGroup.TransientFailure, e.g. a Clever Cloud API error) is
+// not a refusal and never produces this error.
 type ErrFlavorRejected struct {
 	Flavor  string
 	Reason  string
@@ -112,9 +115,10 @@ func (e *ErrFlavorRejected) Error() string {
 }
 
 // flavorBackoff is how long a flavor stays unavailable after the upstream
-// operator refused it. Long enough that karpenter re-plans onto another flavor
-// instead of looping on the refused one, short enough that a transient refusal
-// or a platform-side fix is picked up without a restart.
+// operator, or the API server's admission, refused it. Long enough that
+// karpenter re-plans onto another flavor instead of looping on the refused
+// one, short enough that a transient refusal or a platform-side fix (an enum
+// that now carries the flavor) is picked up without a restart.
 const flavorBackoff = 5 * time.Minute
 
 // Catalogue sizes flavors with the vCPU count and memory their catalogue
@@ -158,7 +162,8 @@ type Provider struct {
 	// rejection of it.
 	quotaRejections map[string]quotaRejection
 	// rejectedFlavors remembers, per flavor, the upstream operator's last
-	// refusal of it for a non-quota reason.
+	// refusal of it for a non-quota reason, or the API server's refusal of it
+	// at admission.
 	rejectedFlavors map[string]flavorHoldOut
 	// holdOutSeq is the sequence number of the last hold-out recorded.
 	holdOutSeq uint64
@@ -272,7 +277,8 @@ func (p *Provider) quotaRejectionCovering(flavor string, size instancetype.Sizin
 // Unavailable reports whether a launch of flavor is known to fail right now,
 // which the cloud provider turns into Available=false offerings: a quota
 // rejection covers it (see quotaRejection.coverage) and no capacity was freed
-// since, or the operator refused flavor itself within the last flavorBackoff.
+// since, or the operator, or the API server's admission, refused flavor itself
+// within the last flavorBackoff.
 func (p *Provider) Unavailable(flavor string) bool {
 	size, sized := p.sizing(flavor)
 	p.mu.Lock()
@@ -410,7 +416,8 @@ func NodeClaimOwners(ng *ngv1.NodeGroup) []string {
 // Create creates the NodeGroup backing a NodeClaim and waits for the Clever
 // Cloud operator's decision on it. It returns ErrQuotaExceeded (after cleaning
 // up the NodeGroup) when the organisation quota rejects it, and
-// ErrFlavorRejected on any other refusal. A group the operator acknowledged is
+// ErrFlavorRejected on any other refusal, by the operator or by the API
+// server's admission of the flavor. A group the operator acknowledged is
 // returned at once, before its VM is up; the nodegroupstatus controller
 // follows it from there.
 // It is idempotent: an already-existing NodeGroup owned by the same NodeClaim
@@ -470,6 +477,16 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 	// the hold-outs recorded up to here (see clearFlavorRejection).
 	mark := p.holdOutMark()
 	if err := p.kubeClient.Create(ctx, ng); err != nil {
+		// A flavor outside the NodeGroup CRD's enum never reaches the
+		// operator: the API server refuses the create itself (422 Invalid).
+		// Returned as a plain error, karpenter-core retried the same claim
+		// until its 5-minute launch timeout, then re-planned onto the same
+		// cheapest flavor, forever. It is a refusal of the flavor like the
+		// operator's, and takes the same path.
+		if rejected := admissionFlavorRefusal(err, flavor); rejected != nil {
+			p.refuseFlavorAtAdmission(ctx, nodeClaim, ng.Name, rejected, err)
+			return nil, rejected
+		}
 		if !apierrors.IsAlreadyExists(err) {
 			return nil, fmt.Errorf("creating nodegroup, %w", err)
 		}
@@ -557,6 +574,68 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 	// out and let a refused one back in.
 	p.clearFlavorRejection(ng.Spec.Flavor, mark)
 	return ng, nil
+}
+
+// flavorField is the field an API server admission error names when the
+// NodeGroup CRD's enum refuses the flavor.
+var flavorField = field.NewPath("spec", "flavor").String()
+
+// fieldlessCause is the Field of a cause that names no field: the API server
+// renders a nil path as "<nil>". It adds such a cause to every schema error,
+// saying the CRD's CEL rules were left unchecked.
+var fieldlessCause = (*field.Path)(nil).String()
+
+// admissionFlavorRefusal returns the refusal of the flavor carried by an error
+// of the NodeGroup create: an Invalid error whose every cause that names a
+// field is on spec.flavor, which the API server returns when the flavor is
+// outside the CRD's enum. Causes without a field are ignored. Any other error
+// returns nil, including an Invalid one that also names another field: a
+// payload the CRD refuses for another reason (a label value) fails whatever
+// the flavor, so the launch is not a capacity problem another flavor solves,
+// and holding flavors out for it would only walk the catalogue. The API server
+// reports every schema error at once, so a bad label value shows up next to
+// the flavor; a failing CEL rule (a reserved label key) does not, since CEL
+// is skipped once the schema fails, and surfaces as a plain error on the
+// re-plan instead.
+func admissionFlavorRefusal(err error, flavor string) *ErrFlavorRejected {
+	var status apierrors.APIStatus
+	if !apierrors.IsInvalid(err) || !errors.As(err, &status) || status.Status().Details == nil {
+		return nil
+	}
+	var refusal *ErrFlavorRejected
+	for _, cause := range status.Status().Details.Causes {
+		switch cause.Field {
+		case "", fieldlessCause:
+		case flavorField:
+			if refusal == nil {
+				refusal = &ErrFlavorRejected{Flavor: flavor, Reason: string(metav1.StatusReasonInvalid), Message: cause.Message}
+			}
+		default:
+			return nil
+		}
+	}
+	return refusal
+}
+
+// refuseFlavorAtAdmission records a flavor the API server refused at
+// admission the way Create records a refusal by the operator: counted, held
+// out of provisioning for flavorBackoff so the re-plan lands on another
+// flavor, and published on the NodeClaim. The API server's own message is
+// logged in full. Nothing needs cleaning up: no NodeGroup was created, so no
+// VM and no quota reservation exist.
+func (p *Provider) refuseFlavorAtAdmission(ctx context.Context, nodeClaim *karpv1.NodeClaim, name string, rejected *ErrFlavorRejected, apiErr error) {
+	log.FromContext(ctx).WithValues("NodeGroup", name, "flavor", rejected.Flavor).Error(apiErr,
+		"the NodeGroup API refused the flavor at admission; holding it out of provisioning", "holdOut", flavorBackoff)
+	metrics.NodeGroupRejections.Inc(nil)
+	p.recordFlavorRejection(rejected.Flavor)
+	p.recorder.Publish(events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeWarning,
+		Reason:         "NodeGroupRejected",
+		Message: fmt.Sprintf("The NodeGroup API refused flavor %s for NodeGroup %s at admission (%s); no NodeGroup was created, and that flavor is held out of provisioning for %s so the scheduler relaxes to another one. Unless Clever Cloud withdrew a built-in flavor, a settings.flavors override introduced it: fix or remove that override",
+			rejected.Flavor, name, rejected.Message, flavorBackoff),
+		DedupeValues: []string{nodeClaim.Name},
+	})
 }
 
 // publishQuotaEvent surfaces a quota rejection on the NodeClaim so users see
