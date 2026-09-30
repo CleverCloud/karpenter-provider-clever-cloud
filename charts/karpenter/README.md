@@ -57,7 +57,7 @@ kubectl apply -f examples/v1/general-purpose.yaml
 | `nodeSelector` | `{}` | Extra pinning, ANDed with `affinity` |
 | `affinity` | require `karpenter.sh/nodepool` absent | Karpenter must not run on nodes it manages — holds on every CKE topology |
 | `tolerations` | control-plane `NoSchedule` | No-op today (no CKE node role is tainted); future-proofs placement. Never tolerate `karpenter.sh/unregistered` or everything: until a node registers (and for good on a resized NodeGroup's extra node) that taint is all that keeps the controller off it |
-| `settings.region` | `par` | Zone advertised on instance types |
+| `settings.region` | `par` | Value of `topology.kubernetes.io/region` and `topology.kubernetes.io/zone` on instance types and nodes |
 | `settings.logLevel` | `info` | debug / info / error |
 | `settings.disableLeaderElection` | `false` | For single-replica dev setups |
 | `settings.batchMaxDuration` / `batchIdleDuration` | `10s` / `1s` | Pod batching windows |

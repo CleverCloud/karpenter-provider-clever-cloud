@@ -178,6 +178,9 @@ type observedCapacity struct {
 // Provider builds Karpenter instance types from a flavor catalog computed by
 // overlaying per-flavor overrides on top of the built-in seed.
 type Provider struct {
+	// region is advertised as both topology.kubernetes.io/region and
+	// topology.kubernetes.io/zone: CKE is single-zone, so the region is its
+	// only topology domain.
 	region string
 	// flavors is computed once by NewProvider and never written afterwards,
 	// so List and Get read it without locking.
@@ -447,10 +450,22 @@ func (p *Provider) Synthesize(flavor string) *cloudprovider.InstanceType {
 
 func (p *Provider) newInstanceType(f Flavor) *cloudprovider.InstanceType {
 	memory := resource.NewQuantity(f.MemoryKi*1024, resource.BinarySI)
+	// Both topology labels are declared here, in the requirements AND in the
+	// offering. The platform puts neither on its nodes and karpenter-core
+	// never turns a well-known requirement into a label itself, so the
+	// single-valued requirements copied onto the NodeClaim (buildNodeClaim)
+	// are their only path to the node. An undeclared well-known label is
+	// worse than unsupported: core admits a pod or a volume that requires it
+	// onto a NEW claim (undefined well-known labels are allowed there) but
+	// never onto that claim once launched (in-flight and existing nodes are
+	// checked strictly), so every provisioning pass launches another node for
+	// the same pod; and a NodePool that requires it drifts every node it
+	// launches.
 	requirements := scheduling.NewRequirements(
 		scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, f.Name),
 		scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, v1.ArchitectureAmd64),
 		scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, string(corev1.Linux)),
+		scheduling.NewRequirement(corev1.LabelTopologyRegion, corev1.NodeSelectorOpIn, p.region),
 		scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, p.region),
 		scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeOnDemand),
 		scheduling.NewRequirement(v1alpha1.FlavorLabelKey, corev1.NodeSelectorOpIn, f.Name),
@@ -489,6 +504,7 @@ func (p *Provider) newInstanceType(f Flavor) *cloudprovider.InstanceType {
 			{
 				Requirements: scheduling.NewRequirements(
 					scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeOnDemand),
+					scheduling.NewRequirement(corev1.LabelTopologyRegion, corev1.NodeSelectorOpIn, p.region),
 					scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, p.region),
 				),
 				Price:     f.Price,
