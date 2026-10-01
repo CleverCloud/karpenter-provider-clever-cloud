@@ -208,3 +208,82 @@ DaemonSets to one 2XS, whose measured allocatable cannot hold them (a second
 node follows), and chose an XL for a 29.5Gi pod that no measured flavor
 holds — a launch repeated after every controller restart while no XL node
 runs.
+
+---
+
+# Third validation run (2026-10-01)
+
+Live validation of the 2026-09-30 fix series on a CKE cluster
+(`kubernetes_01M3S499F1ZK2EA68TECG770GT`, Paris, Kubernetes v1.37.0,
+worker-only topology, kernel `7.2.8-clevercloud-vm-dirty`, containerd 2.3.5,
+Cilium, org quota 100 vCPU / 100 GB RAM), with an **unmanaged** 2× S
+NodeGroup as baseline capacity. The controller ran out-of-cluster, built from
+the tip of the series; the "before" figures come from the same cluster at
+`1beb82e` (v0.12.0 plus its P1 fixes) on 2026-09-30.
+
+## `make e2e`
+
+| Scenario | Result | Notes |
+|---|---|---|
+| Provision | PASS (50 s) | pods Running in 45 s; the 2XS node reported exactly the catalogue's memory (3715344Ki, +0.00%); no acceptance timeout on the healthy launches |
+| ConsolidationScaleToZero | PASS (71 s) | pool consolidated to zero in 1 min 10 s |
+| Drift | PASS (115 s) | replacement registered 1 min 25 s after the NodeClass patch |
+| GarbageCollection | PASS (252 s) | ownerless decoy refused in 2 min 5 s; owner-reference cascade reaped the force-deleted claim's group in 5 s |
+| QuotaFastFail | PASS (106 s) | rejection surfaced in **10 s** (35 s at `1beb82e`), 4/4 pods Pending, no leaked NodeGroup |
+
+Whole suite: 1020 s, including a 7-minute `E2E_CLEANUP_RECHECK` that found no
+NodeGroup of the run re-created upstream.
+
+## Operator acknowledgement timeline
+
+Watched event by event (`kubectl get nodegroups -w`) on hand-made groups:
+
+- the operator's **first** status write lands ~1 s after creation and is
+  already the decision: an accepted group gets `phase=Creating` +
+  `ReconcileInProgress=True(Creating)`; a quota-rejected one gets
+  `phase=QuotaExceeded` + `ReconcileFailed=True(QuotaExceeded)` directly,
+  never preceded by `Creating`. The quota condition message is now empty
+  (it used to carry `Quota exceeded: RAM max: limit = …`);
+- karpenter registers the node ~28 s after creation while the group is still
+  `Creating`; `phase=Synced` and `Ready=True` follow together at 38–58 s
+  (one outlier stayed `Creating` for 6 min 30 s).
+
+This is what the acceptance poll now waits for: the acknowledgement, not
+`Ready`.
+
+## Upgrade from `1beb82e` and an external resize
+
+1. `1beb82e` created a managed 2XS group (`spec.labels` carrying
+   `karpenter.sh/nodepool`, hash generation `v2`), then was stopped.
+2. The new controller adopted it: the stored hash was migrated to `v3` with
+   **no drift** (the NodeClaim kept every condition `True`) and the NodeClass
+   stayed `Ready`.
+3. `nodeCount: 1 → 2`: the extra `-node1` joined with `karpenter.sh/nodepool`
+   and no provider ID. The controller refused to stamp it (by design) and
+   **removed `karpenter.sh/nodepool` from it** half a second later.
+4. Controller restarted while the group was still resized, then the workload
+   scaled up: `karpenter_cluster_state_synced` was `1` and the new NodeClaim
+   existed **4 s** after the restart. At `1beb82e` the same sequence kept the
+   cluster state unsynced for 4 minutes — no provisioning, no disruption —
+   until the resize was reverted.
+5. The new group's `spec.labels` no longer carry `karpenter.sh/nodepool`; its
+   node got `karpenter.sh/nodepool`, `topology.kubernetes.io/zone=par` and
+   `topology.kubernetes.io/region=par` from registration.
+
+## Region selector
+
+One pod with `nodeSelector: topology.kubernetes.io/region: par`: **one**
+NodeClaim, pod Running in 45 s. At `1beb82e` the same pod made karpenter
+launch three VMs in 60 s (stopped only by the NodePool limit) and was never
+scheduled.
+
+## Before / after
+
+| Measure | `1beb82e` | This series |
+|---|---|---|
+| `CloudProvider.Create` duration (healthy launch) | 15.06 s | 1.16 s |
+| `nodegroup_acceptance_timeouts_total` on healthy launches | 7/7 | 0 |
+| Quota rejection surfaced by the e2e quota scenario | 35 s | 10 s |
+| Restart with an externally resized group | cluster state unsynced until the resize is reverted | synced, provisioning in 4 s |
+| Pod with a region `nodeSelector` | 3 VMs, never scheduled | 1 VM, Running in 45 s |
+| Outbound HTTP to Clever Cloud | pricing refresher (failing: `/v4/kubernetes-product` now answers 401) | none |
