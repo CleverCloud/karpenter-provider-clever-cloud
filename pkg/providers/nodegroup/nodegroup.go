@@ -61,9 +61,13 @@ const (
 )
 
 // quotaCheckTimeout bounds how long Create waits for the Clever Cloud
-// operator to accept or reject (quota) a new NodeGroup. Rejections are
-// observed within 1-3s; on timeout we optimistically assume the group
-// will converge and let Karpenter's registration TTL be the backstop.
+// operator's decision on a new NodeGroup. The decision is the operator's
+// first status write, about 1 s after the group's creation live: phase
+// Creating + ReconcileInProgress=True on a group it accepted, QuotaExceeded
+// written directly on one the quota engine rejects. The VM comes up far
+// later (Synced at 38-58 s), after Create has returned. A timeout therefore
+// means the operator did not even acknowledge the group; Create proceeds
+// optimistically and lets Karpenter's registration TTL be the backstop.
 // Variable only so tests can exercise the timeout path without waiting 15s.
 var quotaCheckTimeout = 15 * time.Second
 
@@ -109,16 +113,36 @@ type Provider struct {
 	// upstream quota engine evaluate all in-flight groups together, rejecting
 	// several at once; deleting groups while their first upstream reconcile
 	// is still running has been observed to leak upstream reservations.
+	// It is held until the operator has decided on the group (its first
+	// status write, about 1 s after creation), by which point the quota
+	// engine has evaluated it, and not until the group is Ready: waiting for
+	// Ready outlasted the 15s window on every healthy launch, so launches ran
+	// 15 s apart, and karpenter-core, whose cluster state stays unsynced
+	// while any NodeClaim lacks a provider ID, paused disruption cluster-wide
+	// for as long as the queue lasted.
 	createMu sync.Mutex
 
 	mu              sync.Mutex
 	quotaRejectedAt time.Time
 	quotaMessage    string
-	// rejectedFlavors remembers, per flavor, when the upstream operator last
-	// refused it for a non-quota reason. Without it the scheduler re-picks the
-	// cheapest flavor immediately and loops: karpenter-core keeps no
+	// rejectedFlavors remembers, per flavor, the upstream operator's last
+	// refusal of it for a non-quota reason. Without it the scheduler re-picks
+	// the cheapest flavor immediately and loops: karpenter-core keeps no
 	// per-offering memory of an InsufficientCapacityError.
-	rejectedFlavors map[string]time.Time
+	rejectedFlavors map[string]flavorHoldOut
+	// holdOutSeq is the sequence number of the last hold-out recorded.
+	holdOutSeq uint64
+}
+
+// flavorHoldOut is a flavor held out of provisioning after a refusal.
+type flavorHoldOut struct {
+	// at is when the refusal was recorded; the hold-out lasts flavorBackoff.
+	at time.Time
+	// seq orders the hold-out among all those recorded, so that an acceptance
+	// releases only the ones recorded before its launch's create call (see
+	// clearFlavorRejection). A sequence rather than a time: two readings of
+	// the clock can be equal, and the order must be exact.
+	seq uint64
 }
 
 func NewProvider(kubeClient client.Client, recorder events.Recorder) *Provider {
@@ -148,8 +172,8 @@ func (p *Provider) RejectedFlavors() map[string]struct{} {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := map[string]struct{}{}
-	for flavor, at := range p.rejectedFlavors {
-		if time.Since(at) < flavorBackoff {
+	for flavor, hold := range p.rejectedFlavors {
+		if time.Since(hold.at) < flavorBackoff {
 			out[flavor] = struct{}{}
 		}
 	}
@@ -160,16 +184,37 @@ func (p *Provider) recordFlavorRejection(flavor string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.rejectedFlavors == nil {
-		p.rejectedFlavors = map[string]time.Time{}
+		p.rejectedFlavors = map[string]flavorHoldOut{}
 	}
-	p.rejectedFlavors[flavor] = time.Now()
+	p.holdOutSeq++
+	p.rejectedFlavors[flavor] = flavorHoldOut{at: time.Now(), seq: p.holdOutSeq}
 }
 
-// clearFlavorRejection forgets a refusal as soon as the same flavor succeeds.
-func (p *Provider) clearFlavorRejection(flavor string) {
+// holdOutMark returns the sequence number of the last hold-out recorded so
+// far. A launch takes it just before its create call, and its acceptance then
+// releases only the hold-outs recorded up to it (clearFlavorRejection).
+func (p *Provider) holdOutMark() uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.rejectedFlavors, flavor)
+	return p.holdOutSeq
+}
+
+// clearFlavorRejection forgets the refusal of a flavor the operator has just
+// accepted, unless the refusal was recorded after mark, the launch's
+// holdOutMark. A refusal recorded while the launch was polled is not answered
+// by its acceptance: it is typically the late refusal of a group acknowledged
+// earlier (RecordLateRefusal, which does not take createMu), and an
+// acknowledgement is exactly what that group had before it was refused, so it
+// proves nothing about the flavor. Releasing that hold-out would hand the
+// flavor straight back to the next launch, and a flavor refused late on every
+// group would never stay held out while launches of it kept being
+// acknowledged.
+func (p *Provider) clearFlavorRejection(flavor string, mark uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if hold, held := p.rejectedFlavors[flavor]; held && hold.seq <= mark {
+		delete(p.rejectedFlavors, flavor)
+	}
 }
 
 func (p *Provider) clearQuotaRejection() {
@@ -235,9 +280,12 @@ func NodeClaimOwners(ng *ngv1.NodeGroup) []string {
 	return names
 }
 
-// Create creates the NodeGroup backing a NodeClaim and waits briefly for the
-// Clever Cloud operator to accept it. It returns ErrQuotaExceeded (after
-// cleaning up the NodeGroup) when the organisation quota rejects it.
+// Create creates the NodeGroup backing a NodeClaim and waits for the Clever
+// Cloud operator's decision on it. It returns ErrQuotaExceeded (after cleaning
+// up the NodeGroup) when the organisation quota rejects it, and
+// ErrFlavorRejected on any other refusal. A group the operator acknowledged is
+// returned at once, before its VM is up; the nodegroupstatus controller
+// follows it from there.
 // It is idempotent: an already-existing NodeGroup owned by the same NodeClaim
 // is reused.
 func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.CleverNodeClass, flavor string) (*ngv1.NodeGroup, error) {
@@ -288,6 +336,9 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 			},
 		},
 	}
+	// Taken just before the create call: the acceptance below releases only
+	// the hold-outs recorded up to here (see clearFlavorRejection).
+	mark := p.holdOutMark()
 	if err := p.kubeClient.Create(ctx, ng); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return nil, fmt.Errorf("creating nodegroup, %w", err)
@@ -302,12 +353,12 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 		}
 		ng = existing
 	}
-	synced, retried, err := p.waitForAcceptance(ctx, ng.Name)
+	accepted, retried, err := p.waitForAcceptance(ctx, ng.Name)
 	// Before the error branches, not only on success: a group that vanished or
 	// was refused after the operator reported a transient failure must stay
 	// traceable to that platform incident.
 	if retried != nil {
-		p.publishTransientFailure(ctx, nodeClaim, ng.Name, retried, synced, err)
+		p.publishTransientFailure(ctx, nodeClaim, ng.Name, retried, accepted, err)
 	}
 	if err != nil {
 		quotaErr := &ErrQuotaExceeded{}
@@ -341,33 +392,38 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 				InvolvedObject: nodeClaim,
 				Type:           corev1.EventTypeWarning,
 				Reason:         "NodeGroupVanished",
-				Message:        fmt.Sprintf("NodeGroup %s disappeared during the acceptance poll (usually the quota engine reclaiming an accepted group); failing the launch instead of waiting out the registration TTL", ng.Name),
+				Message:        fmt.Sprintf("NodeGroup %s disappeared or was being deleted during the acceptance poll (usually the quota engine reclaiming an accepted group); failing the launch instead of waiting out the registration TTL", ng.Name),
 				DedupeValues:   []string{nodeClaim.Name},
 			})
 		}
 		return nil, err
 	}
-	if synced {
-		// ng.Spec.Flavor, not the requested flavor: on the AlreadyExists
-		// adoption path the group that was actually accepted can carry a
-		// different one, and releasing the hold on the wrong flavor would both
-		// keep a usable flavor out and let a refused one back in.
-		p.clearFlavorRejection(ng.Spec.Flavor)
-	}
-	if !synced {
-		// Optimistic-launch path: today the only signal that the operator
-		// never accepted the group. Karpenter's registration TTL backstops it.
+	if accepted == unacknowledged {
+		// Optimistic-launch path. Healthy launches are acknowledged about 1 s
+		// after creation, so this is the signal of an operator that is down,
+		// wedged or not picking groups up. Karpenter's registration TTL
+		// backstops it, and the nodegroupstatus controller reports the group
+		// if it stays unsynced.
 		metrics.NodeGroupAcceptanceTimeouts.Inc(nil)
 		log.FromContext(ctx).WithValues("NodeGroup", ng.Name).Info(
-			"nodegroup not accepted by the node-group operator within the poll window; proceeding optimistically")
+			"nodegroup neither acknowledged nor refused by the node-group operator within the poll window; proceeding optimistically")
 		p.recorder.Publish(events.Event{
 			InvolvedObject: nodeClaim,
 			Type:           corev1.EventTypeWarning,
 			Reason:         "NodeGroupAcceptanceTimeout",
-			Message:        fmt.Sprintf("NodeGroup %s was not accepted by the node-group operator within %s; proceeding optimistically (the registration TTL is the backstop)", ng.Name, quotaCheckTimeout),
+			Message:        fmt.Sprintf("The node-group operator neither acknowledged nor refused NodeGroup %s within %s; proceeding optimistically (the registration TTL is the backstop)", ng.Name, quotaCheckTimeout),
 			DedupeValues:   []string{nodeClaim.Name},
 		})
+		return ng, nil
 	}
+	// Acknowledged or already Ready, the operator took the flavor: that
+	// releases a hold-out recorded before the create call, never one recorded
+	// while this launch was polled (see clearFlavorRejection).
+	// ng.Spec.Flavor, not the requested flavor: on the AlreadyExists adoption
+	// path the group that was actually accepted can carry a different one, and
+	// releasing the hold on the wrong flavor would both keep a usable flavor
+	// out and let a refused one back in.
+	p.clearFlavorRejection(ng.Spec.Flavor, mark)
 	return ng, nil
 }
 
@@ -394,18 +450,22 @@ func (p *Provider) publishQuotaEvent(nodeClaim *karpv1.NodeClaim, err error) {
 // The wording states only that the poll saw the failure, never that it is
 // still current or that it was resolved: a later poll may have seen it
 // cleared, and the operator can keep it set next to Ready. The outcome is what
-// ended the poll: accepted (Normal), not accepted in time, or failed.
-func (p *Provider) publishTransientFailure(ctx context.Context, nodeClaim *karpv1.NodeClaim, name string, failure *transientFailure, synced bool, pollErr error) {
+// ended the poll: Ready (Normal: the machine is up), acknowledged (the machine
+// is still being built while the operator retries), not acknowledged in time,
+// or failed.
+func (p *Provider) publishTransientFailure(ctx context.Context, nodeClaim *karpv1.NodeClaim, name string, failure *transientFailure, accepted acceptance, pollErr error) {
 	eventType := corev1.EventTypeWarning
 	var outcome string
 	switch {
 	case pollErr != nil:
 		outcome = fmt.Sprintf("the launch then failed: %v", pollErr)
-	case synced:
+	case accepted == ready:
 		eventType = corev1.EventTypeNormal
-		outcome = "the NodeGroup was then accepted within the poll window"
+		outcome = "the NodeGroup was Ready, so its machine is up"
+	case accepted == acknowledged:
+		outcome = "the operator acknowledged the NodeGroup, so the launch proceeds while its machine is built and the group is followed until it syncs (the registration TTL is the backstop)"
 	default:
-		outcome = fmt.Sprintf("the NodeGroup was not accepted within %s, so the launch proceeds optimistically (the registration TTL is the backstop)", quotaCheckTimeout)
+		outcome = fmt.Sprintf("the NodeGroup was neither acknowledged nor refused within %s, so the launch proceeds optimistically (the registration TTL is the backstop)", quotaCheckTimeout)
 	}
 	log.FromContext(ctx).WithValues("NodeGroup", name, "reason", failure.reason, "message", failure.message, "outcome", outcome).Info(
 		"node-group operator reported a transient failure during the acceptance poll; not treated as a refusal")
@@ -420,10 +480,14 @@ func (p *Provider) publishTransientFailure(ctx context.Context, nodeClaim *karpv
 }
 
 // ErrNodeGroupVanished is returned by Create when the NodeGroup disappeared
-// during the acceptance poll after having been observed once — the quota
-// engine reclaiming an accepted group is the documented cause. Failing the
-// launch immediately beats returning optimistic success and burning the
-// registration TTL on a group that no longer exists.
+// during the acceptance poll after having been observed once, or was seen
+// terminating — the quota engine reclaiming an accepted group is the
+// documented cause. Failing the launch immediately beats returning optimistic
+// success and burning the registration TTL on a group that no longer exists.
+// The poll ends on the operator's decision, about 1 s after the creation, so
+// it only catches a vanish up to then: a group that vanishes after its
+// acknowledgement is failed by the garbage collector's sweep instead, 2 to 4
+// minutes after its NodeClaim's creation.
 var ErrNodeGroupVanished = errors.New("nodegroup vanished during the acceptance poll")
 
 // transientFailure is a ReconcileFailed condition the operator retries on its
@@ -432,20 +496,41 @@ type transientFailure struct {
 	reason, message string
 }
 
+// acceptance is how far the node-group operator had taken a NodeGroup when
+// the acceptance poll ended without a refusal.
+type acceptance int
+
+const (
+	// unacknowledged: the window closed before the operator acknowledged or
+	// refused the group. It wrote no status at all, or only a transient
+	// failure.
+	unacknowledged acceptance = iota
+	// acknowledged: the operator took the group and is building it
+	// (ReconcileInProgress=True, no refusal). Its machine is not up yet.
+	acknowledged
+	// ready: the group's machines are up (Ready=True).
+	ready
+)
+
 // waitForAcceptance polls the NodeGroup until the Clever Cloud operator
-// reports it Ready, refuses it, or the timeout elapses. A timeout returns
-// (false, _, nil): the caller treats it as optimistic success but must
-// surface it — it is the only signal distinguishing a down operator from
-// normal provisioning. A cancelled parent context (controller shutdown) is
-// NOT a timeout and returns its error, so shutdowns don't fake that signal.
-// The last transient failure the poll saw, if any, is returned alongside so
-// the caller can surface it whatever ended the poll, Ready included: it is not
-// a refusal, and does not end the poll. A shutdown returns none, for the same
-// reason it returns no timeout.
-func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bool, *transientFailure, error) {
+// decides on it or the timeout elapses. The decision is the operator's first
+// status write, about 1 s after the group's creation live, not the group
+// turning Ready, which takes 38-58 s: a refusal returns its typed error, and
+// an accepted group returns acknowledged, or ready when it is already Ready.
+// A timeout returns (unacknowledged, _, nil): the caller treats it as
+// optimistic success but must surface it — it is the only signal
+// distinguishing a down operator from normal provisioning. A cancelled parent
+// context (controller shutdown) is NOT a timeout and returns its error, so
+// shutdowns don't fake that signal. The last transient failure the poll saw,
+// if any, is returned alongside so the caller can surface it whatever ended
+// the poll, Ready included: it is not a refusal, and on its own it is not a
+// decision either. A shutdown returns none, for the same reason it returns no
+// timeout.
+func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (acceptance, *transientFailure, error) {
 	ctx, cancel := context.WithTimeout(parentCtx, quotaCheckTimeout)
 	defer cancel()
 	seen := false
+	accepted := unacknowledged
 	var retried *transientFailure
 	err := wait.PollUntilContextCancel(ctx, quotaCheckInterval, true, func(ctx context.Context) (bool, error) {
 		ng := &ngv1.NodeGroup{}
@@ -470,6 +555,18 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bo
 		if reason, message, transient := ng.TransientFailure(); transient {
 			retried = &transientFailure{reason: reason, message: message}
 		}
+		// A group being deleted is going away whatever its status still says,
+		// and cloudprovider.Get already reads it as gone. Accepting it would
+		// hand core a launch on a group that will not exist and release the
+		// hold-out of a flavor nothing runs. Reachable on the AlreadyExists
+		// adoption path, where a terminating group can still carry Ready or
+		// ReconcileInProgress, and on a group deleted mid-poll whose
+		// finalizer holds it: either way it is on its way to vanishing, so it
+		// fails the launch as a vanish does. Checked before Ready, which only
+		// wins over the other conditions of a group that stays.
+		if !ng.DeletionTimestamp.IsZero() {
+			return false, fmt.Errorf("%w: %q is being deleted", ErrNodeGroupVanished, name)
+		}
 		// Ready wins over every other condition. The operator reports several
 		// at once — live: Ready=True + ReconcileInProgress=True +
 		// ReconcileFailed=True(UpstreamError) on a group whose machine was up
@@ -477,6 +574,7 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bo
 		// delete it as "refused": on the AlreadyExists adoption path, the VM
 		// this very claim launched on an earlier attempt.
 		if ng.IsSynced() {
+			accepted = ready
 			return true, nil
 		}
 		if ng.IsQuotaExceeded() {
@@ -496,11 +594,12 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bo
 			// never replacing the rejection: this Delete runs on the poll's
 			// own 15s context, so a rejection observed late enough would fail
 			// it with a wrapped context.DeadlineExceeded; wait.Interrupted
-			// would then match, waitForAcceptance would return (false, _, nil),
-			// and Create would report optimistic success for a group the quota
-			// engine has already rejected — the claim would burn the 15-minute
-			// registration TTL with the reservation never freed. The typed
-			// error wins; the leftover group is reclaimed by the GC sweep.
+			// would then match, waitForAcceptance would return
+			// (unacknowledged, _, nil), and Create would report optimistic
+			// success for a group the quota engine has already rejected — the
+			// claim would burn the 15-minute registration TTL with the
+			// reservation never freed. The typed error wins; the leftover
+			// group is reclaimed by the GC sweep.
 			if err := p.kubeClient.Delete(ctx, &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: name}}); err != nil && !apierrors.IsNotFound(err) {
 				log.FromContext(ctx).WithValues("NodeGroup", name).Error(err,
 					"could not delete the quota-rejected nodegroup; the garbage collector will reclaim it")
@@ -513,11 +612,10 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bo
 		// same incident hits every flavor: treated as a refusal, successive
 		// claims would delete one group each mid-first-reconcile (the upstream
 		// reservation-leak pattern createMu guards against) and hold out the
-		// whole catalogue flavor by flavor. Keep polling as for any group still
-		// in progress; it was recorded above, and the caller surfaces it.
-		if _, _, transient := ng.TransientFailure(); transient {
-			return false, nil
-		}
+		// whole catalogue flavor by flavor. Refusal() excludes it, so the rest
+		// of the status is read as if it were absent; it was recorded above, and
+		// the caller surfaces it.
+		//
 		// Any other ReconcileFailed is a refusal too — including a reason never
 		// seen before. Previously it was indistinguishable from "still
 		// reconciling": the poll timed out, Create reported optimistic success,
@@ -531,31 +629,48 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (bo
 			// the poll's own 15s context, so a refusal observed late enough
 			// would fail it with a wrapped context.DeadlineExceeded;
 			// wait.Interrupted would then match, waitForAcceptance would return
-			// (false, _, nil), and Create would report optimistic success for a
-			// group the operator has already refused — the exact 15-minute TTL
-			// burn this branch exists to prevent. The typed error wins; the
-			// leftover group is reclaimed by the GC sweep.
+			// (unacknowledged, _, nil), and Create would report optimistic
+			// success for a group the operator has already refused — the exact
+			// 15-minute TTL burn this branch exists to prevent. The typed error
+			// wins; the leftover group is reclaimed by the GC sweep.
 			if err := p.kubeClient.Delete(ctx, &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: name}}); err != nil && !apierrors.IsNotFound(err) {
 				log.FromContext(ctx).WithValues("NodeGroup", name).Error(err,
 					"could not delete the refused nodegroup; the garbage collector will reclaim it")
 			}
 			return false, &ErrFlavorRejected{Flavor: ng.Spec.Flavor, Reason: reason, Message: message}
 		}
+		// Not refused and in progress: the operator acknowledged the group,
+		// even with a transient failure alongside. That first status write is
+		// its decision: live, a group the quota engine rejects gets
+		// QuotaExceeded directly, never preceded by ReconcileInProgress, while
+		// Ready only comes 38-58 s later. Return now, releasing createMu:
+		// waiting for Ready held it for the whole window on every healthy
+		// launch and counted each one as an acceptance timeout. The
+		// nodegroupstatus controller follows the group until it syncs, and
+		// fails the launch if the operator refuses it after all; a group that
+		// vanishes from here on is failed by the garbage collector's sweep,
+		// which deletes its NodeClaim 2 to 4 minutes after the claim's
+		// creation.
+		if ng.IsReconciling() {
+			accepted = acknowledged
+			return true, nil
+		}
+		// No status yet, or only a transient failure: no decision yet.
 		return false, nil
 	})
 	if err == nil {
-		return true, retried, nil
+		return accepted, retried, nil
 	}
 	if wait.Interrupted(err) {
 		if parentCtx.Err() != nil {
 			// Shutdown, not an outcome: no transient failure either, or it
 			// would be published as a failed launch. The claim's next attempt
 			// adopts the group and its poll reads the status again.
-			return false, nil, parentCtx.Err()
+			return unacknowledged, nil, parentCtx.Err()
 		}
-		return false, retried, nil
+		return unacknowledged, retried, nil
 	}
-	return false, retried, err
+	return unacknowledged, retried, err
 }
 
 // Get fetches a NodeGroup by name.

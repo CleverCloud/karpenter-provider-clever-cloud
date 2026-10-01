@@ -16,13 +16,13 @@ limitations under the License.
 
 // Package nodegroupstatus follows the NodeGroups this provider launched until
 // the Clever Cloud node-group operator has synced them. Create reads the
-// operator's verdict only inside its 15-second acceptance poll, while the VM is
-// built well after that window: live, the group reached Synced 38-58 s after
-// its creation, and one stayed Creating for 6 min 30 s. Before this
-// controller, a refusal published after the poll, a group stuck in its first
-// reconcile and an operator that never answers produced no provider signal at
-// all. The first signal was karpenter-core's registration timeout, 15 minutes
-// after the NodeClaim was created.
+// operator's status only until its decision, the first status write about 1 s
+// after the group's creation, while the VM is built well after that: live, the
+// group reached Synced 38-58 s after its creation, and one stayed Creating for
+// 6 min 30 s. Before this controller, a refusal published after the poll, a
+// group stuck in its first reconcile and an operator that never answers
+// produced no provider signal at all. The first signal was karpenter-core's
+// registration timeout, 15 minutes after the NodeClaim was created.
 //
 // It follows a group only while the NodeClaim it was launched for is Launched
 // and not Registered. In that window core has handed the launch over and

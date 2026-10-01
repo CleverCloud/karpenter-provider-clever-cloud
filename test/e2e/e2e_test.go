@@ -120,7 +120,9 @@ func TestE2E(t *testing.T) {
 // testProvision covers the core promise: a pending pod becomes a running pod
 // on a dedicated, correctly-labeled nodeCount:1 NodeGroup, with the claim
 // registered, the node carrying the stamped provider ID, and its capacity
-// matching the built-in catalogue the pods were packed against.
+// matching the built-in catalogue the pods were packed against. Its launches
+// are healthy ones, so none may end in an acceptance timeout: the operator
+// acknowledges a group about 1 s after its creation, and Create returns there.
 func testProvision(t *testing.T, ctx context.Context, f *framework) {
 	poolName := f.prefix + "-main"
 	if err := f.client.Create(ctx, f.nodeClass(poolName, nil)); err != nil {
@@ -140,6 +142,12 @@ func testProvision(t *testing.T, ctx context.Context, f *framework) {
 		return true, ""
 	})
 
+	// Baseline before the workload, as a delta: the counter is process-wide.
+	// Pre-seeded, so a missing series is a failed scrape, never a pass.
+	timeoutsBefore, found, err := f.scrapeMetric("karpenter_clevercloud_nodegroup_acceptance_timeouts_total")
+	if err != nil || !found {
+		t.Fatalf("scraping acceptance_timeouts_total before the launches: found=%v, err=%v", found, err)
+	}
 	if err := f.client.Create(ctx, f.deployment("inflate", 2, "1", "1500Mi", false)); err != nil {
 		t.Fatalf("creating deployment: %v", err)
 	}
@@ -205,6 +213,18 @@ func testProvision(t *testing.T, ctx context.Context, f *framework) {
 		t.Errorf("observed_capacity_rejections_total is not exposed by the controller, although it is pre-seeded at startup")
 	case rejections != 0:
 		t.Errorf("observed_capacity_rejections_total = %v, want 0: the controller refused the capacity report of a node of a managed group (see its log)", rejections)
+	}
+	// Every launch above was healthy. An acceptance timeout here means the
+	// acceptance poll waited past the operator's acknowledgement (its first
+	// status write), which serializes launches a whole poll window apart and
+	// turns the operator-down alert into noise.
+	switch timeouts, found, err := f.scrapeMetric("karpenter_clevercloud_nodegroup_acceptance_timeouts_total"); {
+	case err != nil:
+		t.Errorf("scraping acceptance_timeouts_total: %v", err)
+	case !found:
+		t.Errorf("acceptance_timeouts_total is not exposed by the controller, although it is pre-seeded at startup")
+	case timeouts != timeoutsBefore:
+		t.Errorf("acceptance_timeouts_total moved by %v over healthy launches, want 0: the node-group operator acknowledged no group within the poll window, or the poll no longer returns on its acknowledgement (see the NodeGroupAcceptanceTimeout events)", timeouts-timeoutsBefore)
 	}
 }
 
