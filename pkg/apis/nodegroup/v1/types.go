@@ -220,6 +220,19 @@ func (in *NodeGroup) IsSynced() bool {
 	return cond != nil && cond.Status == corev1.ConditionTrue
 }
 
+// IsReconciling reports whether the upstream operator is working on the
+// NodeGroup (ReconcileInProgress=True). On a group that is neither Ready nor
+// refused, it is the operator's acknowledgement: measured live on CKE
+// (2026-09-30), its first status write, about 1 s after the group's creation,
+// is phase=Creating + ReconcileInProgress=True(Creating) on a group it
+// accepted, while a quota rejection is written directly, never preceded by
+// it. It says nothing about a refusal the same status may carry: callers
+// check IsRefused first.
+func (in *NodeGroup) IsReconciling() bool {
+	cond := in.GetCondition(ConditionTypeReconcileInProgress)
+	return cond != nil && cond.Status == corev1.ConditionTrue
+}
+
 // NodeGroupList contains a list of NodeGroup
 // +kubebuilder:object:root=true
 type NodeGroupList struct {

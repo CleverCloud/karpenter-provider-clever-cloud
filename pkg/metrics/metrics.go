@@ -32,16 +32,19 @@ const namespace = "karpenter_clevercloud"
 
 var (
 	// NodeGroupAcceptanceTimeouts counts Creates that hit the acceptance-poll
-	// timeout and proceeded optimistically. Sustained growth is the signature
-	// of a down or wedged node-group operator, which otherwise looks like
-	// normal (slow) provisioning until the registration TTL fires.
+	// timeout and proceeded optimistically: the node-group operator neither
+	// acknowledged nor refused the group within the window. A healthy
+	// operator acknowledges a group about 1 s after its creation, so healthy
+	// launches never count here; growth is the signature of a down or wedged
+	// operator, which otherwise looks like normal (slow) provisioning until
+	// the registration TTL fires.
 	NodeGroupAcceptanceTimeouts = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: "nodegroup",
 			Name:      "acceptance_timeouts_total",
-			Help:      "NodeGroup creations that were not accepted by the node-group operator within the poll window and proceeded optimistically. Sustained growth usually means the operator is down or wedged.",
+			Help:      "NodeGroup creations the node-group operator neither acknowledged nor refused within the poll window, which proceeded optimistically. Healthy launches are acknowledged within seconds; growth usually means the operator is down or wedged.",
 		},
 		nil,
 	)

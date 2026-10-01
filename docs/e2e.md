@@ -96,7 +96,10 @@ kubectl --context <kubeconfig-context> -n karpenter scale deployment/karpenter -
    within 1%) and the controller refused no capacity report
    (`instancetype_observed_capacity_rejections_total` scraped and = 0; it
    counts every node of a managed group the controller watches — in a
-   dedicated test cluster, the suite's own). The
+   dedicated test cluster, the suite's own), and no launch ended in an
+   acceptance timeout (`nodegroup_acceptance_timeouts_total` delta = 0: the
+   node-group operator acknowledges a group about 1 s after its creation,
+   and `Create` returns there instead of waiting for the VM). The
    memory the kernel exposes moves with Clever Cloud's node image, and a
    fresh controller packs pods against the built-in value, so a node image
    change fails here first: re-measure `FlavorSizing` (see

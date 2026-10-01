@@ -148,6 +148,62 @@ func TestIsSynced(t *testing.T) {
 	}
 }
 
+func TestIsReconciling(t *testing.T) {
+	tests := []struct {
+		name       string
+		conditions []ngv1.NodeGroupCondition
+		want       bool
+	}{
+		{
+			// Verbatim live shape of the operator's first status write on a
+			// group it accepted (phase Creating).
+			name: "in progress true",
+			conditions: []ngv1.NodeGroupCondition{
+				{Type: ngv1.ConditionTypeReconcileInProgress, Status: corev1.ConditionTrue, Reason: "Creating"},
+			},
+			want: true,
+		},
+		{
+			name: "in progress false",
+			conditions: []ngv1.NodeGroupCondition{
+				{Type: ngv1.ConditionTypeReconcileInProgress, Status: corev1.ConditionFalse, Reason: "Creating"},
+			},
+			want: false,
+		},
+		{
+			// A refusal alongside does not change it: callers check refusals
+			// first.
+			name: "in progress next to a refusal",
+			conditions: []ngv1.NodeGroupCondition{
+				{Type: ngv1.ConditionTypeReconcileInProgress, Status: corev1.ConditionTrue, Reason: "Creating"},
+				{Type: ngv1.ConditionTypeReconcileFailed, Status: corev1.ConditionTrue, Reason: "FlavorNotAvailable"},
+			},
+			want: true,
+		},
+		{
+			// Live shape of a quota rejection: written directly, never
+			// preceded by ReconcileInProgress.
+			name: "quota rejection",
+			conditions: []ngv1.NodeGroupCondition{
+				{Type: ngv1.ConditionTypeReconcileFailed, Status: corev1.ConditionTrue, Reason: ngv1.ReasonQuotaExceeded},
+			},
+			want: false,
+		},
+		{
+			name: "no conditions",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ng := nodeGroupWithConditions(tt.conditions...)
+			if got := ng.IsReconciling(); got != tt.want {
+				t.Errorf("IsReconciling() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestReconcileFailureClassification pins which ReconcileFailed reasons are
 // refusals and which the operator retries on its own. The split is an
 // allowlist of transient reasons: anything else, including a reason never
