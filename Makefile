@@ -14,9 +14,9 @@ GOLANGCI_LINT_VERSION ?= v2.14.0
 GOVULNCHECK_VERSION ?= v1.8.0
 # setup-envtest ships with controller-runtime; keep the major.minor in sync
 # with the sigs.k8s.io/controller-runtime version in go.mod.
-SETUP_ENVTEST_VERSION ?= v0.24.1
+SETUP_ENVTEST_VERSION ?= v0.25.1
 # apiserver/etcd binaries used by envtest; tracks the k8s.io/* minor in go.mod
-ENVTEST_K8S_VERSION ?= 1.36.0
+ENVTEST_K8S_VERSION ?= 1.37.0
 IMAGE ?= ghcr.io/clevercloud/karpenter
 TAG ?= dev
 # Helm chart version derived from TAG (v0.2.0 -> 0.2.0)
