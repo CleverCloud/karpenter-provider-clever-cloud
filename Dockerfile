@@ -5,7 +5,7 @@
 # Nothing bumps this pin automatically: move it together with the go directive
 # on every Go patch release (cmd/controller's TestImageBuilderMatchesGoDirective
 # fails when the two diverge).
-FROM golang:1.26.8 AS builder
+FROM golang:1.26.9 AS builder
 WORKDIR /workspace
 COPY go.mod go.sum ./
 RUN go mod download
