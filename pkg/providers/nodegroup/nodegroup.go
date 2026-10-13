@@ -73,9 +73,9 @@ var quotaCheckTimeout = 15 * time.Second
 // against the Clever Cloud API, and the cloud provider reports its offerings
 // unavailable to the scheduler. Every other flavor at least as large stays
 // unavailable for twice as long, so that the rejected flavor is retried first
-// (see quotaRejection.coverage). Deleting a NodeGroup that may hold capacity
-// ends both; deleting one the operator refused and that never synced does not
-// (see Delete).
+// (see quotaRejection.coverage). An accepted DELETE of a NodeGroup that may
+// hold capacity ends both optimistically; deleting one the operator refused
+// and that never synced does not (see Delete).
 const QuotaBackoff = time.Minute
 
 // ErrQuotaExceeded is returned by Create when the organisation quota rejects
@@ -162,6 +162,8 @@ type Provider struct {
 	// quotaRejections remembers, per flavor, the organisation quota's last
 	// rejection of it.
 	quotaRejections map[string]quotaRejection
+	// quotaRejectionSeq is the sequence number of the last quota rejection.
+	quotaRejectionSeq uint64
 	// rejectedFlavors remembers, per flavor, the upstream operator's last
 	// refusal of it for a non-quota reason, or the API server's refusal of it
 	// at admission.
@@ -186,6 +188,9 @@ type flavorHoldOut struct {
 type quotaRejection struct {
 	at      time.Time
 	message string
+	// seq lets Delete clear only rejections recorded before its API call,
+	// even when the clock has not advanced (see clearQuotaRejections).
+	seq uint64
 	// size is the rejected flavor's catalogue sizing; sized is false for a
 	// flavor the catalogue cannot size, whose rejection covers only itself.
 	size  instancetype.Sizing
@@ -209,10 +214,10 @@ func (p *Provider) sizing(flavor string) (instancetype.Sizing, bool) {
 }
 
 // recordQuotaRejection records that the organisation quota rejected flavor.
-// Until the rejection's coverage ends (see quotaRejection.coverage) or
-// capacity is freed, Create fails flavor and every flavor at least as large
-// fast and Unavailable reports them, while every smaller flavor stays
-// available — it may still fit.
+// Until the rejection's coverage ends (see quotaRejection.coverage) or Delete
+// clears it, Create fails flavor and every flavor at least as large fast and
+// Unavailable reports them, while every smaller flavor stays available — it
+// may still fit.
 func (p *Provider) recordQuotaRejection(flavor, message string) {
 	size, sized := p.sizing(flavor)
 	p.mu.Lock()
@@ -220,7 +225,8 @@ func (p *Provider) recordQuotaRejection(flavor, message string) {
 	if p.quotaRejections == nil {
 		p.quotaRejections = map[string]quotaRejection{}
 	}
-	p.quotaRejections[flavor] = quotaRejection{at: p.clock.Now(), message: message, size: size, sized: sized}
+	p.quotaRejectionSeq++
+	p.quotaRejections[flavor] = quotaRejection{at: p.clock.Now(), message: message, seq: p.quotaRejectionSeq, size: size, sized: sized}
 }
 
 // coverage reports until when this rejection of flavor rejected keeps flavor
@@ -277,9 +283,9 @@ func (p *Provider) quotaRejectionCovering(flavor string, size instancetype.Sizin
 
 // Unavailable reports whether a launch of flavor is known to fail right now,
 // which the cloud provider turns into Available=false offerings: a quota
-// rejection covers it (see quotaRejection.coverage) and no capacity was freed
-// since, or the operator, or the API server's admission, refused flavor itself
-// within the last flavorBackoff.
+// rejection covers it (see quotaRejection.coverage) and Delete has not cleared
+// it since, or the operator, or the API server's admission, refused flavor
+// itself within the last flavorBackoff.
 func (p *Provider) Unavailable(flavor string) bool {
 	size, sized := p.sizing(flavor)
 	p.mu.Lock()
@@ -349,12 +355,25 @@ func (p *Provider) clearFlavorRejection(flavor string, mark uint64) {
 	}
 }
 
-// clearQuotaRejections forgets every quota rejection: capacity was freed, so
-// any flavor may fit again.
-func (p *Provider) clearQuotaRejections() {
+// quotaRejectionMark snapshots the last quota rejection before a DELETE.
+func (p *Provider) quotaRejectionMark() uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.quotaRejections = nil
+	return p.quotaRejectionSeq
+}
+
+// clearQuotaRejections forgets quota rejections known before an accepted DELETE:
+// capacity may become available, so those flavors can be retried optimistically.
+// A rejection recorded during the API call survives: accepting a DELETE does
+// not prove that capacity is free, particularly for a launch just rejected.
+func (p *Provider) clearQuotaRejections(mark uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for flavor, rejection := range p.quotaRejections {
+		if rejection.seq <= mark {
+			delete(p.quotaRejections, flavor)
+		}
+	}
 }
 
 // ProviderID returns the provider ID for a NodeGroup name.
@@ -939,25 +958,32 @@ func (p *Provider) List(ctx context.Context) ([]ngv1.NodeGroup, error) {
 	return list.Items, nil
 }
 
-// Delete removes a NodeGroup; the Clever Cloud operator finalizer tears down
-// the VM and the Node object (~40s observed). Deletions free quota, so every
-// quota rejection is forgotten and the flavors it covered are available again
-// — except when the operator refused that very group (a quota rejection or any
-// other terminal refusal, ngv1.NodeGroup.IsRefused) and it never synced: its
-// VM never came up, so it held no capacity, and clearing the backoff on its
-// removal would send the next Create straight back into an exhausted quota —
+// Delete requests removal of a NodeGroup; the Clever Cloud operator finalizer
+// tears down the VM and the Node object (~40s observed). Only an accepted
+// DELETE forgets quota rejections recorded before its request, optimistically
+// making the flavors they covered available again: it does not confirm VM
+// destruction or freed quota. Rejections recorded during the request survive.
+// An error, including NotFound on a stale retry, preserves the backoff.
+// The backoff also stays when the operator refused that group (a quota
+// rejection or any other terminal refusal, ngv1.NodeGroup.IsRefused) and it
+// never synced: its VM never came up, so it held no capacity, and clearing the
+// backoff on its removal would send the next Create into an exhausted quota —
 // whichever claim's rejection armed it. The acceptance poll deletes the groups
 // it sees refused directly, bypassing this method, for the same reason. This
 // removal is what karpenter-core's termination runs after the nodegroupstatus
 // controller fails a launch the operator refused late, and what the GC runs on
-// a refused group the acceptance poll could not free. A Ready group always
-// clears it: its VM holds capacity whatever its later reconciles report. A
-// refusal hold-out is not a capacity verdict, so no deletion lifts it.
+// a refused group the acceptance poll could not free. An accepted DELETE of a
+// Ready group clears it: its VM holds capacity whatever its later reconciles
+// report. A refusal hold-out is not a capacity verdict, so no deletion lifts it.
 func (p *Provider) Delete(ctx context.Context, ng *ngv1.NodeGroup) error {
-	if ng.IsSynced() || !ng.IsRefused() {
-		p.clearQuotaRejections()
+	mark := p.quotaRejectionMark()
+	if err := p.kubeClient.Delete(ctx, &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: ng.Name}}); err != nil {
+		return err
 	}
-	return p.kubeClient.Delete(ctx, &ngv1.NodeGroup{ObjectMeta: metav1.ObjectMeta{Name: ng.Name}})
+	if ng.IsSynced() || !ng.IsRefused() {
+		p.clearQuotaRejections(mark)
+	}
+	return nil
 }
 
 // RecordLateRefusal records a refusal the node-group operator published after

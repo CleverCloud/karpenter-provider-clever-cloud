@@ -112,8 +112,15 @@ offerings**, for a limited time, and karpenter's scheduler plans around them:
   unavailable flavors fail fast without reaching Clever Cloud. Once its minute
   has passed, the rejected flavor — the cheapest probe of whether capacity
   came back — is tried again on its own, and the larger flavors only a minute
-  later, if it was not rejected again. Deleting a node that held capacity ends
-  every quota rejection at once (a refusal's hold-out stays). The quota
+  later, if it was not rejected again. An accepted DELETE of a NodeGroup
+  that may hold capacity ends the quota rejections recorded before that
+  request (a refusal's hold-out stays); deleting a refused group that never
+  synced does not. New or refreshed quota rejections recorded while the
+  DELETE was in flight survive its acceptance.
+  This is an optimistic opportunity to retry: Kubernetes accepting the
+  DELETE does **not** confirm that the VM was destroyed or quota released,
+  and the CKE finalizer may still be waiting on the platform. A failed DELETE,
+  including `NotFound` on a stale retry, preserves the backoff. The quota
   belongs to the organisation, so the usage that exhausted it may be another
   cluster's: a rejection says nothing about whose.
 - A **refusal** of a flavor for any other reason (`nodegroup_rejections_total`,
