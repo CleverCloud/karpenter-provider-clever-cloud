@@ -1315,6 +1315,117 @@ func TestDeleteKeepsTheQuotaBackoffForARefusedGroup(t *testing.T) {
 	<-done
 }
 
+func TestDeletePreservesQuotaBackoffUntilRequestSucceeds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"forbidden", apierrors.NewForbidden(schema.GroupResource{Group: apis.CleverCloudGroup, Resource: "nodegroups"}, "default-delete", errors.New("deletion denied"))},
+		{"unavailable", apierrors.NewServiceUnavailable("API server unavailable")},
+		{"cancelled", context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ng := ownedNodeGroup("default-delete", "XS", ngv1.NodeGroupStatus{
+				Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReady, "Synced", "")},
+			})
+			// An accepted DELETE can leave the group terminating while CKE
+			// retries its VM cleanup. It is only an optimistic reason to probe
+			// capacity, not confirmation that the VM has gone.
+			ng.Finalizers = []string{"test.clever-cloud.com/cleanup"}
+			deleteErr := tc.err
+			kubeClient := fake.NewClientBuilder().
+				WithScheme(scheme.Scheme).
+				WithObjects(ng).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						if deleteErr != nil {
+							return deleteErr
+						}
+						return c.Delete(ctx, obj, opts...)
+					},
+				}).Build()
+			clk := clocktesting.NewFakeClock(time.Now())
+			provider := nodegroup.NewProvider(kubeClient, &fakeRecorder{}, catalogue, clk)
+			provider.RecordLateRefusal(testNodeClaim("default-quota"), ownedNodeGroup("default-quota", "XS", quotaRejectedStatus()))
+			provider.RecordLateRefusal(testNodeClaim("default-refused"), ownedNodeGroup("default-refused", "M", ngv1.NodeGroupStatus{
+				Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReconcileFailed, "FlavorUnavailable", "flavor unavailable")},
+			}))
+			requireAvailability := func(stage string, want map[string]bool) {
+				t.Helper()
+				for flavor, unavailable := range want {
+					if got := provider.Unavailable(flavor); got != unavailable {
+						t.Errorf("%s: Unavailable(%s) = %v, want %v", stage, flavor, got, unavailable)
+					}
+				}
+			}
+
+			if err := provider.Delete(context.Background(), ng); !errors.Is(err, tc.err) {
+				t.Fatalf("expected the DELETE error %v, got %v", tc.err, err)
+			}
+			requireAvailability("failed DELETE", map[string]bool{"2XS": false, "XS": true, "S": true, "M": true, "XL": true})
+			stored := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(ng), stored); err != nil || !stored.DeletionTimestamp.IsZero() {
+				t.Fatalf("expected the failed DELETE to leave the group untouched, got %v, deletionTimestamp %v", err, stored.DeletionTimestamp)
+			}
+
+			// Failure preserves the original expiry of both windows too.
+			clk.Step(nodegroup.QuotaBackoff)
+			requireAvailability("first window elapsed", map[string]bool{"XS": false, "S": true, "M": true, "XL": true})
+			deleteErr = nil
+			if err := provider.Delete(context.Background(), ng); err != nil {
+				t.Fatalf("retry DELETE: %v", err)
+			}
+			requireAvailability("accepted DELETE", map[string]bool{"2XS": false, "XS": false, "S": false, "M": true, "XL": false})
+			if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(ng), stored); err != nil || stored.DeletionTimestamp.IsZero() {
+				t.Fatalf("expected the accepted DELETE to leave the group terminating, got %v, deletionTimestamp %v", err, stored.DeletionTimestamp)
+			}
+		})
+	}
+}
+
+func TestDeletePreservesQuotaRejectionsRecordedDuringRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		flavor string
+	}{
+		{"refreshed rejection", "XS"},
+		{"new rejection", "S"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ng := ownedNodeGroup("default-delete", "XS", ngv1.NodeGroupStatus{
+				Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReady, "Synced", "")},
+			})
+			var provider *nodegroup.Provider
+			kubeClient := fake.NewClientBuilder().
+				WithScheme(scheme.Scheme).
+				WithObjects(ng).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						// A different launch can be refused while DELETE is in
+						// flight. Its acceptance says nothing about that rejection.
+						provider.RecordLateRefusal(testNodeClaim("default-concurrent"), ownedNodeGroup("default-concurrent", tc.flavor, quotaRejectedStatus()))
+						return c.Delete(ctx, obj, opts...)
+					},
+				}).Build()
+			// All rejections have the same timestamp: sequence, not wall time,
+			// must distinguish them from those known before the request.
+			provider = nodegroup.NewProvider(kubeClient, &fakeRecorder{}, catalogue, clocktesting.NewFakeClock(time.Now()))
+			provider.RecordLateRefusal(testNodeClaim("default-old-small"), ownedNodeGroup("default-old-small", "2XS", quotaRejectedStatus()))
+			provider.RecordLateRefusal(testNodeClaim("default-old"), ownedNodeGroup("default-old", "XS", quotaRejectedStatus()))
+			if err := provider.Delete(context.Background(), ng); err != nil {
+				t.Fatalf("DELETE: %v", err)
+			}
+			// Only pre-existing rejections can be cleared. A refreshed XS
+			// rejection stays; an old XS rejection not refreshed goes away.
+			for flavor, want := range map[string]bool{"2XS": false, "XS": tc.flavor == "XS", "S": true, "M": true, "XL": true} {
+				if got := provider.Unavailable(flavor); got != want {
+					t.Errorf("Unavailable(%s) = %v, want %v after DELETE with concurrent %s rejection", flavor, got, want, tc.flavor)
+				}
+			}
+		})
+	}
+}
+
 func TestRecordLateRefusal(t *testing.T) {
 	quota := ownedNodeGroup("default-lateq", "XS", quotaRejectedStatus())
 	refused := ownedNodeGroup("default-later", "M", ngv1.NodeGroupStatus{
@@ -1414,10 +1525,17 @@ func TestDeleteRemovesNodeGroup(t *testing.T) {
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: ng.Name}, &ngv1.NodeGroup{}); !apierrors.IsNotFound(err) {
 		t.Errorf("expected nodegroup deleted, got %v", err)
 	}
-	// NotFound is surfaced, not swallowed: the caller maps it to karpenter's
-	// NodeClaimNotFoundError.
+	// A new rejection can land before a stale retry of the same DELETE.
+	// NotFound gives no new reason to probe quota, so it must preserve the
+	// backoff and surface to the caller as usual (NodeClaimNotFoundError).
+	provider.RecordLateRefusal(testNodeClaim("default-quota"), ownedNodeGroup("default-quota", "XS", quotaRejectedStatus()))
 	if err := provider.Delete(context.Background(), ng); !apierrors.IsNotFound(err) {
 		t.Errorf("expected NotFound on second delete, got %v", err)
+	}
+	for _, flavor := range []string{"XS", "XL"} {
+		if !provider.Unavailable(flavor) {
+			t.Errorf("%s available after NotFound: the quota backoff must survive", flavor)
+		}
 	}
 }
 

@@ -45,6 +45,30 @@ Scaled to 12 replicas with NodePool limits above the org quota:
   backoff, upstream churn dropped from ~6 create/delete cycles per minute
   to 1.
 
+## DELETE error and quota backoff validation (2026-10-13)
+
+Validated the updated `nodegroup.Provider.Delete` against
+`karpenter-test@kubernetes_01M4TR2F3NY1WHFEJWG1RP86DT` (CKE 1.37)
+with a direct provider harness and real Kubernetes API calls. A disposable
+managed `2XS` NodeGroup used `nodeCount: 0` and a test-owned finalizer;
+no NodeClaim or worker VM was created. The quota rejection was seeded in
+provider memory, without exhausting the organisation quota.
+
+- At 14:37:15 UTC, a DELETE impersonating an identity without write access
+  returned a real API `Forbidden`. The rejected `2XS` flavor and larger
+  `XS` flavor both remained unavailable.
+- Retrying through the authorized client succeeded and cleared the older
+  quota backoff. The NodeGroup still had its deletion timestamp and
+  finalizers: accepted deletion does not confirm VM destruction or quota
+  release.
+- Cleanup removed only the test-owned finalizer. The platform reconciled
+  its own finalizer, and the disposable NodeGroup disappeared.
+
+Unit tests additionally cover service unavailability, cancellation, stale
+`NotFound` retries, and a new or refreshed quota rejection arriving while
+DELETE is in flight, including when the fake clock has not advanced.
+This targeted API test does not reproduce CKE `UPDATING` or `FAILED`.
+
 ## 4. Drift (NodeClass change)
 
 Patched the `CleverNodeClass` with `labels: {environment: production}`:
