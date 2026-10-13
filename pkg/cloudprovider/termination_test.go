@@ -31,19 +31,23 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/clock"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
@@ -73,8 +77,14 @@ func newCoreIndexedClient(objs ...client.Object) client.Client {
 		WithIndex(&karpv1.NodeClaim{}, "status.providerID", func(o client.Object) []string {
 			return []string{o.(*karpv1.NodeClaim).Status.ProviderID}
 		}).
+		WithIndex(&corev1.Node{}, "spec.providerID", func(o client.Object) []string {
+			return []string{o.(*corev1.Node).Spec.ProviderID}
+		}).
 		WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
 			return []string{o.(*corev1.Pod).Spec.NodeName}
+		}).
+		WithIndex(&storagev1.VolumeAttachment{}, "spec.nodeName", func(o client.Object) []string {
+			return []string{o.(*storagev1.VolumeAttachment).Spec.NodeName}
 		}).
 		Build()
 }
@@ -144,6 +154,92 @@ func TestGetReleasesTheNodeOfATerminatingNodeGroup(t *testing.T) {
 	// as its last finalizer goes.
 	if err := kubeClient.Get(ctx, types.NamespacedName{Name: node.Name}, &corev1.Node{}); !apierrors.IsNotFound(err) {
 		t.Errorf("expected core to release the node of the terminating nodegroup at once, got %v", err)
+	}
+}
+
+// A cluster upgrade can block the CKE finalizer even though Kubernetes
+// accepted DELETE. Core must retain the NodeClaim until the group disappears
+// and resume automatically afterwards. Its five-second retry has no timeout:
+// the deletion-overdue signal must report this without forcing progress.
+func TestBlockedDeletionWaitsAndResumesWhenThePlatformRecovers(t *testing.T) {
+	for _, ready := range []corev1.ConditionStatus{corev1.ConditionTrue, corev1.ConditionUnknown} {
+		t.Run(string(ready), func(t *testing.T) {
+			ctx := context.Background()
+			group := terminatingNodeGroup("default-blocked", "XS")
+			claim := launchedNodeClaim(group.Name)
+			claim.StatusConditions().SetTrue(karpv1.ConditionTypeRegistered)
+			claim.StatusConditions().SetTrue(karpv1.ConditionTypeDrained)
+			node := clusterNode(claim, ready, time.Now().Add(-time.Hour))
+			now := metav1.Now()
+			node.DeletionTimestamp, claim.DeletionTimestamp = &now, &now
+			kubeClient := newCoreIndexedClient(readyNodeClass("default"), group, claim, node)
+			clk := clocktesting.NewFakeClock(time.Now())
+			itp := instancetype.NewProvider("par", nil, nil)
+			cp := cloudprovider.New(kubeClient, kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clk))
+			nodeController := termination.NewController(clk, kubeClient, cp, terminator.NewTerminator(clk, kubeClient, terminator.NewQueue(kubeClient, noopRecorder{}), noopRecorder{}), noopRecorder{})
+			claimController := lifecycle.NewController(clk, kubeClient, cp, noopRecorder{}, nil, nil)
+			for range 3 {
+				err := kubeClient.Get(ctx, client.ObjectKeyFromObject(node), node)
+				if err == nil {
+					result, err := nodeController.Reconcile(ctx, node)
+					if err != nil {
+						t.Fatalf("core node termination: %v", err)
+					}
+					if ready == corev1.ConditionTrue && result.RequeueAfter != 5*time.Second {
+						t.Fatalf("Ready node retry = %v, want 5s", result.RequeueAfter)
+					}
+				} else if !apierrors.IsNotFound(err) {
+					t.Fatal(err)
+				}
+				err = kubeClient.Get(ctx, client.ObjectKeyFromObject(node), node)
+				if ready == corev1.ConditionTrue {
+					if err != nil || !controllerutil.ContainsFinalizer(node, karpv1.TerminationFinalizer) {
+						t.Fatalf("Ready node released while deletion blocked: %v", err)
+					}
+				} else if !apierrors.IsNotFound(err) {
+					t.Fatalf("NotReady node must be released to avoid the CKE finalizer deadlock: %v", err)
+				}
+				if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(claim), claim); err != nil {
+					t.Fatal(err)
+				}
+				result, err := claimController.Reconcile(ctx, claim)
+				// While the Node exists its termination controller performs
+				// the retry; once gone the NodeClaim controller takes over.
+				if err != nil || (ready == corev1.ConditionUnknown && result.RequeueAfter != 5*time.Second) {
+					t.Fatalf("core claim termination = %+v, %v", result, err)
+				}
+				if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(claim), claim); err != nil {
+					t.Fatal(err)
+				}
+				if !controllerutil.ContainsFinalizer(claim, karpv1.TerminationFinalizer) ||
+					!claim.StatusConditions().IsTrue(karpv1.ConditionTypeInstanceTerminating) {
+					t.Fatalf("blocked claim lost its finalizer or InstanceTerminating: %+v", claim)
+				}
+				clk.Step(24 * time.Hour)
+			}
+			// Simulate the platform completing its own finalizer. Production
+			// code never removes it; only its disappearance allows completion.
+			if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(group), group); err != nil {
+				t.Fatal(err)
+			}
+			group.Finalizers = nil
+			if err := kubeClient.Update(ctx, group); err != nil {
+				t.Fatal(err)
+			}
+			if ready == corev1.ConditionTrue {
+				if _, err := nodeController.Reconcile(ctx, node); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := claimController.Reconcile(ctx, claim); err != nil {
+				t.Fatal(err)
+			}
+			for _, obj := range []client.Object{node, claim, group} {
+				if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(obj), obj); !apierrors.IsNotFound(err) {
+					t.Errorf("%T did not finish deletion after platform recovery: %v", obj, err)
+				}
+			}
+		})
 	}
 }
 

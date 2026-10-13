@@ -16,6 +16,7 @@ All provider series are prefixed `karpenter_clevercloud_`.
 | `nodegroup_rejections_total` | counter | The node-group operator refused a NodeGroup for a reason that is **not** the organisation quota — a flavor this cluster cannot provision, a spec it will not accept, or any reason the provider does not know. The refused flavor is [unavailable](#unavailable-flavors) to karpenter's scheduler for 5 minutes, so it relaxes to another flavor, or to the next NodePool by weight. A refusal published after the acceptance poll counts too: the nodegroupstatus controller then deletes the launched NodeClaim so karpenter re-plans, and holds the flavor out the same way. So does a create the API server refused **at admission** because the NodeGroup CRD's `spec.flavor` enum (`2XS`…`XL`) does not carry the flavor: no NodeGroup is created, the flavor is unavailable the same way, and the launch fails over to another flavor when the claim allows one (pods only that flavor fits stay pending). An admission error that also names another field (a label value the CRD refuses) is not counted: it fails whatever the flavor and stays a plain launch error. **Not counted**: a `ReconcileFailed` with reason `UpstreamError`, which the operator reports when one of its Clever Cloud API calls fails and then retries on its own (seen recovering after about an hour). That is a platform incident, not a verdict on the flavor: the group is left in place, nothing is held out, the launch proceeds once the operator acknowledges the group (or keeps waiting when it has not yet), and a `NodeGroupTransientFailure` event reports it instead. | Unlike a quota rejection this is not normal operation: the request was well-formed as far as the provider knows. Read the `NodeGroupRejected` event on the NodeClaim — it carries the operator's own reason and message, which is what to report to Clever Cloud. A refusal **at admission** (the event says so, with the API server's `Unsupported value` message; the controller logs it as an error) names a flavor the NodeGroup API does not know, which a `settings.flavors` override added — a new flavor declared before Clever Cloud's CRD carries it: fix or remove that override. A built-in flavor refused this way means Clever Cloud withdrew it from the enum: report it, and exclude it in the NodePool requirements meanwhile (see below). Every flavor being refused in turn points at the platform, not at the flavors: report the reasons to Clever Cloud rather than trimming the catalogue. If a single flavor is refused persistently, the 5-minute hold-out already makes launches pick another flavor between attempts when the claim allows one; to stop the attempts, exclude it in the NodePool requirements (`node.kubernetes.io/instance-type` with `NotIn`) — nodes already running that flavor are then replaced as `RequirementsDrifted` under the disruption budgets. `settings.flavors` cannot remove a flavor from the catalogue: its overrides only add or adjust entries. |
 | `nodegroup_vanished_total` | counter | A NodeGroup disappeared after creation while its NodeClaim was still unregistered — usually the quota engine reclaiming an accepted group. Each tick is a launch fast-failed instead of burning the 15-minute registration TTL. Two paths count it. The acceptance poll fails the launch at once, and its flavor is then [unavailable](#unavailable-flavors) for 1 minute and every other flavor at least as large for 2 minutes, as after a quota rejection; but the poll only runs until the operator's decision, about 1 s after the group's creation, and a group it sees terminating counts as vanished too. A group that vanishes after the operator acknowledged it is caught by the GC sweep instead, which deletes the NodeClaim 2 to 4 minutes after its creation (the sweep runs every 2 minutes and skips claims younger than 2 minutes) and makes no flavor unavailable. | Occasional ticks near the quota ceiling are the documented upstream race. Sustained growth means the platform keeps reclaiming accepted groups — check quota headroom and the node-group operator. |
 | `nodegroup_sync_overdue` | gauge | Launched NodeGroups the node-group operator has not synced (no `Ready=True`) 5 minutes after their creation while their NodeClaim is still unregistered. Healthy launches sync in under a minute (node Ready at 26–60 s, see [E2E-RESULTS](E2E-RESULTS.md)). | **Non-zero means launches are stuck upstream**: they will not register, and karpenter-core deletes each NodeClaim at its 15-minute registration timeout, then re-plans. The `NodeGroupSyncOverdue` event on the NodeClaim names the group and what the operator last wrote. In `kubectl get nodegroup <name> -o yaml`: no `status` means the operator never picked the group up; a `ReconcileInProgress` (`Creating`) that never ends means the operator is still building, or failing to build, the machine; a `ReconcileFailed` with reason `UpstreamError` means the operator keeps retrying failed Clever Cloud API calls (a `NodeGroupTransientFailure` event says so too). None of this can be fixed from the cluster: report the NodeGroup names (and their `status.upstreamId` when set) to Clever Cloud support. Nothing needs deleting by hand. |
+| `nodegroup_deletion_overdue` | gauge | Managed NodeGroups still present at least 5 minutes after their `deletionTimestamp`, from the last successful GC list. Checked every 2 minutes (normally detected 5–7 minutes after the DELETE), independently of NodeClaim existence or status and of stale `Ready=True`. | Read the `NodeGroupDeletionOverdue` Warning on the **NodeGroup**, its remaining finalizers and `status.upstreamId`; check the CKE cluster state and report persistent blockage to Clever Cloud support. An updating or failed cluster can block platform operations, but this signal does not diagnose its cause. Preserve finalizers. The count clears when Kubernetes no longer lists the group as managed; that **does not confirm VM destruction**. See [blocked cluster operations](#blocked-cluster-operations). |
 | `nodegroup_external_resizes` | gauge | Managed NodeGroups whose `nodeCount` is not 1 — something outside karpenter resizes them (the platform's alert-driven scaler via an inherited `autoscalingEnabled`, a human, anything with `nodegroups/scale` RBAC). | **Non-zero breaks the 1 NodeClaim = 1 NodeGroup invariant**: the extra nodes are never registered — they get no provider ID and keep the `karpenter.sh/unregistered` taint — so karpenter neither manages nor prices them. Find the resizer; ensure the cluster's `autoscalingEnabled` feature is off (the two autoscalers must never run together), then set `nodeCount` back to 1. **Also check karpenter-core's `karpenter_cluster_state_synced`**: a node carrying `karpenter.sh/nodepool` without a `spec.providerID` keeps it at 0 after every controller restart — provisioning and disruption stop cluster-wide and `cluster is waiting on sync for extended duration` is logged every 10 s. NodeGroups created by the current version never put that label on their nodes; for older groups, whose immutable `spec.labels` still carry it, the providerid controller removes it from the extra node it refuses to stamp (logged once per node). The controller never touches nodes of unmanaged groups, and that includes an older group recreated upstream without its `karpenter.clever-cloud.com/managed` label but with its old `spec.labels`: its single node carries the label with no provider ID and freezes the sync the same way. If `karpenter_cluster_state_synced` stays at 0 anyway, list the culprits with `kubectl get nodes -l karpenter.sh/nodepool -o custom-columns=NAME:.metadata.name,PROVIDERID:.spec.providerID` and remove the label from any node with an empty provider ID, or revert the resize. |
 | `gc_reaped_nodegroups_total` | counter | The GC safety net deleted an orphaned NodeGroup (its NodeClaim was force-deleted outside the normal flow). | Occasional ticks are the safety net working. Frequent ticks mean something force-deletes NodeClaims — find it. |
 | `gc_refused_nodegroups` | gauge | NodeGroups the last GC sweep refused to reap: managed label present, but no verified dead NodeClaim owner. | **Non-zero needs attention** — each one is a VM billing hourly. A copied manifest: remove the `karpenter.clever-cloud.com/managed` label. A deliberately orphaned group: delete it manually. Details in the `GarbageCollectionRefused` event on the NodeGroup. |
@@ -42,6 +43,11 @@ karpenter_clevercloud_nodegroup_external_resizes > 0
 # Launches stuck upstream: the node-group operator has not synced a launched
 # group 5 minutes after its creation (healthy launches sync in under a minute)
 karpenter_clevercloud_nodegroup_sync_overdue > 0
+
+# Deletions still visible at least 5 minutes after their DELETE. No extra
+# `for` is needed for the age threshold; set one if longer waits are expected
+# during planned cluster upgrades. This cannot confirm VM cleanup.
+karpenter_clevercloud_nodegroup_deletion_overdue > 0
 
 # karpenter-core's cluster state has not synced for 15 minutes: provisioning and
 # disruption are paused. Launches in flight hold it unsynced legitimately: each
@@ -71,6 +77,54 @@ The controller no longer exports `pricing_refresh_failures_total` nor
 `pricing_last_successful_refresh_timestamp_seconds`: the dynamic pricing
 refresher that fed them was removed, and the catalogue is now the built-in one
 plus `settings.flavors`. Delete any alert or dashboard built on them.
+
+## Blocked cluster operations
+
+The provider uses the in-cluster NodeGroup API and does not read the global
+CKE cluster state. Kubernetes can accept a creation or DELETE while CKE
+cannot apply it upstream. This was reproduced during a cluster upgrade
+(`UPDATING`); operations resumed after the cluster returned to `ACTIVE`
+([live investigation](E2E-RESULTS.md#cluster-upgrade-blocks-platform-operations-2026-10-13)).
+A permanently `FAILED` cluster was not reproduced.
+
+For creation, `UpstreamError` stays a transient error. If the operator has
+not acknowledged the group after 15 seconds, the provider returns
+optimistically with a `NodeGroupAcceptanceTimeout` event, accompanied by
+`NodeGroupTransientFailure` when it observed `UpstreamError`. The status
+controller reports a launch still unsynced after 5 minutes; core's 15-minute
+registration timeout remains the backstop. These signals do not identify a
+cluster-wide block, so they do not suspend provisioning or voluntary
+disruption globally.
+
+For deletion, an accepted DELETE may leave the NodeGroup visible with a
+`deletionTimestamp` and the platform's finalizer. The last `Ready=True`
+condition can remain set throughout that wait. After drain, core retries
+termination every 5 seconds while a Ready Node remains; if the Node becomes
+NotReady it can be released to avoid the CKE finalizer deadlock, and the
+NodeClaim continues waiting for the NodeGroup to disappear. This wait has no
+maximum duration. The provider neither repeats DELETE on an already
+terminating group nor removes finalizers.
+
+The GC sweep reports any managed group still terminating after 5 minutes,
+even with a registered, terminating or missing NodeClaim. It emits
+`NodeGroupDeletionOverdue` on the NodeGroup, logs once while that group stays
+overdue, and refreshes the `nodegroup_deletion_overdue` gauge on each
+successful group list. Its normal 2-minute cadence detects the threshold at
+5–7 minutes; reconciliation errors or cache lag can delay this. Events repeat
+at most hourly. A failed group list retains the previous gauge value; a
+controller restart resets it until the first successful sweep. Like the
+other controller gauges, this is leader-local: aggregate replicas with
+`max`, not `sum`.
+
+Inspect the group's finalizers and `status.upstreamId`, check the CKE cluster
+state in the console, and contact Clever Cloud support if the wait persists
+beyond an upgrade or incident. Removing finalizers loses tracking without
+guaranteeing VM destruction. A group disappearing from Kubernetes clears
+the signal, but the live upgrade showed platform deletion finishing about
+two minutes later. Confirmation of VM destruction requires platform
+information that this token-free provider does not receive. A global pause
+before drain would likewise require an explicit CKE signal exposed in the
+cluster; the generic `UpstreamError` is not sufficient.
 
 ## Flavor removal semantics
 
@@ -205,6 +259,7 @@ NodePool `NodeRegistrationHealthy` status condition.
 | `NodeGroupAcceptanceTimeout` | NodeClaim | Warning | The operator neither acknowledged nor refused the NodeGroup within the 15 s poll window (no status at all, or only a transient failure); the launch proceeded optimistically. A healthy launch never publishes it: the operator acknowledges a group about 1 s after its creation. Controller shutdowns mid-poll are excluded. |
 | `NodeGroupVanished` | NodeClaim | Warning | The NodeGroup disappeared after launch before the node registered, and the launch was failed instead of waiting out the registration TTL. From the acceptance poll, the launch failed at once: the poll runs until the operator's decision, about 1 s after the group's creation, and also fails the launch on a group it sees terminating. When the acceptance poll saw it, its flavor is [unavailable](#unavailable-flavors) for a minute and every other flavor at least as large for two, as after a quota rejection. From the GC sweep, the claim was deleted: a group that vanishes after the operator acknowledged it is caught there, 2 to 4 minutes after the NodeClaim's creation, and no flavor is made unavailable. |
 | `NodeGroupSyncOverdue` | NodeClaim | Warning | The launched NodeGroup is still not synced 5 minutes after its creation and the claim has not registered; carries what the operator last wrote (phase and true conditions), or says the operator never picked the group up. Nothing is deleted: karpenter-core's registration timeout retires the claim at 15 minutes. Counted by `nodegroup_sync_overdue`. |
+| `NodeGroupDeletionOverdue` | NodeGroup | Warning | The managed NodeGroup is still visible at least 5 minutes after its DELETE. Includes remaining finalizers and advises checking CKE state and contacting support; does not diagnose `UPDATING`/`FAILED` or confirm VM deletion. Published by the 2-minute GC sweep, including for missing or registered NodeClaims and stale `Ready=True`; deduped per object UID and republished hourly. No finalizer or retry behavior changes. |
 | `NodeGroupExternallyResized` | NodeGroup | Warning | The group's nodeCount is not 1; republished hourly while the condition persists. |
 | `GarbageCollected` | NodeGroup | Normal | The GC safety net deleted this orphaned group. |
 | `GarbageCollectionRefused` | NodeGroup | Warning | The GC found this group orphan-like but refused to reap it (no verified dead owner); republished hourly while the condition persists so it survives etcd's event TTL. |
@@ -213,7 +268,9 @@ NodePool `NodeRegistrationHealthy` status condition.
 Refusal logs are deduplicated to one line per NodeGroup per controller
 lifetime — the gauge, not the log volume, is the persistent signal. The
 nodegroupstatus controller likewise logs a transient failure or an overdue
-sync once per NodeGroup while it follows the launch.
+sync once per NodeGroup while it follows the launch. Overdue-deletion logs
+are deduplicated per NodeGroup UID while it remains overdue; groups no
+longer reported by a successful managed-group list leave that log state.
 
 Deliberate descope: unknown-flavor lookups are metrics/log-only — the lookup
 site holds no natural involved object for an Event (instance-type lookups have
