@@ -61,6 +61,9 @@ const (
 	// minAge protects freshly created NodeGroups from racing with NodeClaim
 	// informer lag.
 	minAge = 2 * time.Minute
+	// deletionOverdueAfter is an observability threshold, not a deadline:
+	// finalizers remain the platform's responsibility, however long it takes.
+	deletionOverdueAfter = 5 * time.Minute
 )
 
 type Controller struct {
@@ -75,6 +78,10 @@ type Controller struct {
 	// warned dedups the refusal log/event per NodeGroup for this process
 	// lifetime; Reconcile is a singleton, no locking needed.
 	warned map[string]struct{}
+	// deletionWarned contains only the currently overdue groups, keyed by
+	// name and UID so a recreated group receives its own log line. Each
+	// successful list replaces it; singleton reconciliation needs no lock.
+	deletionWarned map[types.NamespacedName]types.UID
 }
 
 func NewController(kubeClient client.Client, uncached client.Reader, nodeGroupProvider *nodegroup.Provider, recorder events.Recorder) *Controller {
@@ -90,6 +97,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	if err != nil {
 		return reconciler.Result{}, err
 	}
+	// Deletion monitoring does not depend on a NodeClaim: its owner may
+	// already be gone, and a failed NodeClaim list must not hide this signal.
+	c.reportOverdueDeletions(ctx, nodeGroups, time.Now())
 	nodeClaims := &karpv1.NodeClaimList{}
 	if err := c.kubeClient.List(ctx, nodeClaims); err != nil {
 		return reconciler.Result{}, err
@@ -186,6 +196,43 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{}, errors.Join(errs...)
 	}
 	return reconciler.Result{RequeueAfter: pollPeriod}, nil
+}
+
+// reportOverdueDeletions observes an accepted DELETE still visible through
+// the managed NodeGroup list. Neither Ready nor a missing NodeClaim proves
+// that the platform finished deleting its VM. This pass only reports: it
+// never retries DELETE, edits finalizers or changes quota state.
+func (c *Controller) reportOverdueDeletions(ctx context.Context, nodeGroups []ngv1.NodeGroup, now time.Time) {
+	overdue := map[types.NamespacedName]types.UID{}
+	for i := range nodeGroups {
+		ng := &nodeGroups[i]
+		if ng.DeletionTimestamp.IsZero() || now.Sub(ng.DeletionTimestamp.Time) < deletionOverdueAfter {
+			continue
+		}
+		key := client.ObjectKeyFromObject(ng)
+		overdue[key] = ng.UID
+		msg := fmt.Sprintf("NodeGroup %s is still present at least %s after deletion was requested (remaining finalizers: %v). "+
+			"Inspect the NodeGroup and the CKE cluster state; an updating or failed cluster can block platform operations. "+
+			"Report persistent blockage to Clever Cloud support; do not remove finalizers. VM deletion is not confirmed by this signal",
+			ng.Name, deletionOverdueAfter, ng.Finalizers)
+		if uid, logged := c.deletionWarned[key]; !logged || uid != ng.UID {
+			log.FromContext(ctx).WithValues("NodeGroup", ng.Name, "upstreamID", ng.Status.UpstreamID,
+				"deletionTimestamp", ng.DeletionTimestamp, "finalizers", ng.Finalizers).Info(msg)
+		}
+		c.recorder.Publish(events.Event{
+			InvolvedObject: ng,
+			Type:           corev1.EventTypeWarning,
+			Reason:         "NodeGroupDeletionOverdue",
+			Message:        msg,
+			DedupeValues:   []string{ng.Name, string(ng.UID)},
+			DedupeTimeout:  time.Hour,
+		})
+	}
+	// Replace, rather than accumulate, so disappeared/unmanaged groups leave
+	// the gauge and log state. A failed list never reaches here and preserves
+	// the last observation instead of falsely reporting recovery.
+	c.deletionWarned = overdue
+	metrics.NodeGroupDeletionOverdue.Set(float64(len(overdue)), nil)
 }
 
 // anyClaimAliveUncached reports whether any of the named NodeClaims exists on

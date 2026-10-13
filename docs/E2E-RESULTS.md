@@ -313,3 +313,79 @@ Unit tests additionally cover service unavailability, cancellation, stale
 `NotFound` retries, and a new or refreshed quota rejection arriving while
 DELETE is in flight, including when the fake clock has not advanced.
 This targeted API test does not reproduce CKE `UPDATING` or `FAILED`.
+
+
+---
+
+# Cluster upgrade blocks platform operations (2026-10-13)
+
+Manual investigation on `karpenter-test`
+(`kubernetes_01M4TR2F3NY1WHFEJWG1RP86DT`, Paris, `DEDICATED_COMPUTE`),
+upgrading Kubernetes **1.36 → 1.37** with an unmanaged 2× XS worker group
+as baseline. The controller ran out-of-cluster and reported build
+`33a6c2a-dirty`. This investigation used the **existing controller before the
+deletion-overdue feature**; it is evidence for the failure mode and recovery,
+not a live test of the new metric or event.
+
+A managed 2XS NodeClaim/NodeGroup (`upgrade-probe-before`) was provisioned
+before the upgrade. During `UPDATING`, its NodeGroup was deleted and a second
+2XS NodeClaim (`upgrade-probe-during`) created. The first NodeClaim was then
+deleted to exercise Karpenter's termination flow. The test NodePool disabled
+consolidation and voluntary disruption; no finalizer was forcibly removed.
+Platform state was observed separately with the operator's authenticated
+CLI; the provider continued to use only the Kubernetes API.
+
+Times below are Europe/Paris (CEST, UTC+02:00). Platform and Kubernetes
+snapshots were sampled every 5 seconds; controller log times are exact.
+
+| Time | Observation |
+|---|---|
+| 15:57:36 | Platform CLI accepted the upgrade to 1.37. |
+| 15:57:40 | Platform state was `UPDATING`. Kubernetes accepted the NodeGroup DELETE and the new NodeClaim. The deleting group retained `clever-nodegroup-operator` and its old `Ready=True` condition. |
+| 15:57:56 | The new group's acceptance poll timed out after 15 s with `ReconcileFailed=True(UpstreamError)`, message `Upstream creation failed: failed to reconcile resource, upstream creation failed, CreationFailedUpstream`. The provider emitted `NodeGroupTransientFailure` and `NodeGroupAcceptanceTimeout`, returned optimistically, and core set `Launched=True`; no new node existed yet. |
+| 15:58:01–15:58:09 | Deleting the old NodeClaim started drain; the sampled claim reached `Drained=True`, `VolumesDetached=True`, `InstanceTerminating=True`. Its NodeGroup stayed visible with the platform finalizer. |
+| 16:01:01 | First platform sample back at `ACTIVE`; the queued operations resumed automatically. |
+| 16:01:05–16:01:06 | Core deleted the old Node and NodeClaim. The 16:01:06 Kubernetes sample no longer contained the old NodeGroup, while the platform still listed it as `READY` with one node. |
+| 16:01:32–16:01:40 | The newly requested NodeClaim registered and initialized without intervention. The platform showed its group `READY` by 16:01:56. |
+| 16:03:02 | The old group's platform record reported `DELETED`, `currentNodeCount: 0`, with `updatedAt: 14:03:02.777502Z`; confirmed by the later direct group read. |
+
+The deletion remained visible in Kubernetes for about 3 min 26 s, shorter
+than the new 5-minute observation threshold. Platform confirmation of its
+completion arrived about **two minutes after** the Kubernetes NodeGroup
+and NodeClaim disappeared. Disappearance from the in-cluster API therefore
+does not prove that the platform has finished deleting the VM; the new
+`nodegroup_deletion_overdue` gauge deliberately measures only the former.
+
+`UPDATING` with automatic recovery was reproduced. A persistently `FAILED`
+cluster was **not** induced, so no recovery bound is claimed for that state.
+The existing core termination behavior for an indefinitely held finalizer
+is covered separately by fake-clock tests: a Ready Node remains, a NotReady
+Node can be released, the NodeClaim keeps waiting, and deletion resumes
+when the platform completes its finalizer.
+
+Cleanup removed both managed probe groups, their NodeClaims, the temporary
+NodePool/NodeClass, the out-of-cluster controller and the temporary
+Karpenter CRDs. Final platform state was `ACTIVE` at 1.37 with only the
+baseline two workers; quota usage returned to 18 vCPU / 24 GB (including
+the control plane).
+
+## Deletion-overdue signal validation
+
+The new reporting feature was tested separately on the same cluster on
+2026-10-13 using a disposable managed NodeGroup, `pr-deletion-probe`
+(`flavor: 2XS`, `nodeCount: 0`). A test-owned finalizer retained the deleting
+object; no NodeClaim or worker was created. The actual GC `Reconcile` ran
+against the real Kubernetes API with the real `events.Recorder`, called
+every 10 seconds for this probe (production remains every 2 minutes).
+
+| Time (Europe/Paris, CEST) | Observation |
+|---|---|
+| 16:31:49 | Deletion age 4 min 58 s: `nodegroup_deletion_overdue=0`. |
+| 16:32:00 | Deletion age 5 min 9 s: gauge `1`; a real Warning `NodeGroupDeletionOverdue` event was recorded on the NodeGroup and named its remaining test finalizer. |
+| 16:32:00 | Removing only the test-owned finalizer let the NodeGroup disappear; the next reconcile returned the gauge to `0`. |
+
+The platform had already cleared its own finalizer; it was never forcibly
+removed. This validates the feature's threshold, Kubernetes event and gauge
+recovery with no NodeClaim. It does not reproduce `FAILED` or validate VM
+creation/deletion: this probe had no worker, unlike the upgrade investigation
+above.

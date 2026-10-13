@@ -118,6 +118,20 @@ var (
 		nil,
 	)
 
+	// NodeGroupDeletionOverdue counts managed NodeGroups still present at
+	// least 5 minutes after deletion was requested, from the last successful
+	// GC list. Disappearance clears the count but does not confirm VM deletion.
+	NodeGroupDeletionOverdue = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: "nodegroup",
+			Name:      "deletion_overdue",
+			Help:      "Managed NodeGroups still present at least 5 minutes after deletion was requested, from the last successful garbage-collection list. This does not confirm VM deletion.",
+		},
+		nil,
+	)
+
 	// NodeGroupExternalResizes is the number of managed NodeGroups whose
 	// nodeCount is not 1 — something outside this provider resized them (the
 	// platform's alert-driven scaler through the inherited autoscalingEnabled
@@ -223,6 +237,7 @@ func init() {
 	NodeGroupVanished.Add(0, nil)
 	NodeGroupExternalResizes.Set(0, nil)
 	NodeGroupSyncOverdue.Set(0, nil)
+	NodeGroupDeletionOverdue.Set(0, nil)
 	FlavorsConfigInvalid.Set(0, nil)
 	GCReapedNodeGroups.Add(0, nil)
 	GCRefusedNodeGroups.Set(0, nil)

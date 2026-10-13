@@ -24,6 +24,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -32,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -397,6 +400,189 @@ func TestReconcileSkipsAlreadyDeletingNodeGroup(t *testing.T) {
 	if !provider.Unavailable("2XS") {
 		t.Error("the sweep forgot a quota rejection by deleting a nodegroup already being deleted")
 	}
+}
+
+func TestReconcileReportsOverdueDeletionsWithoutDependingOnClaimsOrStatus(t *testing.T) {
+	ctx := context.Background()
+	overdue := func(name string) *ngv1.NodeGroup {
+		ng := managedNodeGroup(name, "", time.Hour, true)
+		ng.UID = types.UID(name)
+		deleted := metav1.NewTime(time.Now().Add(-5*time.Minute - time.Second))
+		ng.DeletionTimestamp = &deleted
+		return ng
+	}
+	missingClaim := overdue("deleted-claim")
+	registered := overdue("registered")
+	// Ready is a stale provisioning condition, not deletion confirmation.
+	registered.Status.Conditions = []ngv1.NodeGroupCondition{{Type: ngv1.ConditionTypeReady, Status: corev1.ConditionTrue}}
+	registeredClaim := testNodeClaim(registered.Name)
+	registeredClaim.StatusConditions().SetTrue(karpv1.ConditionTypeRegistered)
+	terminating := overdue("terminating-claim")
+	terminatingClaim := testNodeClaim(terminating.Name)
+	terminatingClaim.DeletionTimestamp = terminating.DeletionTimestamp.DeepCopy()
+	terminatingClaim.Finalizers = []string{karpv1.TerminationFinalizer}
+	// Reporting does not authorize any destructive action, so the monitor
+	// also covers a managed group whose owner reference was stripped.
+	terminating.OwnerReferences = nil
+	unmanaged := overdue("unmanaged")
+	unmanaged.Labels = nil
+	recentDelete := managedNodeGroup("recent-delete", "", time.Hour, true)
+	notDeleting := managedNodeGroup("not-deleting", "", time.Hour, false)
+	deletes := 0
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).
+		WithObjects(missingClaim, registered, registeredClaim, terminating, terminatingClaim,
+			unmanaged, recentDelete, notDeleting, testNodeClaim(notDeleting.Name)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error {
+				deletes++
+				return errTest
+			},
+		}).Build()
+	recorder := &fakeRecorder{}
+	provider := nodegroup.NewProvider(kubeClient, recorder, nil, clock.RealClock{})
+	ctrl := garbagecollection.NewController(kubeClient, kubeClient, provider, recorder)
+	for range 2 {
+		result, err := ctrl.Reconcile(ctx)
+		if err != nil || result.RequeueAfter != 2*time.Minute {
+			t.Fatalf("Reconcile = %+v, %v; want next sweep in 2m", result, err)
+		}
+		if got := metricstest.Value(t, "karpenter_clevercloud_nodegroup_deletion_overdue"); got != 3 {
+			t.Fatalf("deletion_overdue = %v, want 3", got)
+		}
+	}
+	if deletes != 0 {
+		t.Fatalf("deletion reporting sent %d DELETE requests", deletes)
+	}
+	reported := recorder.eventsByReason("NodeGroupDeletionOverdue")
+	if len(reported) != 6 {
+		t.Fatalf("events = %d, want 6 publishes (the recorder dedupes them)", len(reported))
+	}
+	for _, event := range reported {
+		if event.Type != corev1.EventTypeWarning || event.DedupeTimeout != time.Hour {
+			t.Errorf("expected hourly-deduped Warning, got %+v", event)
+		}
+		ng, ok := event.InvolvedObject.(*ngv1.NodeGroup)
+		if !ok || ng.Name == unmanaged.Name || ng.Name == recentDelete.Name || ng.Name == notDeleting.Name {
+			t.Fatalf("unexpected involved object: %+v", event.InvolvedObject)
+		}
+		if len(event.DedupeValues) != 2 || event.DedupeValues[1] != string(ng.UID) {
+			t.Errorf("event must distinguish recreated groups: %+v", event.DedupeValues)
+		}
+		for _, detail := range []string{"test.finalizer/keep", "CKE cluster state", "VM deletion is not confirmed"} {
+			if !strings.Contains(event.Message, detail) {
+				t.Errorf("event lacks %q: %s", detail, event.Message)
+			}
+		}
+		stored := &ngv1.NodeGroup{}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(ng), stored); err != nil {
+			t.Fatal(err)
+		}
+		if len(stored.Finalizers) != 1 || stored.Finalizers[0] != "test.finalizer/keep" {
+			t.Fatalf("reporting altered finalizers: %v", stored.Finalizers)
+		}
+	}
+}
+
+func TestOverdueDeletionGaugeKeepsLastObservationOnListFailure(t *testing.T) {
+	ctx := context.Background()
+	ng := managedNodeGroup("overdue-list-failure", "", time.Hour, true)
+	deleted := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	ng.DeletionTimestamp = &deleted
+	var failGroups, failClaims bool
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(ng).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				switch list.(type) {
+				case *ngv1.NodeGroupList:
+					if failGroups {
+						return errTest
+					}
+				case *karpv1.NodeClaimList:
+					if failClaims {
+						return errTest
+					}
+				}
+				return cl.List(ctx, list, opts...)
+			},
+		}).Build()
+	recorder := &fakeRecorder{}
+	ctrl := garbagecollection.NewController(kubeClient, kubeClient, nodegroup.NewProvider(kubeClient, recorder, nil, clock.RealClock{}), recorder)
+	// No successful NodeClaim list is needed to first report the incident.
+	failClaims = true
+	if _, err := ctrl.Reconcile(ctx); !errors.Is(err, errTest) {
+		t.Fatalf("expected NodeClaim list failure, got %v", err)
+	}
+	if got := metricstest.Value(t, "karpenter_clevercloud_nodegroup_deletion_overdue"); got != 1 {
+		t.Fatalf("deletion_overdue despite NodeClaim list failure = %v, want 1", got)
+	}
+	if recorder.countReason("NodeGroupDeletionOverdue") != 1 {
+		t.Fatal("NodeClaim list failure hid the overdue-deletion event")
+	}
+	// The operator finishes the Kubernetes deletion, but the next failed
+	// group list must not claim that recovery has been observed yet.
+	stored := &ngv1.NodeGroup{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(ng), stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Finalizers = nil
+	if err := kubeClient.Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	failGroups = true
+	if _, err := ctrl.Reconcile(ctx); !errors.Is(err, errTest) {
+		t.Fatalf("expected NodeGroup list failure, got %v", err)
+	}
+	if got := metricstest.Value(t, "karpenter_clevercloud_nodegroup_deletion_overdue"); got != 1 {
+		t.Fatalf("failed NodeGroup list reset gauge to %v", got)
+	}
+	failGroups = false
+	if _, err := ctrl.Reconcile(ctx); !errors.Is(err, errTest) {
+		t.Fatalf("expected NodeClaim list failure, got %v", err)
+	}
+	if got := metricstest.Value(t, "karpenter_clevercloud_nodegroup_deletion_overdue"); got != 0 {
+		t.Fatalf("successful empty NodeGroup list did not clear gauge: %v", got)
+	}
+}
+
+func TestOverdueDeletionLogsForgetGroupsNoLongerMonitored(t *testing.T) {
+	ng := managedNodeGroup("overdue-logs", "", time.Hour, true)
+	ng.UID = "original"
+	deleted := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	ng.DeletionTimestamp = &deleted
+	ctrl, kubeClient, _ := newTestControllerWithRecorder(t, ng)
+	logs := 0
+	ctx := log.IntoContext(context.Background(), funcr.New(func(_, line string) {
+		if strings.Contains(line, "VM deletion is not confirmed") {
+			logs++
+		}
+	}, funcr.Options{}))
+	reconcile := func(wantGauge float64, wantLogs int) {
+		t.Helper()
+		if _, err := ctrl.Reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := metricstest.Value(t, "karpenter_clevercloud_nodegroup_deletion_overdue"); got != wantGauge || logs != wantLogs {
+			t.Fatalf("gauge/logs = %v/%d, want %v/%d", got, logs, wantGauge, wantLogs)
+		}
+	}
+	reconcile(1, 1)
+	reconcile(1, 1)
+	stored := &ngv1.NodeGroup{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(ng), stored); err != nil {
+		t.Fatal(err)
+	}
+	// A group that loses its managed label leaves both the gauge and the
+	// bounded log state. Reintroducing it must produce a fresh diagnostic.
+	delete(stored.Labels, v1alpha1.ManagedLabelKey)
+	if err := kubeClient.Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(0, 1)
+	stored.Labels[v1alpha1.ManagedLabelKey] = "true"
+	if err := kubeClient.Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(1, 2)
 }
 
 // vanishedClaim builds a NodeClaim in the launched-but-never-registered
