@@ -358,10 +358,12 @@ does not prove that the platform has finished deleting the VM; the new
 
 `UPDATING` with automatic recovery was reproduced. A persistently `FAILED`
 cluster was **not** induced, so no recovery bound is claimed for that state.
-The existing core termination behavior for an indefinitely held finalizer
-is covered separately by fake-clock tests: a Ready Node remains, a NotReady
-Node can be released, the NodeClaim keeps waiting, and deletion resumes
-when the platform completes its finalizer.
+A separate characterization test runs the existing core termination
+controllers after drain: across repeated reconciles a Ready Node remains,
+a NotReady Node can be released, and the NodeClaim keeps waiting. Deletion
+resumes when the test simulates the platform completing its finalizer. This
+pins the wait/recovery contract, not a maximum duration or the new overdue
+signal; the latter has its own deterministic threshold and event tests.
 
 Cleanup removed both managed probe groups, their NodeClaims, the temporary
 NodePool/NodeClass, the out-of-cluster controller and the temporary
@@ -389,3 +391,32 @@ removed. This validates the feature's threshold, Kubernetes event and gauge
 recovery with no NodeClaim. It does not reproduce `FAILED` or validate VM
 creation/deletion: this probe had no worker, unlike the upgrade investigation
 above.
+
+
+---
+
+# Deletion diagnostic follow-up (2026-10-14)
+
+Validated the revised message on `karpenter-review`
+(`kubernetes_01M4WSYD7Q0BS4FRV9GSTCT4A2`, Kubernetes 1.36.3). The
+actual GC and event recorder ran against the real API every ten seconds,
+using a disposable managed 2XS NodeGroup with `nodeCount: 0` and a
+test-owned finalizer. No NodeClaim or worker was created for this probe.
+Times below are Europe/Paris (CEST, UTC+02:00).
+
+- At 12:45:24, deletion age 4 min 55 s, the gauge was still zero.
+- At 12:45:35, age 5 min 6 s, the gauge was one. The Warning recorded the
+  age at observation (5 min 4 s), `phase: DeletionRequested`, the last
+  `Ready` and `Terminating` true conditions, and the test finalizer.
+- CKE had already removed its own finalizer. The message correctly pointed
+  to the remaining finalizer's controller and the current NodeGroup YAML,
+  without directing this case to Clever Cloud support or claiming VM
+  cleanup was complete.
+- Removing only the test-owned finalizer let the object disappear; the
+  next reconcile returned the gauge to zero at 12:45:38.
+
+The exact five-minute boundary and same-name/new-UID behavior are covered
+separately by deterministic tests with the real event deduplication logic.
+The production GC cadence remains two minutes. The prior upgrade and
+this zero-worker diagnostic probe establish different properties; neither
+reproduces a persistently `FAILED` cluster.
