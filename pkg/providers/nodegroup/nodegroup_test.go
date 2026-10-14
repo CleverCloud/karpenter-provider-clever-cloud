@@ -1359,6 +1359,9 @@ func TestDeletePreservesQuotaBackoffUntilRequestSucceeds(t *testing.T) {
 				}
 			}
 
+			// The failed request happens after the rejection, so refreshing
+			// its timestamp on failure would visibly postpone both windows.
+			clk.Step(nodegroup.QuotaBackoff / 2)
 			if err := provider.Delete(context.Background(), ng); !errors.Is(err, tc.err) {
 				t.Fatalf("expected the DELETE error %v, got %v", tc.err, err)
 			}
@@ -1368,9 +1371,18 @@ func TestDeletePreservesQuotaBackoffUntilRequestSucceeds(t *testing.T) {
 				t.Fatalf("expected the failed DELETE to leave the group untouched, got %v, deletionTimestamp %v", err, stored.DeletionTimestamp)
 			}
 
-			// Failure preserves the original expiry of both windows too.
-			clk.Step(nodegroup.QuotaBackoff)
+			// Both windows expire relative to the original rejection, with
+			// no accepted DELETE that could hide an incorrectly extended wait.
+			clk.Step(nodegroup.QuotaBackoff / 2)
 			requireAvailability("first window elapsed", map[string]bool{"XS": false, "S": true, "M": true, "XL": true})
+			clk.Step(nodegroup.QuotaBackoff)
+			requireAvailability("second window elapsed", map[string]bool{"XS": false, "S": false, "M": true, "XL": false})
+
+			// A new launch hits quota before the deletion is retried. Only
+			// the accepted retry may clear this new backoff early; the
+			// independent flavor refusal must still survive.
+			provider.RecordLateRefusal(testNodeClaim("default-quota-again"), ownedNodeGroup("default-quota-again", "XS", quotaRejectedStatus()))
+			requireAvailability("new rejection", map[string]bool{"XS": true, "S": true, "M": true, "XL": true})
 			deleteErr = nil
 			if err := provider.Delete(context.Background(), ng); err != nil {
 				t.Fatalf("retry DELETE: %v", err)
@@ -1423,6 +1435,66 @@ func TestDeletePreservesQuotaRejectionsRecordedDuringRequest(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestOverlappingDeletesPreserveLaterQuotaRejections(t *testing.T) {
+	ready := ngv1.NodeGroupStatus{Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReady, "Synced", "")}}
+	first := ownedNodeGroup("default-delete-first", "XS", ready)
+	second := ownedNodeGroup("default-delete-second", "XS", ready)
+	var provider *nodegroup.Provider
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(first, second).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if obj.GetName() == first.Name {
+					// While the first request is in flight, another DELETE
+					// completes and clears every existing quota rejection.
+					// A later refusal must outlive the first request too:
+					// emptying the map must never reset its sequence numbers.
+					if err := provider.Delete(ctx, second); err != nil {
+						return fmt.Errorf("overlapping DELETE: %w", err)
+					}
+					if provider.Unavailable("XS") {
+						t.Error("the second DELETE did not clear the existing rejection")
+					}
+					provider.RecordLateRefusal(testNodeClaim("default-later"), ownedNodeGroup("default-later", "S", quotaRejectedStatus()))
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).Build()
+	provider = nodegroup.NewProvider(kubeClient, &fakeRecorder{}, catalogue, clocktesting.NewFakeClock(time.Now()))
+	provider.RecordLateRefusal(testNodeClaim("default-earlier"), ownedNodeGroup("default-earlier", "XS", quotaRejectedStatus()))
+	if err := provider.Delete(context.Background(), first); err != nil {
+		t.Fatalf("first DELETE: %v", err)
+	}
+	for flavor, want := range map[string]bool{"2XS": false, "XS": false, "S": true, "M": true, "XL": true} {
+		if got := provider.Unavailable(flavor); got != want {
+			t.Errorf("Unavailable(%s) = %v, want %v after overlapping DELETEs", flavor, got, want)
+		}
+	}
+}
+
+func TestSuccessiveDeletesClearSuccessiveQuotaRejections(t *testing.T) {
+	ready := ngv1.NodeGroupStatus{Conditions: []ngv1.NodeGroupCondition{condTrue(ngv1.ConditionTypeReady, "Synced", "")}}
+	first := ownedNodeGroup("default-delete-first", "XS", ready)
+	second := ownedNodeGroup("default-delete-second", "XS", ready)
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(first, second).Build()
+	provider := nodegroup.NewProvider(kubeClient, &fakeRecorder{}, catalogue, clocktesting.NewFakeClock(time.Now()))
+	for cycle, ng := range []*ngv1.NodeGroup{first, second} {
+		provider.RecordLateRefusal(testNodeClaim("default-quota"), ownedNodeGroup("default-quota", "XS", quotaRejectedStatus()))
+		if !provider.Unavailable("XS") {
+			t.Fatalf("cycle %d: XS available immediately after its rejection", cycle+1)
+		}
+		if err := provider.Delete(context.Background(), ng); err != nil {
+			t.Fatalf("cycle %d: DELETE: %v", cycle+1, err)
+		}
+		for _, flavor := range []string{"XS", "S", "M", "XL"} {
+			if provider.Unavailable(flavor) {
+				t.Errorf("cycle %d: %s still unavailable after accepted DELETE", cycle+1, flavor)
+			}
+		}
 	}
 }
 
