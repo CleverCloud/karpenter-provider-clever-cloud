@@ -95,6 +95,10 @@ type framework struct {
 	recheckAfter time.Duration
 	artifacts    string
 	logPath      string
+	// The local controller has no pod host. An explicit E2E_NODE_NAME opts
+	// into the same disk reference that the chart supplies automatically.
+	referenceNodeName string
+	referenceNode     *corev1.Node // preflight snapshot, before any test workload
 
 	// ctrl is the controller subprocess, set by startController. A pointer:
 	// withT copies the framework, and every copy must see the same process.
@@ -140,12 +144,13 @@ func newFramework(t *testing.T) *framework {
 	runID := hex.EncodeToString(buf)
 
 	f := &framework{
-		t:            t,
-		runID:        runID,
-		prefix:       "e2e-" + runID,
-		namespace:    "e2e-" + runID,
-		recheckAfter: 2 * time.Minute,
-		artifacts:    envString("E2E_ARTIFACTS", filepath.Join(os.TempDir(), "karpenter-e2e")),
+		t:                 t,
+		runID:             runID,
+		prefix:            "e2e-" + runID,
+		namespace:         "e2e-" + runID,
+		recheckAfter:      2 * time.Minute,
+		artifacts:         envString("E2E_ARTIFACTS", filepath.Join(os.TempDir(), "karpenter-e2e")),
+		referenceNodeName: os.Getenv("E2E_NODE_NAME"),
 	}
 	if v := os.Getenv("E2E_CLEANUP_RECHECK"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -378,6 +383,16 @@ func listensOn(pid, port int) (bool, error) {
 // dedicated CKE test cluster, and reports pre-existing suite leftovers.
 func (f *framework) checkCluster(ctx context.Context) {
 	f.t.Helper()
+	if f.referenceNodeName != "" {
+		var err error
+		f.referenceNode, err = loadDiskReference(ctx, f.client, f.referenceNodeName)
+		if err != nil {
+			f.t.Fatalf("E2E_NODE_NAME=%q is not a usable disk reference: %v", f.referenceNodeName, err)
+		}
+		capacity := f.referenceNode.Status.Capacity[corev1.ResourceEphemeralStorage]
+		allocatable := f.referenceNode.Status.Allocatable[corev1.ResourceEphemeralStorage]
+		f.t.Logf("disk reference node %s: capacity %s, allocatable %s", f.referenceNode.Name, capacity.String(), allocatable.String())
+	}
 	if err := f.client.List(ctx, &ngv1.NodeGroupList{}, client.Limit(1)); err != nil {
 		f.t.Fatalf("cluster does not serve nodegroups.api.clever-cloud.com — not a CKE cluster? %v", err)
 	}
@@ -393,6 +408,34 @@ func (f *framework) checkCluster(ctx context.Context) {
 			f.t.Logf("WARNING: pre-existing managed nodegroup %s — quota headroom for this run is reduced", ng.Name)
 		}
 	}
+}
+
+// A reference typo or unhealthy test cluster must fail before CRDs and billed
+// workloads are created. Unlike the production controller, this preflight also
+// requires Ready: a live test needs a healthy baseline, not only valid numbers.
+func loadDiskReference(ctx context.Context, kubeClient client.Client, name string) (*corev1.Node, error) {
+	node := &corev1.Node{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: name}, node); err != nil {
+		return nil, err
+	}
+	if !node.DeletionTimestamp.IsZero() {
+		return nil, fmt.Errorf("node is terminating")
+	}
+	ready := false
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+			ready = true
+		}
+	}
+	if !ready {
+		return nil, fmt.Errorf("node is not Ready")
+	}
+	capacity := node.Status.Capacity[corev1.ResourceEphemeralStorage]
+	allocatable := node.Status.Allocatable[corev1.ResourceEphemeralStorage]
+	if capacity.Sign() <= 0 || allocatable.Sign() <= 0 || allocatable.Cmp(capacity) > 0 {
+		return nil, fmt.Errorf("ephemeral-storage must satisfy 0 < allocatable <= capacity, got allocatable %s and capacity %s", allocatable.String(), capacity.String())
+	}
+	return node, nil
 }
 
 // applyCRDs server-side-applies every CRD under deploy/crds. The suite owns
@@ -477,6 +520,9 @@ func (f *framework) startController(ctx context.Context) (context.Context, func(
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	cmd.Env = append(os.Environ(),
 		"KUBECONFIG="+f.kubeconfigPath,
+		// Explicitly clear an inherited NODE_NAME when E2E_NODE_NAME is not
+		// supplied: the local runner's host may belong to another cluster.
+		"NODE_NAME="+f.referenceNodeName,
 		"DISABLE_LEADER_ELECTION=true",
 		"LOG_LEVEL=debug",
 		fmt.Sprintf("METRICS_PORT=%d", f.metricsPort),

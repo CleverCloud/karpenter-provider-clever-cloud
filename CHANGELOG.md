@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### ✨ Added
+
+- **`feat(instancetype)`: learn new-worker ephemeral storage from the controller's node** — the chart supplies the host name through the Downward API. Its reported disk capacity and allocatable replace the static disk profile for all flavors, following increases and decreases without rebuilding the provider. Provisioning waits for a valid reference, and older workers cannot constrain the new-launch profile. CPU/RAM sizing, remote PVCs and existing disks remain independent. Each NodeGroup stores its launch disk profile so an interrupted launch can be adopted after a reference change without claiming the new disk size or recreating a disappeared group. The host must represent future workers; a platform change affecting only new workers cannot be discovered from an unchanged host. Local runs without `NODE_NAME` retain the measured static fallback. Three metrics expose reference readiness and the last valid disk profile.
+
 ## 0.14.0 - 2026-10-14
 
 Blocked deletions become visible, failed deletes keep the quota backoff, and the catalogue follows CKE's expanded worker disk. During a cluster upgrade, Kubernetes can accept a NodeGroup DELETE while the platform leaves its finalizer in place: the provider now reports that wait even when the NodeClaim is already gone or the group's last condition still says `Ready`. A failed DELETE no longer reopens quota-rejected flavors, and a successful one cannot erase a rejection recorded while it was in flight. Newly created workers expose about 98Gi of ephemeral storage, so the catalogue now admits workloads that the former 39Gi sizing could never provision, while existing workers keep their actual smaller capacity. Built on karpenter-core 1.14.1 and Go 1.26.9, with the complete end-to-end suite validated on a live CKE 1.36.3 cluster. The controller continues to use only the cluster's Kubernetes API.

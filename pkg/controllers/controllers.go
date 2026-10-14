@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/karpenter/pkg/events"
 
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/ephemeralstorage"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/garbagecollection"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/instancetypecapacity"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodeclass"
@@ -35,12 +36,16 @@ import (
 // NewControllers wires the Clever Cloud controllers. uncached reads straight
 // from the API server (the GC and the nodegroup status watch confirm
 // destructive decisions with it).
-func NewControllers(kubeClient client.Client, uncached client.Reader, recorder events.Recorder, nodeGroupProvider *nodegroup.Provider, instanceTypeProvider *instancetype.Provider) []controller.Controller {
-	return []controller.Controller{
+func NewControllers(kubeClient client.Client, uncached client.Reader, recorder events.Recorder, nodeGroupProvider *nodegroup.Provider, instanceTypeProvider *instancetype.Provider, nodeName string) []controller.Controller {
+	controllers := []controller.Controller{
 		providerid.NewController(kubeClient, uncached),
 		garbagecollection.NewController(kubeClient, uncached, nodeGroupProvider, recorder),
 		nodegroupstatus.NewController(kubeClient, uncached, nodeGroupProvider, recorder),
 		nodeclass.NewController(kubeClient, recorder),
 		instancetypecapacity.NewController(kubeClient, instanceTypeProvider),
 	}
+	if nodeName != "" {
+		controllers = append(controllers, ephemeralstorage.NewController(uncached, instanceTypeProvider, nodeName))
+	}
+	return controllers
 }

@@ -96,8 +96,9 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// group — spec.flavor is immutable and, on a managed group, written by
 	// this provider. Only this provider's groups count: nodes of a fixed
 	// nodegroup, the control plane or anything else never enter the
-	// catalogue, whatever their labels claim. The figures themselves are
-	// bounded by RecordObservedCapacity, since the kubelet of a managed node
+	// CPU/memory catalogue, whatever their labels claim. The dedicated
+	// ephemeralstorage controller may trust its named host for disk only.
+	// Other figures are bounded by RecordObservedCapacity, since a managed kubelet
 	// can still lie about them.
 	flavor := node.Labels[v1alpha1.FlavorLabelKey]
 	ng := &ngv1.NodeGroup{}

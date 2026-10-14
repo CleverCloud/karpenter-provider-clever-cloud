@@ -57,6 +57,7 @@ import (
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/ephemeralstorage"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodeclass"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodegroupstatus"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/providerid"
@@ -69,6 +70,9 @@ var (
 	// apiReader reads straight from the apiserver, for read-modify-write
 	// cycles the manager's cache may not have caught up with.
 	apiReader client.Reader
+	// Dedicated to the host-disk watch test; the existing NodeGroup tests
+	// retain their independent provider and static sizing behavior.
+	hostStorageProvider *instancetype.Provider
 )
 
 // noopRecorder discards events: the unit tests assert on them.
@@ -137,6 +141,11 @@ func TestMain(m *testing.M) {
 	nodeGroupProvider := nodegroup.NewProvider(mgr.GetClient(), discardRecorder{}, instancetype.NewProvider("par", nil, nil), clock.RealClock{})
 	if err := nodegroupstatus.NewController(mgr.GetClient(), mgr.GetAPIReader(), nodeGroupProvider, discardRecorder{}).Register(ctx, mgr); err != nil {
 		fmt.Printf("registering nodegroup status controller: %v\n", err)
+		os.Exit(1)
+	}
+	hostStorageProvider = instancetype.NewProvider("par", nil, nil)
+	if err := ephemeralstorage.NewController(mgr.GetAPIReader(), hostStorageProvider, hostStorageNodeName).Register(ctx, mgr); err != nil {
+		fmt.Printf("registering host ephemeral storage controller: %v\n", err)
 		os.Exit(1)
 	}
 	go func() {

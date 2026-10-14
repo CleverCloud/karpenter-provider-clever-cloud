@@ -23,8 +23,10 @@ limitations under the License.
 // after the platform enlarged every new worker's disk; old workers keep theirs.
 // The kernel-visible memory moves with the platform's node image, so nodes of this
 // provider's NodeGroups keep correcting it at runtime, within bounds
-// (RecordObservedCapacity). Offering prices are not a currency: they are a
-// unitless cost relative to the smallest flavor, derived from each flavor's cpu
+// (RecordObservedCapacity). When a representative node is configured, its
+// ephemeral-storage capacity and allocatable replace the static disk profile
+// for every flavor (SetEphemeralStorageReference). Offering prices are not a
+// currency: they are a unitless cost relative to the smallest flavor, derived from each flavor's cpu
 // and memory (RelativePrice). The served catalogue is this static seed with the
 // operator's settings.flavors overrides on top: nothing is fetched from a
 // Clever Cloud endpoint at runtime.
@@ -240,6 +242,14 @@ type observedCapacity struct {
 	allocatable corev1.ResourceList
 }
 
+// ephemeralStorageProfile describes the disk available to new workers. It is
+// kept separately from per-flavor observations: old workers can retain a disk
+// smaller or larger than what the platform currently provisions.
+type ephemeralStorageProfile struct {
+	capacity    resource.Quantity
+	allocatable resource.Quantity
+}
+
 // Provider builds Karpenter instance types from a flavor catalog computed by
 // overlaying per-flavor overrides on top of the built-in seed.
 type Provider struct {
@@ -247,20 +257,24 @@ type Provider struct {
 	// topology.kubernetes.io/zone: CKE is single-zone, so the region is its
 	// only topology domain.
 	region string
-	// flavors is computed once by NewProvider and never written afterwards,
-	// so List and Get read it without locking.
+	// flavors is computed once by NewProvider and never written afterwards.
+	// Reading the static sizing itself requires no locking.
 	flavors []Flavor
 
-	// mu guards observed, the only state that changes at runtime: per
-	// flavor, the smallest figures its nodes reported (RecordObservedCapacity).
-	mu       sync.RWMutex
-	observed map[string]observedCapacity
+	// mu guards observations and the disk reference as one snapshot. A
+	// reference update must never race with recording an old worker's disk.
+	mu                        sync.RWMutex
+	observed                  map[string]observedCapacity
+	ephemeralStorageRequired  bool
+	ephemeralStorageReady     bool
+	ephemeralStorageReference *ephemeralStorageProfile
 }
 
 // NewProvider builds a Provider for the given region: the overrides are
 // overlaid on base (the built-in DefaultFlavors when empty, which is what the
-// controller passes) and the resulting catalog is fixed for the Provider's
-// lifetime. An override that cannot be constructed is logged and skipped.
+// controller passes). This sizing and its prices remain fixed for the Provider's
+// lifetime; observations and the optional disk reference refine capacity only.
+// An override that cannot be constructed is logged and skipped.
 func NewProvider(region string, base []Flavor, overrides []FlavorOverride) *Provider {
 	if len(base) == 0 {
 		base = DefaultFlavors
@@ -276,6 +290,82 @@ func NewProvider(region string, base []Flavor, overrides []FlavorOverride) *Prov
 		flavors:  flavors,
 		observed: map[string]observedCapacity{},
 	}
+}
+
+// RequireEphemeralStorageReference enables dynamic disk sizing. Call it before
+// starting provisioning: EphemeralStorageReady remains false until a valid
+// reference arrives. Repeated calls preserve an already established reference.
+// Without this opt-in the measured static profiles retain their usual behavior.
+func (p *Provider) RequireEphemeralStorageReference() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ephemeralStorageRequired {
+		return
+	}
+	p.ephemeralStorageRequired = true
+	// Observations can predate the opt-in in embedded callers. Their old
+	// disk minima must not constrain a later, larger reference.
+	for _, obs := range p.observed {
+		delete(obs.capacity, corev1.ResourceEphemeralStorage)
+		delete(obs.allocatable, corev1.ResourceEphemeralStorage)
+	}
+}
+
+// EphemeralStorageReady reports whether provisioning has a usable disk profile.
+// Static mode is always ready. The caller gates new launches with this method;
+// Get/List keep describing instance types during a reference outage.
+func (p *Provider) EphemeralStorageReady() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return !p.ephemeralStorageRequired || p.ephemeralStorageReady
+}
+
+// InvalidateEphemeralStorageReference suspends new provisioning without losing
+// the last valid profile used to describe existing instances. A subsequent Set
+// restores readiness, including when its values equal the previous reference.
+func (p *Provider) InvalidateEphemeralStorageReference() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ephemeralStorageReady = false
+}
+
+// SetEphemeralStorageReference replaces the disk profile for every flavor.
+// The caller explicitly vouches for the source node as representative of new
+// workers; ordinary node observations never enter this path. Consequently a
+// reference may increase or decrease beyond the static observation tolerance.
+// Both quantities must be positive whole bytes representable by an int64, with
+// allocatable no greater than capacity. Invalid input preserves the last profile
+// and readiness; the caller can invalidate it if the source is no longer usable.
+// changed includes becoming ready again after an invalidation.
+func (p *Provider) SetEphemeralStorageReference(capacity, allocatable resource.Quantity) (changed bool, err error) {
+	capacity, allocatable = capacity.DeepCopy(), allocatable.DeepCopy()
+	for _, field := range []struct {
+		name     string
+		quantity resource.Quantity
+	}{{"capacity", capacity}, {"allocatable", allocatable}} {
+		bytes := field.quantity.Value()
+		if bytes <= 0 || field.quantity.Cmp(*resource.NewQuantity(bytes, resource.DecimalSI)) != 0 {
+			return false, fmt.Errorf("ephemeral-storage %s must be positive whole bytes representable by int64, got %s", field.name, field.quantity.String())
+		}
+	}
+	if allocatable.Cmp(capacity) > 0 {
+		return false, fmt.Errorf("ephemeral-storage allocatable %s exceeds capacity %s", allocatable.String(), capacity.String())
+	}
+	// Normalize to whole-byte, int64-backed quantities. Besides detaching
+	// the source's decimal representation, this keeps resource arithmetic
+	// from sharing a mutable decimal pointer across capacity and overhead.
+	capacity = *resource.NewQuantity(capacity.Value(), resource.BinarySI)
+	allocatable = *resource.NewQuantity(allocatable.Value(), resource.BinarySI)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.ephemeralStorageRequired {
+		return false, fmt.Errorf("ephemeral-storage reference is not enabled")
+	}
+	previous := p.ephemeralStorageReference
+	changed = !p.ephemeralStorageReady || previous == nil || previous.capacity.Cmp(capacity) != 0 || previous.allocatable.Cmp(allocatable) != 0
+	p.ephemeralStorageReference = &ephemeralStorageProfile{capacity: capacity, allocatable: allocatable}
+	p.ephemeralStorageReady = true
+	return changed, nil
 }
 
 // LoadFlavorsFromFile reads and validates per-flavor overrides from a YAML file
@@ -474,6 +564,8 @@ var ErrImplausibleCapacity = errors.New("implausible observed capacity")
 // profile, then omitted from observations so an old worker cannot cap new
 // launches at its obsolete disk size. Its other resources still contribute
 // to the minimum; scheduling onto existing nodes uses their actual status.
+// In dynamic disk mode every ordinary node's disk is omitted, whatever its
+// size: only the explicitly configured reference describes future launches.
 //
 // A flavor with no catalogue entry and no sizing seed (an override-only
 // flavor whose override was removed while its nodes still run) has nothing to
@@ -488,6 +580,18 @@ func (p *Provider) RecordObservedCapacity(flavor string, capacity, allocatable c
 		return 0, nil
 	}
 	observed := observedCapacity{capacity: filterGeneralizable(capacity), allocatable: filterGeneralizable(allocatable)}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ephemeralStorageRequired {
+		// Check basic report consistency before ignoring the disk. Workers
+		// from any earlier image may report a completely different disk,
+		// while their CPU/RAM observations remain useful and bounded.
+		if err := checkConsistent(observed); err != nil {
+			return 0, fmt.Errorf("%w for flavor %q: %v", ErrImplausibleCapacity, flavor, err)
+		}
+		delete(observed.capacity, corev1.ResourceEphemeralStorage)
+		delete(observed.allocatable, corev1.ResourceEphemeralStorage)
+	}
 	if ref, ok := p.reference(flavor); ok {
 		legacyDisk := math.Abs(deviation(observed.capacity[corev1.ResourceEphemeralStorage], legacyEphemeralStorage)) <= observedTolerance
 		if legacyDisk {
@@ -505,8 +609,6 @@ func (p *Provider) RecordObservedCapacity(flavor string, capacity, allocatable c
 	} else if err := checkConsistent(observed); err != nil {
 		return 0, fmt.Errorf("%w for flavor %q: %v", ErrImplausibleCapacity, flavor, err)
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	prev := p.observed[flavor]
 	p.observed[flavor] = observedCapacity{
 		capacity:    minMerge(prev.capacity, observed.capacity),
@@ -626,9 +728,13 @@ func minMerge(prev, next corev1.ResourceList) corev1.ResourceList {
 // objects (lazy allocatable computation), so fresh objects are built on every
 // call.
 func (p *Provider) List() []*cloudprovider.InstanceType {
+	// A reference update applies to the catalogue as one snapshot, never
+	// to only the flavors constructed after that update.
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	its := make([]*cloudprovider.InstanceType, 0, len(p.flavors))
 	for _, f := range p.flavors {
-		its = append(its, p.newInstanceType(f))
+		its = append(its, p.newInstanceTypeLocked(f))
 	}
 	return its
 }
@@ -709,6 +815,14 @@ func staticCapacity(f Flavor) (corev1.ResourceList, *cloudprovider.InstanceTypeO
 }
 
 func (p *Provider) newInstanceType(f Flavor) *cloudprovider.InstanceType {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.newInstanceTypeLocked(f)
+}
+
+// newInstanceTypeLocked requires mu's read or write lock. Every returned disk
+// quantity is owned by the returned instance type, not by the shared reference.
+func (p *Provider) newInstanceTypeLocked(f Flavor) *cloudprovider.InstanceType {
 	// Both topology labels are declared here, in the requirements AND in the
 	// offering. The platform puts neither on its nodes and karpenter-core
 	// never turns a well-known requirement into a label itself, so the
@@ -735,7 +849,6 @@ func (p *Provider) newInstanceType(f Flavor) *cloudprovider.InstanceType {
 		scheduling.NewRequirement(v1alpha1.InstanceMemoryLabelKey, corev1.NodeSelectorOpIn, fmt.Sprint(f.MemoryKi)),
 	)
 	capacity, overhead := staticCapacity(f)
-	p.mu.RLock()
 	if obs, ok := p.observed[f.Name]; ok {
 		// A missing resource keeps both its capacity AND its allocatable
 		// fallback. In particular, ignoring a legacy disk must not discard
@@ -746,7 +859,14 @@ func (p *Provider) newInstanceType(f Flavor) *cloudprovider.InstanceType {
 			KubeReserved: resources.Subtract(capacity, allocatable),
 		}
 	}
-	p.mu.RUnlock()
+	if reference := p.ephemeralStorageReference; reference != nil {
+		allocatable := resources.Subtract(capacity, overhead.Total())
+		capacity[corev1.ResourceEphemeralStorage] = reference.capacity.DeepCopy()
+		allocatable[corev1.ResourceEphemeralStorage] = reference.allocatable.DeepCopy()
+		overhead = &cloudprovider.InstanceTypeOverhead{
+			KubeReserved: resources.Subtract(capacity, allocatable),
+		}
+	}
 	return &cloudprovider.InstanceType{
 		Name:         f.Name,
 		Requirements: requirements,

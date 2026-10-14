@@ -124,10 +124,29 @@ func TestE2E(t *testing.T) {
 // testProvision covers the core promise: a pending pod becomes a running pod
 // on a dedicated, correctly-labeled nodeCount:1 NodeGroup, with the claim
 // registered, the node carrying the stamped provider ID, and its capacity
-// matching the built-in catalogue the pods were packed against. Its launches
+// matching the catalogue the pods were packed against (the host reference for
+// disk when E2E_NODE_NAME is supplied, the built-in seed otherwise). Its launches
 // are healthy ones, so none may end in an acceptance timeout: the operator
 // acknowledges a group about 1 s after its creation, and Create returns there.
 func testProvision(t *testing.T, ctx context.Context, f *framework) {
+	if f.referenceNode != nil {
+		capacity := f.referenceNode.Status.Capacity[corev1.ResourceEphemeralStorage]
+		allocatable := f.referenceNode.Status.Allocatable[corev1.ResourceEphemeralStorage]
+		f.eventually(ctx, 2*time.Minute, "controller has adopted the reference disk before provisioning", func(context.Context) (bool, string) {
+			for suffix, want := range map[string]float64{
+				"ready":             1,
+				"capacity_bytes":    float64(capacity.Value()),
+				"allocatable_bytes": float64(allocatable.Value()),
+			} {
+				name := "karpenter_clevercloud_instancetype_host_ephemeral_storage_" + suffix
+				got, found, err := f.scrapeMetric(name)
+				if err != nil || !found || got != want {
+					return false, fmt.Sprintf("%s = %v, want %v (found=%v, err=%v)", name, got, want, found, err)
+				}
+			}
+			return true, ""
+		})
+	}
 	poolName := f.prefix + "-main"
 	if err := f.client.Create(ctx, f.nodeClass(poolName, nil)); err != nil {
 		t.Fatalf("creating nodeclass: %v", err)
@@ -153,12 +172,18 @@ func testProvision(t *testing.T, ctx context.Context, f *framework) {
 		t.Fatalf("scraping acceptance_timeouts_total before the launches: found=%v, err=%v", found, err)
 	}
 	deployment := f.deployment("inflate", 2, "1", "1500Mi", false)
-	// A new worker has about 88Gi allocatable after the platform's disk
-	// expansion. This request cannot fit the old ~35Gi catalogue. On a
-	// cluster with no pre-existing managed nodes, it exercises scheduling
-	// before any node can teach the provider its capacity. Requests reserve
-	// scheduling capacity without writing data.
-	deployment.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("50Gi")
+	// Use more than half the reference disk so two replicas need two nodes,
+	// including after a future platform increase or decrease. Without a
+	// reference, retain the 50Gi regression case for the built-in ~88Gi
+	// allocatable seed (the former ~35Gi seed cannot place it). Requests
+	// reserve scheduling capacity without writing data.
+	diskRequest := resource.MustParse("50Gi")
+	if f.referenceNode != nil {
+		allocatable := f.referenceNode.Status.Allocatable[corev1.ResourceEphemeralStorage]
+		diskRequest = *resource.NewQuantity(allocatable.Value()/5*3, resource.BinarySI)
+	}
+	deployment.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceEphemeralStorage] = diskRequest
+	t.Logf("each provision pod requests %s ephemeral storage", diskRequest.String())
 	if err := f.client.Create(ctx, deployment); err != nil {
 		t.Fatalf("creating deployment: %v", err)
 	}
@@ -209,7 +234,7 @@ func testProvision(t *testing.T, ctx context.Context, f *framework) {
 		if want := nodegroup.ProviderID(claim.Name); node.Spec.ProviderID != want {
 			t.Errorf("node %s providerID = %q, want %q", node.Name, node.Spec.ProviderID, want)
 		}
-		checkSeedCapacity(t, node, ng.Spec.Flavor)
+		checkProvisionedCapacity(t, node, ng.Spec.Flavor, f.referenceNode)
 	}
 	// Every node of a managed group the controller watches — in a dedicated
 	// test cluster, the suite's own — is a genuine VM: the capacity
@@ -239,13 +264,14 @@ func testProvision(t *testing.T, ctx context.Context, f *framework) {
 	}
 }
 
-// checkSeedCapacity compares a live node with the built-in catalogue, which
-// is what karpenter packs pods against until a node of the flavor reports.
+// checkProvisionedCapacity compares a live node with the catalogue used for
+// scheduling: CPU/memory use the built-in seed, disk uses the supplied host
+// reference or falls back to the built-in seed.
 // The memory the kernel exposes moves with Clever Cloud's node image (the
 // seed was 4.4-5.0% above it before being re-measured): past 1% this fails,
 // so the next image change is caught here rather than by pods that do not
 // fit the node launched for them.
-func checkSeedCapacity(t *testing.T, node *corev1.Node, flavor string) {
+func checkProvisionedCapacity(t *testing.T, node *corev1.Node, flavor string, reference *corev1.Node) {
 	t.Helper()
 	seed, ok := instancetype.SizingByName[flavor]
 	if !ok {
@@ -266,20 +292,26 @@ func checkSeedCapacity(t *testing.T, node *corev1.Node, flavor string) {
 	if err != nil {
 		t.Fatalf("getting catalogue entry for %s: %v", flavor, err)
 	}
+	diskCapacity, diskAllocatable := instanceType.Capacity, instanceType.Allocatable()
+	referenceDescription := "built-in catalogue"
+	if reference != nil {
+		diskCapacity, diskAllocatable = reference.Status.Capacity, reference.Status.Allocatable
+		referenceDescription = "reference node " + reference.Name
+	}
 	for _, pair := range []struct {
 		name      string
 		got, want corev1.ResourceList
 	}{
-		{"capacity", node.Status.Capacity, instanceType.Capacity},
-		{"allocatable", node.Status.Allocatable, instanceType.Allocatable()},
+		{"capacity", node.Status.Capacity, diskCapacity},
+		{"allocatable", node.Status.Allocatable, diskAllocatable},
 	} {
 		got, want := pair.got[corev1.ResourceEphemeralStorage], pair.want[corev1.ResourceEphemeralStorage]
 		if deviation := float64(got.Value())/float64(want.Value()) - 1; math.Abs(deviation) > 0.01 {
-			t.Errorf("node %s (%s): %s ephemeral-storage %s, catalogue %s (%+.1f%%): re-measure the disk capacity and eviction reserve",
-				node.Name, flavor, pair.name, got.String(), want.String(), deviation*100)
+			t.Errorf("node %s (%s): %s ephemeral-storage %s, %s says %s (%+.1f%%): the reference does not describe newly provisioned workers",
+				node.Name, flavor, pair.name, got.String(), referenceDescription, want.String(), deviation*100)
 		} else {
-			t.Logf("node %s (%s): %s ephemeral-storage %s, catalogue %s (%+.2f%%)",
-				node.Name, flavor, pair.name, got.String(), want.String(), deviation*100)
+			t.Logf("node %s (%s): %s ephemeral-storage %s, %s says %s (%+.2f%%)",
+				node.Name, flavor, pair.name, got.String(), referenceDescription, want.String(), deviation*100)
 		}
 	}
 }

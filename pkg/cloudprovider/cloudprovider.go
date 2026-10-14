@@ -81,13 +81,18 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	// (see resolveLaunch): instanceType is the flavor resolved there, the one
 	// the NodeGroup is created with.
 	var instanceType *cloudprovider.InstanceType
-	ng, err := c.nodeGroupProvider.ResolveAndCreate(ctx, nodeClaim, func(ctx context.Context) (*v1alpha1.CleverNodeClass, string, error) {
-		nodeClass, resolved, err := c.resolveLaunch(ctx, nodeClaim)
+	ng, err := c.nodeGroupProvider.ResolveAndCreate(ctx, nodeClaim, func(ctx context.Context) (*nodegroup.Launch, error) {
+		existing, err := c.existingDiskLaunch(ctx, nodeClaim)
 		if err != nil {
-			return nil, "", err
+			return nil, err
+		}
+		nodeClass, resolved, err := c.resolveLaunch(ctx, nodeClaim, existing)
+		if err != nil {
+			return nil, err
 		}
 		instanceType = resolved
-		return nodeClass, resolved.Name, nil
+		return &nodegroup.Launch{NodeClass: nodeClass, Flavor: resolved.Name,
+			Annotations: diskSnapshotAnnotations(resolved), Existing: existing, ExistingReader: c.apiReader}, nil
 	})
 	if err != nil {
 		quotaErr := &nodegroup.ErrQuotaExceeded{}
@@ -121,8 +126,11 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 			return nil, err
 		}
 	}
+	if _, err := readDiskSnapshot(ng); err != nil {
+		return nil, err
+	}
 	log.FromContext(ctx).WithValues("NodeGroup", ng.Name, "flavor", ng.Spec.Flavor).Info("created nodegroup")
-	return c.buildNodeClaim(ng, instanceType), nil
+	return c.buildNodeClaim(ctx, ng, instanceType), nil
 }
 
 func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
@@ -179,7 +187,7 @@ func (c *CloudProvider) Get(ctx context.Context, providerID string) (*karpv1.Nod
 	if err != nil {
 		return nil, err
 	}
-	return c.buildNodeClaim(ng, instanceType), nil
+	return c.buildNodeClaim(ctx, ng, instanceType), nil
 }
 
 func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
@@ -193,7 +201,7 @@ func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
 		if err != nil {
 			return nil, err
 		}
-		nodeClaims = append(nodeClaims, c.buildNodeClaim(&nodeGroups[i], instanceType))
+		nodeClaims = append(nodeClaims, c.buildNodeClaim(ctx, &nodeGroups[i], instanceType))
 	}
 	return nodeClaims, nil
 }
@@ -231,7 +239,12 @@ func (c *CloudProvider) resolveNodeGroupInstanceType(ctx context.Context, ng *ng
 	return c.instanceTypeProvider.Synthesize(ng.Spec.Flavor), nil
 }
 
+var errEphemeralStorageNotReady = errors.New("waiting for valid ephemeral storage capacity from the controller's node")
+
 func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
+	if !c.instanceTypeProvider.EphemeralStorageReady() {
+		return nil, errEphemeralStorageNotReady
+	}
 	return c.instanceTypes(), nil
 }
 
@@ -335,7 +348,7 @@ func (c *CloudProvider) GetSupportedNodeClasses() []status.Object {
 // The NodeClaim and the NodeClass are read from the API server, not the
 // informer cache: they are the last word before a billed machine and an
 // upstream quota reservation, and one GET each is nothing next to a launch.
-func (c *CloudProvider) resolveLaunch(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*v1alpha1.CleverNodeClass, *cloudprovider.InstanceType, error) {
+func (c *CloudProvider) resolveLaunch(ctx context.Context, nodeClaim *karpv1.NodeClaim, existing *ngv1.NodeGroup) (*v1alpha1.CleverNodeClass, *cloudprovider.InstanceType, error) {
 	if err := c.checkNodeClaimWanted(ctx, nodeClaim); err != nil {
 		return nil, nil, err
 	}
@@ -358,8 +371,18 @@ func (c *CloudProvider) resolveLaunch(ctx context.Context, nodeClaim *karpv1.Nod
 	if !nodeClass.DeletionTimestamp.IsZero() {
 		return nil, nil, cloudprovider.NewNodeClassNotReadyError(fmt.Errorf("nodeclass %s is terminating", nodeClass.Name))
 	}
+	if existing != nil {
+		// This group's disk was chosen on an earlier attempt. Re-evaluating
+		// it against the current new-worker profile could reject a sufficient
+		// older disk or promise a larger one than the existing VM received.
+		instanceType, err := c.resolveNodeGroupInstanceType(ctx, existing)
+		return nodeClass, instanceType, err
+	}
 	instanceType, err := c.resolveInstanceType(nodeClaim)
 	if err != nil {
+		if errors.Is(err, errEphemeralStorageNotReady) {
+			return nil, nil, err // retry the existing claim when the reference recovers
+		}
 		return nil, nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("resolving instance type, %w", err))
 	}
 	return nodeClass, instanceType, nil
@@ -409,6 +432,11 @@ func (c *CloudProvider) resolveNodeClassFromNodeClaim(ctx context.Context, nodeC
 // waited for the creation lock (see resolveLaunch) — falls to the next one, or
 // fails fast with none.
 func (c *CloudProvider) resolveInstanceType(nodeClaim *karpv1.NodeClaim) (*cloudprovider.InstanceType, error) {
+	// Recheck under the NodeGroup creation lock: a claim can have been planned
+	// before the reference disappeared or while its disk was still larger.
+	if !c.instanceTypeProvider.EphemeralStorageReady() {
+		return nil, errEphemeralStorageNotReady
+	}
 	requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
 	var best *cloudprovider.InstanceType
 	bestPrice := 0.0
@@ -453,7 +481,7 @@ func (c *CloudProvider) resolveInstanceType(nodeClaim *karpv1.NodeClaim) (*cloud
 // copies them onto the node at registration, which is the only way the
 // well-known ones (topology.kubernetes.io/region and /zone above all, which
 // the platform never sets) reach a Clever Cloud node.
-func (c *CloudProvider) buildNodeClaim(ng *ngv1.NodeGroup, instanceType *cloudprovider.InstanceType) *karpv1.NodeClaim {
+func (c *CloudProvider) buildNodeClaim(ctx context.Context, ng *ngv1.NodeGroup, instanceType *cloudprovider.InstanceType) *karpv1.NodeClaim {
 	labels := map[string]string{}
 	for key, req := range instanceType.Requirements {
 		if req.Len() == 1 {
@@ -473,7 +501,7 @@ func (c *CloudProvider) buildNodeClaim(ng *ngv1.NodeGroup, instanceType *cloudpr
 	if nodePool, ok := ng.Labels[v1alpha1.NodePoolLabelKey]; ok {
 		labels[karpv1.NodePoolLabelKey] = nodePool
 	}
-	return &karpv1.NodeClaim{
+	claim := &karpv1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              ng.Name,
 			Labels:            labels,
@@ -481,8 +509,17 @@ func (c *CloudProvider) buildNodeClaim(ng *ngv1.NodeGroup, instanceType *cloudpr
 		},
 		Status: karpv1.NodeClaimStatus{
 			ProviderID:  nodegroup.ProviderID(ng.Name),
-			Capacity:    instanceType.Capacity,
-			Allocatable: instanceType.Allocatable(),
+			Capacity:    instanceType.Capacity.DeepCopy(),
+			Allocatable: instanceType.Allocatable().DeepCopy(),
 		},
 	}
+	if snapshot, err := readDiskSnapshot(ng); err != nil {
+		// Get/List must keep serving the provider ID so corrupted metadata
+		// cannot strand termination or garbage collection. Create is strict.
+		log.FromContext(ctx).WithValues("NodeGroup", ng.Name).Error(err, "invalid nodegroup disk snapshot; describing it with the current catalogue")
+	} else if snapshot != nil {
+		claim.Status.Capacity[corev1.ResourceEphemeralStorage] = snapshot.capacity
+		claim.Status.Allocatable[corev1.ResourceEphemeralStorage] = snapshot.allocatable
+	}
+	return claim
 }

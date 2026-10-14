@@ -88,6 +88,7 @@ func main() {
 			op.EventRecorder,
 			nodeGroupProvider,
 			instanceTypeProvider,
+			env.WithDefaultString("NODE_NAME", ""),
 		)...).
 		Start(ctx)
 }

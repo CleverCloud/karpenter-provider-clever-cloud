@@ -31,6 +31,27 @@ import (
 const namespace = "karpenter_clevercloud"
 
 var (
+	// These series exist only when NODE_NAME enables the host reference.
+	// Capacity gauges retain the last valid snapshot while Ready is zero.
+	HostEphemeralStorageReady = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry, prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: "instancetype", Name: "host_ephemeral_storage_ready",
+			Help: "1 when the controller node has supplied a valid ephemeral storage reference. 0 blocks new provisioning; absent when NODE_NAME is unset.",
+		}, nil,
+	)
+	HostEphemeralStorageCapacity = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry, prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: "instancetype", Name: "host_ephemeral_storage_capacity_bytes",
+			Help: "Last valid controller-node ephemeral storage capacity used for new workers, in bytes. Consult host_ephemeral_storage_ready before using this snapshot.",
+		}, nil,
+	)
+	HostEphemeralStorageAllocatable = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry, prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: "instancetype", Name: "host_ephemeral_storage_allocatable_bytes",
+			Help: "Last valid controller-node ephemeral storage allocatable used for new workers, in bytes. Consult host_ephemeral_storage_ready before using this snapshot.",
+		}, nil,
+	)
+
 	// NodeGroupAcceptanceTimeouts counts Creates that hit the acceptance-poll
 	// timeout and proceeded optimistically: the node-group operator neither
 	// acknowledged nor refused the group within the window. A healthy
@@ -214,7 +235,7 @@ var (
 	// for the whole cluster, so a report only counts when it comes from a node
 	// whose name places it in the managed NodeGroup its labels claim, carries
 	// that NodeGroup's flavor, and fits the flavor's catalogue entry (cpu
-	// exactly, everything else within 10%).
+	// exactly, memory/pods within 10%, disk profiles only in static mode).
 	ObservedCapacityRejections = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{

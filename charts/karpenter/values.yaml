@@ -104,6 +104,14 @@ controller:
     limits:
       memory: 512Mi
   # -- Extra environment variables for the controller container.
+  # NODE_NAME is supplied by the downward API: the host node's local
+  # ephemeral-storage capacity and allocatable define the disk resources
+  # advertised for future workers.
+  # The host must represent newly provisioned workers, including their disk
+  # reserve; old hosts do not discover a platform change affecting only new
+  # nodes. Replicas must run on hosts with the same disk profile. This does
+  # not configure PVCs or resize disks. Outside the cluster, omit NODE_NAME
+  # to retain the built-in disk fallback.
   env: []
 
 settings:

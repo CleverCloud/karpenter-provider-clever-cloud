@@ -499,3 +499,62 @@ CRDs were retained.
 The full local validation also passed on the standalone changes and their
 combined tree: vet, lint, build, unit/race tests, envtest, chart lint/tests,
 vulnerability scan, and generated CRD/manifest checks without drift.
+
+
+---
+
+# Controller-node disk reference (2026-10-14)
+
+The complete suite passed on `karpenter-review`
+(`kubernetes_01M4WSYD7Q0BS4FRV9GSTCT4A2`, Kubernetes 1.36.3,
+kernel 7.2.10) with the dynamic ephemeral-storage reference enabled.
+Run `f27ee4` took place around 14:23–14:35 Europe/Paris
+(CEST, UTC+02:00), using Go 1.26.9. The production source did not change
+between the controller build and completion of the run.
+
+The controller ran outside the cluster with
+`E2E_NODE_NAME=manual-nodegroup-node0`, explicitly selecting the existing
+fixed XS worker as the reference. Chart tests separately verify injection
+of the pod's own node name through the Downward API; this run did not
+deploy a controller pod.
+
+| Scenario | Result | Duration |
+|---|---|---|
+| Provision | PASS | 61.05 s |
+| ConsolidationScaleToZero | PASS | 65.28 s |
+| Drift | PASS | 120.90 s |
+| GarbageCollection | PASS | 336.49 s |
+| QuotaFastFail | PASS | 10.95 s |
+
+`TestE2E` completed in 720.79 s including setup and cleanup. Before
+provisioning, the reference metrics reported readiness `1`, capacity
+`105087164416` bytes (`102624184Ki`) and allocatable `94578447818` bytes.
+Each of the two pending pods requested `56747068689` bytes of ephemeral
+storage, 60% of the reference's allocatable disk. Both became Running on
+freshly provisioned 2XS workers in 55 s. Their actual disk capacity and
+allocatable exactly matched the reference; the launch snapshot annotations
+on both NodeGroups contained these same values. No capacity assertion was
+disabled.
+
+The final controller metrics showed zero observed-capacity rejections,
+zero acceptance timeouts, zero overdue deletions and one expected quota
+rejection. The ownerless decoy survived the GC; the orphaned group's owner
+reference triggered Kubernetes garbage collection before the provider
+sweep. Cleanup and its two-minute recheck passed. Kubernetes then contained
+only the original manual NodeGroup and Node, with their original UIDs, and
+no NodeClaims, NodePools, CleverNodeClasses or test namespace. The local
+controller stopped and pre-existing CRDs were retained. This cleanup check
+does not independently confirm VM deletion through the platform API.
+
+No disk was resized on the platform for this run. Increases, decreases,
+invalid-reference recovery and replacement of the reference Node are
+covered by unit tests and an envtest watch against a real Kubernetes 1.37
+API server. Tests using Karpenter's scheduler verify that a remote 200Gi
+PVC, both already bound and waiting for its first consumer, is independent
+of a worker's 40Gi local disk; they do not provision a real remote volume.
+Adoption tests preserve an existing launch's disk snapshot after a reference
+change or outage and refuse to recreate a vanished or replaced NodeGroup.
+
+The full local validation passed: vet, lint, build, unit and race tests,
+envtest, chart lint/tests, e2e harness tests, generated CRD/manifest checks
+without drift, and govulncheck with no reachable vulnerabilities.

@@ -47,10 +47,11 @@ func TestNewControllersWiresEveryProviderController(t *testing.T) {
 	nodeGroupProvider := nodegroup.NewProvider(kubeClient, noopRecorder{}, instanceTypeProvider, clock.RealClock{})
 
 	got := map[string]int{}
-	for _, c := range controllers.NewControllers(kubeClient, kubeClient, noopRecorder{}, nodeGroupProvider, instanceTypeProvider) {
+	for _, c := range controllers.NewControllers(kubeClient, kubeClient, noopRecorder{}, nodeGroupProvider, instanceTypeProvider, "controller-host") {
 		got[fmt.Sprintf("%T", c)]++
 	}
 	want := map[string]int{
+		"*ephemeralstorage.Controller":     1,
 		"*garbagecollection.Controller":    1,
 		"*instancetypecapacity.Controller": 1,
 		"*nodeclass.Controller":            1,
@@ -59,5 +60,8 @@ func TestNewControllersWiresEveryProviderController(t *testing.T) {
 	}
 	if !maps.Equal(got, want) {
 		t.Errorf("NewControllers wired %v, want %v", got, want)
+	}
+	if instanceTypeProvider.EphemeralStorageReady() {
+		t.Fatal("controller wiring must require a reference before provisioning starts")
 	}
 }
