@@ -112,11 +112,11 @@ offerings**, for a limited time, and karpenter's scheduler plans around them:
   unavailable flavors fail fast without reaching Clever Cloud. Once its minute
   has passed, the rejected flavor — the cheapest probe of whether capacity
   came back — is tried again on its own, and the larger flavors only a minute
-  later, if it was not rejected again. An accepted DELETE of a NodeGroup
-  that may hold capacity ends the quota rejections recorded before that
-  request (a refusal's hold-out stays); deleting a refused group that never
-  synced does not. New or refreshed quota rejections recorded while the
-  DELETE was in flight survive its acceptance.
+  later, if it was not rejected again. An accepted NodeGroup DELETE sent by
+  this provider for a group that may hold capacity ends the quota rejections
+  recorded before that request (a refusal's hold-out stays); deleting a
+  refused group that never synced does not. New or refreshed quota rejections
+  recorded while the DELETE was in flight survive its acceptance.
   This is an optimistic opportunity to retry: Kubernetes accepting the
   DELETE does **not** confirm that the VM was destroyed or quota released,
   and the CKE finalizer may still be waiting on the platform. A failed DELETE,
@@ -139,10 +139,13 @@ a smaller flavor — one rejected NodeGroup per flavor size tried, at most six,
 within seconds. Once the smallest of them is rejected too, only it is
 retried, about once a minute, while the larger ones stay unavailable. That is
 what `nodegroup_quota_rejections_total` shows: a burst, then about one a
-minute, not a create and delete on every scheduling pass. When capacity
-comes back (a retry is accepted, or a node is deleted), the larger flavors
-reopen and a new walk down may follow. An unavailable flavor stays in the
-catalogue: unlike a [removed flavor](#flavor-removal-semantics), it never
+minute, not a create and delete on every scheduling pass. If the probe is no
+longer rejected, the larger flavors reopen after their second window; an
+accepted NodeGroup DELETE sent by this provider can reopen them earlier,
+optimistically. Capacity freed elsewhere in the organisation, or a manual
+DELETE, does not itself clear this provider's backoff. A new walk down may
+follow when the flavors reopen. An unavailable flavor stays in the catalogue:
+unlike a [removed flavor](#flavor-removal-semantics), it never
 drifts the nodes running it.
 
 ## Price units

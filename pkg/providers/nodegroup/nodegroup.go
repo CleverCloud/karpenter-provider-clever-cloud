@@ -163,6 +163,8 @@ type Provider struct {
 	// rejection of it.
 	quotaRejections map[string]quotaRejection
 	// quotaRejectionSeq is the sequence number of the last quota rejection.
+	// Never reset it, even when quotaRejections is empty: a DELETE may still
+	// be in flight with an earlier mark, which must not cover a later rejection.
 	quotaRejectionSeq uint64
 	// rejectedFlavors remembers, per flavor, the upstream operator's last
 	// refusal of it for a non-quota reason, or the API server's refusal of it
@@ -315,7 +317,7 @@ func (p *Provider) quotaFastFail(flavor string) error {
 		cause += " (" + r.message + ")"
 	}
 	remaining := max(until.Sub(p.clock.Now()).Round(time.Second), time.Second)
-	return &ErrQuotaExceeded{Flavor: flavor, Message: fmt.Sprintf("%s; it stays unavailable for another %s unless capacity is freed", cause, remaining)}
+	return &ErrQuotaExceeded{Flavor: flavor, Message: fmt.Sprintf("%s; it stays unavailable for another %s; an accepted NodeGroup DELETE sent by this provider may allow an earlier retry without confirming freed quota", cause, remaining)}
 }
 
 func (p *Provider) recordFlavorRejection(flavor string) {
@@ -699,10 +701,10 @@ func (p *Provider) publishQuotaEvent(nodeClaim *karpv1.NodeClaim, err *ErrQuotaE
 // launches, for the events that report one (see quotaRejection.coverage).
 func (p *Provider) quotaConsequence(flavor string) string {
 	if _, sized := p.sizing(flavor); !sized {
-		return fmt.Sprintf("%s is unavailable to the scheduler for up to %s (freed capacity clears it); the catalogue cannot size it, so no other flavor is affected",
+		return fmt.Sprintf("%s is unavailable to the scheduler for up to %s (an accepted NodeGroup DELETE sent by this provider may clear older rejections early, without confirming freed quota); the catalogue cannot size it, so no other flavor is affected",
 			flavor, QuotaBackoff)
 	}
-	return fmt.Sprintf("%s is unavailable to the scheduler for up to %s and every other flavor at least as large for up to %s, so that %s is retried first (freed capacity clears it); smaller flavors stay available",
+	return fmt.Sprintf("%s is unavailable to the scheduler for up to %s and every other flavor at least as large for up to %s, so that %s is retried first (an accepted NodeGroup DELETE sent by this provider may clear older rejections early, without confirming freed quota); smaller flavors stay available",
 		flavor, QuotaBackoff, 2*QuotaBackoff, flavor)
 }
 
