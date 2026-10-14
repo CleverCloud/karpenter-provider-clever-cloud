@@ -74,13 +74,18 @@ func repoRoot(t *testing.T) string {
 // violations surface as a `helm template` error).
 func helmTemplateArgs(t *testing.T, extra ...string) (string, error) {
 	t.Helper()
+	return helmTemplateIn(t, filepath.Join(repoRoot(t), "charts", "karpenter"), extra...)
+}
+
+func helmTemplateIn(t *testing.T, chartPath string, extra ...string) (string, error) {
+	t.Helper()
 	if _, err := exec.LookPath("helm"); err != nil {
 		if os.Getenv(requireHelmEnv) != "" {
 			t.Fatalf("helm is required (%s is set) but not on PATH: %v", requireHelmEnv, err)
 		}
 		t.Skipf("helm not on PATH; run 'make test-chart' to require it")
 	}
-	args := []string{"template", "karpenter", filepath.Join(repoRoot(t), "charts", "karpenter")}
+	args := []string{"template", "karpenter", chartPath}
 	args = append(args, extra...)
 	out, err := exec.Command("helm", args...).CombinedOutput()
 	return string(out), err
@@ -100,9 +105,9 @@ func helmTemplate(t *testing.T, sets ...string) string {
 	return out
 }
 
-// controllerPodSpec extracts the controller Deployment's pod spec from a
-// rendered multi-document manifest.
-func controllerPodSpec(t *testing.T, manifest string) corev1.PodSpec {
+// controllerDeployment extracts the controller Deployment from a rendered
+// multi-document manifest.
+func controllerDeployment(t *testing.T, manifest string) *appsv1.Deployment {
 	t.Helper()
 	reader := yaml.NewYAMLReader(bufio.NewReader(bytes.NewReader([]byte(manifest))))
 	for {
@@ -123,10 +128,15 @@ func controllerPodSpec(t *testing.T, manifest string) corev1.PodSpec {
 		if err := sigsyaml.Unmarshal(doc, &deploy); err != nil {
 			t.Fatalf("decoding Deployment: %v", err)
 		}
-		return deploy.Spec.Template.Spec
+		return &deploy
 	}
 	t.Fatal("no Deployment found in the rendered chart")
-	return corev1.PodSpec{}
+	return nil
+}
+
+func controllerPodSpec(t *testing.T, manifest string) corev1.PodSpec {
+	t.Helper()
+	return controllerDeployment(t, manifest).Spec.Template.Spec
 }
 
 // controllerEnv returns the named env var from the controller container, or
@@ -143,29 +153,6 @@ func controllerEnv(spec corev1.PodSpec, name string) *corev1.EnvVar {
 		}
 	}
 	return nil
-}
-
-// The reference disk must come from the pod's real host, in both supported
-// installation paths; an unset NODE_NAME silently selects the static fallback.
-func TestHostNodeNameUsesDownwardAPI(t *testing.T) {
-	assertHostNodeName := func(t *testing.T, manifest string) {
-		t.Helper()
-		env := controllerEnv(controllerPodSpec(t, manifest), "NODE_NAME")
-		if env == nil || env.Value != "" || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil ||
-			env.ValueFrom.FieldRef.FieldPath != "spec.nodeName" {
-			t.Fatalf("NODE_NAME must read spec.nodeName through the downward API, got %+v", env)
-		}
-	}
-	t.Run("chart", func(t *testing.T) {
-		assertHostNodeName(t, helmTemplate(t))
-	})
-	t.Run("raw manifest", func(t *testing.T) {
-		raw, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy", "karpenter.yaml"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		assertHostNodeName(t, string(raw))
-	})
 }
 
 // TestBooleanValuesRejectStringForms pins the values.schema.json type guard.

@@ -104,21 +104,28 @@ controller:
     limits:
       memory: 512Mi
   # -- Extra environment variables for the controller container.
-  # NODE_NAME is supplied by the downward API: the host node's local
-  # ephemeral-storage capacity and allocatable define the disk resources
-  # advertised for future workers.
-  # While the reference is unavailable, only disk capacity is advertised as
-  # zero: workloads with no ephemeral-storage request can still provision.
-  # Positive requests (including DaemonSets), and NodePools with an explicit
-  # ephemeral-storage limit, wait for a valid reference.
-  # The host must represent newly provisioned workers, including their disk
-  # reserve; old hosts do not discover a platform change affecting only new
-  # nodes. Replicas must run on hosts with the same disk profile. This does
-  # not configure PVCs or resize disks. Outside the cluster, omit NODE_NAME
-  # to retain the built-in disk fallback.
+  # NODE_NAME is reserved: configure settings.ephemeralStorageReference instead.
   env: []
 
 settings:
+  # -- Source of local ephemeral-storage sizing for future workers; never PVCs.
+  # static preserves the measured built-in disk profile (the upgrade default).
+  # host opts in to the controller pod's spec.nodeName through the downward API.
+  # node uses nodeName explicitly, independently of the controller's placement.
+  # In host/node mode the reference's capacity AND allocatable must represent
+  # new workers. Old fixed workers retain their old disk; the control-plane
+  # disk in ALL_IN_ONE has not been measured against the new worker profile.
+  # Use a stable, unmanaged reference; replicas in host mode need matching
+  # disks and reservations. nodeSelector can pin the controller's placement.
+  # A valid reference replaces the disk profile in either direction, without
+  # falling back to a larger static disk when the platform shrinks its disks.
+  # While unavailable, the dynamic catalogue advertises zero disk: positive
+  # requests (including DaemonSets), and NodePools with explicit disk limits,
+  # wait. Workloads with no disk requests can still provision.
+  ephemeralStorageReference:
+    mode: static
+    # -- Required only in node mode; must be empty in static and host modes.
+    nodeName: ""
   # -- Clever Cloud region, set as both topology.kubernetes.io/region and
   # topology.kubernetes.io/zone on instance types and on the nodes Karpenter
   # launches (CKE is single-zone, Paris-only today).

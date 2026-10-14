@@ -129,7 +129,6 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if _, err := readDiskSnapshot(ng); err != nil {
 		return nil, err
 	}
-	log.FromContext(ctx).WithValues("NodeGroup", ng.Name, "flavor", ng.Spec.Flavor).Info("created nodegroup")
 	return c.buildNodeClaim(ctx, ng, instanceType), nil
 }
 
@@ -244,7 +243,14 @@ var errEphemeralStorageNotReady = errors.New("waiting for valid ephemeral storag
 func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
 	instanceTypes, diskReady := c.instanceTypes()
 	if !diskReady && hasDiskLimit(nodePool) {
-		return nil, fmt.Errorf("%w: nodepool %s has an ephemeral-storage limit", errEphemeralStorageNotReady, nodePool.Name)
+		// The unknown disk cannot be charged against this pool's capacity
+		// limit. Keep its types present for drift and disruption, while making
+		// every offering unavailable to new provisioning.
+		for _, it := range instanceTypes {
+			for _, offering := range it.Offerings {
+				offering.Available = false
+			}
+		}
 	}
 	return instanceTypes, nil
 }
@@ -389,9 +395,15 @@ func (c *CloudProvider) resolveLaunch(ctx context.Context, nodeClaim *karpv1.Nod
 	}
 	instanceType, err := c.resolveInstanceType(ctx, nodeClaim)
 	if err != nil {
-		if errors.Is(err, errEphemeralStorageNotReady) {
-			return nil, nil, err // retry the existing claim when the reference recovers
+		var createError *cloudprovider.CreateError
+		if errors.As(err, &createError) {
+			// A failed NodePool read is not a capacity verdict. Preserve the
+			// claim for retry rather than interpreting an API outage as ICE.
+			return nil, nil, err
 		}
+		// A known missing disk reference cannot satisfy this launch. An ICE
+		// lets core release the unlaunched claim and re-plan; keeping it with
+		// no provider ID would hold Cluster.Synced false for every NodePool.
 		return nil, nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("resolving instance type, %w", err))
 	}
 	return nodeClass, instanceType, nil
@@ -454,7 +466,9 @@ func (c *CloudProvider) resolveInstanceType(ctx context.Context, nodeClaim *karp
 		if name := nodeClaim.Labels[karpv1.NodePoolLabelKey]; name != "" {
 			nodePool := &karpv1.NodePool{}
 			if err := c.apiReader.Get(ctx, types.NamespacedName{Name: name}, nodePool); err != nil {
-				return nil, fmt.Errorf("%w: checking nodepool disk limit: %w", errEphemeralStorageNotReady, err)
+				return nil, cloudprovider.NewCreateError(
+					fmt.Errorf("checking nodepool %s disk limit, %w", name, err),
+					"NodePoolReadFailed", "Unable to read the NodePool to verify its ephemeral-storage limit; retrying")
 			}
 			if hasDiskLimit(nodePool) {
 				return nil, fmt.Errorf("%w: nodepool %s has an ephemeral-storage limit", errEphemeralStorageNotReady, name)

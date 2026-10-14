@@ -582,3 +582,74 @@ lint/tests and e2e harness tests on Go 1.26.9. The live run `f27ee4` above
 predates this follow-up. An additional live probe was deferred because
 another review was actively using the test cluster; no controller was
 started and no cluster resources were changed for this follow-up.
+
+
+## Independent review of the zero-disk follow-up
+
+The independent PR #82 review subsequently tested commit `7c80175` on the
+same cluster on 2026-10-14. Its full suite, run `65bacc`, passed **5/5** in
+736.38 s (15:55–16:07 Europe/Paris, CEST, UTC+02:00): Provision 65.57 s,
+ConsolidationScaleToZero 67.55 s, Drift 110.30 s, GarbageCollection 343.83 s,
+and QuotaFastFail 8.75 s. Cleanup and a later recheck restored the original
+Node/NodeGroup and left no test NodeClaims, NodePools or CleverNodeClasses.
+
+Separate review probes demonstrated CPU-only provisioning with a `0/0`
+launch snapshot while the reference was unavailable, recovery to actual Node
+status after registration, and snapshot adoption across controller restart.
+They also found two gaps fixed by the subsequent revision: an unlaunched
+claim could hold core's cluster synchronization after losing its disk
+reference, and an error from the catalogue prevented empty-node cleanup in
+a pool with a disk limit. This historical run predates those fixes and the
+configurable static/host/named-node chart modes.
+
+
+## Review fixes: upgrade safety and reference outages
+
+The revised PR #82 working tree based on `7c80175` passed a fresh full run,
+`9ec339`, on 2026-10-14 around 17:26–17:38 Europe/Paris (CEST, UTC+02:00).
+The cluster and reference were unchanged: CKE 1.36.3, kernel 7.2.10,
+`E2E_NODE_NAME=manual-nodegroup-node0`. Production and e2e source hashes
+were unchanged between build and completion.
+
+| Scenario | Result | Duration |
+|---|---|---|
+| Provision | PASS | 70.23 s |
+| ConsolidationScaleToZero | PASS | 70.75 s |
+| Drift | PASS | 119.70 s |
+| GarbageCollection | PASS | 335.56 s |
+| QuotaFastFail | PASS | 12.50 s |
+
+`TestE2E` completed in 742.64 s, including cleanup and its two-minute
+recheck. Both provisioned workers exactly matched the reference's disk
+capacity and allocatable; their pods became Running in 61 s. The harness
+now directly verifies both NodeGroup snapshot annotations against the
+reference and NodeClaim status. The reference still equals the static seed
+on this cluster; this run does not by itself distinguish those profiles.
+Final metrics showed zero capacity rejections, acceptance timeouts and
+overdue deletions, plus one expected quota rejection.
+
+The final Kubernetes object identities matched the captured baseline:
+only the original manual NodeGroup and Node, no NodeClaims, NodePools,
+CleverNodeClasses or test namespace. The controller stopped; its temporary
+binary and kubeconfig copy were removed. This is a Kubernetes cleanup
+check, not an independent confirmation through the platform VM API.
+
+The local checks all passed under Go 1.26.9: vet, build, unit/race tests,
+lint, envtest, chart lint/tests, harness tests, generated-file hashes and
+govulncheck (zero reachable vulnerabilities). New regression tests run
+core's actual lifecycle, cluster-state and provisioning controllers to
+prove a lost reference releases an unlaunched claim and allows CPU-only
+provisioning in another pool. Core's disruption candidate path verifies
+that a disk-limited pool remains eligible for empty-node cleanup while
+new launches are unavailable. API-reader failures remain retriable.
+Adoption tests cover legacy groups without snapshots, quota backoff and
+owner UID replacement. Metric and watch tests verify invalidation and
+recovery after the reference was actually read.
+
+Envtest additionally starts the real controller binary against an isolated
+API server with a 23Gi/19Gi reference, distinct from the static seed, and
+checks static versus dynamic wiring. Chart tests send 24 strategic-merge
+and server-side-apply transitions through a real API server, including
+upgrades from a deployment without `NODE_NAME`. The live run uses an
+out-of-cluster binary; it does not deploy the chart's controller pod or
+resize physical disks. Control-plane disk equivalence remains unmeasured.

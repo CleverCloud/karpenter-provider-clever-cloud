@@ -282,9 +282,7 @@ spec:
             readOnlyRootFilesystem: true
           env:
             - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
+              value: ""
             - name: CLEVER_CLOUD_REGION
               value: "par"
             - name: LOG_LEVEL

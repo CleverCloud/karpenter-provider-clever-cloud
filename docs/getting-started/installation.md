@@ -44,6 +44,55 @@ Set `nodeSelector` to pin the controller further (it is ANDed with the affinity,
 
 > **Warning:** Do not enable CKE's own `autoscalingEnabled` on the cluster alongside this provider — two autoscalers will fight over the same NodeGroups.
 
+## Local disk reference
+
+The chart and generated raw manifest default to
+`settings.ephemeralStorageReference.mode: static`, preserving v0.14.0's measured
+local disk capacity for new workers. This setting does not configure remote PVCs.
+Dynamic sizing is an explicit choice:
+
+```yaml
+settings:
+  ephemeralStorageReference:
+    mode: host
+    nodeName: ""
+```
+
+`host` uses the controller pod's actual host through the downward API. Before
+opting in, compare its **capacity and allocatable** with a recently provisioned
+worker:
+
+```sh
+kubectl get node <reference-node> <recent-worker> \
+  -o 'custom-columns=NAME:.metadata.name,CAPACITY:.status.capacity.ephemeral-storage,ALLOCATABLE:.status.allocatable.ephemeral-storage'
+```
+
+Old fixed workers retain their smaller disks: a reference with about 39 Gi capacity
+cannot describe a new worker with about 98 Gi. The control-plane disk in
+`ALL_IN_ONE` has not been measured against the enlarged worker profile; verify it
+before using it. CPU and memory remain flavor-specific in every mode.
+
+You can pin the controller to a representative fixed host without changing its
+safety affinity:
+
+```yaml
+nodeSelector:
+  kubernetes.io/hostname: <representative-host>
+```
+
+For multiple replicas, use hosts with matching disk capacity and reservations, or
+choose `mode: node` with `nodeName: <representative-node>` so they all read the same
+explicit reference independently of placement. Keep that reference on stable
+capacity Karpenter cannot deprovision. `nodeName` must be empty in `host` and
+`static` modes. Neither selecting a reference nor changing modes resizes any disk.
+
+Dynamic sizing follows valid increases **and decreases**. It does not fall back
+from the old 39 Gi profile to the larger static profile: after a real decrease,
+that would promise space new workers do not have. If only future workers change,
+update the reference; restarting the controller on an unchanged host cannot detect
+that change. The [disk reference runbook](../observability.md#controller-node-disk-reference)
+covers missing references and the associated metrics.
+
 ## Step 3 — Verify
 
 ```sh
@@ -106,6 +155,20 @@ helm upgrade karpenter \
 ```
 
 `--reset-then-reuse-values` takes the new chart's defaults and re-applies only the values you set yourself, whereas `--reuse-values` replaces the new defaults with the previous release's, so every default a release changes silently keeps its old value (v0.12.0's placement fix never reaches a `--reuse-values` upgrade from v0.11.0: on `DEDICATED_COMPUTE` and `DISTRIBUTED` the controller stays `Pending`). An explicit values file (`-f` alone, with no reuse or reset flag) works as well, provided it holds every value you have customized and nothing else: Helm then reuses none of the previous release's values, so anything set at an earlier install or upgrade and missing from the file is dropped, and a full copy of an older `values.yaml` pins every default the same way.
+
+**Disk sizing on upgrade:** the default remains `static`, so upgrading from
+v0.14.0 does not silently substitute an old controller host's smaller disk. To
+opt in after checking the reference, add
+`--set settings.ephemeralStorageReference.mode=host` to the controller upgrade,
+or supply `mode: node` and `nodeName` in your values file as described
+[above](#local-disk-reference). If an existing custom deployment already used the
+host reference, set `mode: host` explicitly to preserve that choice.
+
+`NODE_NAME` is reserved in `controller.env`: remove any such entry and configure
+`settings.ephemeralStorageReference` instead. Reused values keep the old env list,
+so pass a corrected list during the upgrade; if it contained only `NODE_NAME`,
+`--set-json 'controller.env=[]'` clears it. Each mode renders exactly one variable:
+empty for `static`, a field reference for `host`, a literal name for `node`.
 
 If you did not install the CRD chart, apply the CRDs by hand instead (Helm does not upgrade CRDs shipped in the main chart's `crds/` directory), from a checkout of the matching release tag: `kubectl apply -f deploy/crds/`.
 

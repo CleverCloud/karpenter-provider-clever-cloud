@@ -57,6 +57,8 @@ kubectl apply -f examples/v1/general-purpose.yaml
 | `nodeSelector` | `{}` | Extra pinning, ANDed with `affinity` |
 | `affinity` | require `karpenter.sh/nodepool` absent | Karpenter must not run on nodes it manages — holds on every CKE topology |
 | `tolerations` | control-plane `NoSchedule` | No-op today (no CKE node role is tainted); future-proofs placement. Never tolerate `karpenter.sh/unregistered` or everything: until a node registers (and for good on a resized NodeGroup's extra node) that taint is all that keeps the controller off it |
+| `settings.ephemeralStorageReference.mode` | `static` | Local disk source: measured static profile, controller host (`host`), or explicit reference (`node`). Dynamic sizing requires a node representative of future workers, including reservations; old fixed workers and unmeasured ALL_IN_ONE control planes need verification first. |
+| `settings.ephemeralStorageReference.nodeName` | `""` | Required only in `node` mode; empty in `static` and `host` modes. Choose stable capacity Karpenter cannot deprovision. |
 | `settings.region` | `par` | Value of `topology.kubernetes.io/region` and `topology.kubernetes.io/zone` on instance types and nodes |
 | `settings.logLevel` | `info` | debug / info / error |
 | `settings.disableLeaderElection` | `false` | For single-replica dev setups |
@@ -64,7 +66,7 @@ kubectl apply -f examples/v1/general-purpose.yaml
 | `settings.featureGates.nodeRepair` | `false` | Enable node auto-repair |
 | `settings.flavors` | `[]` | Per-flavor overrides overlaid on the built-in catalogue (`name` required; `cpu`/`memoryKi` optional). A name must be a Clever Cloud flavor name, uppercase: `2XS`…`XL`, or a new flavor (which must set `cpu` and `memoryKi`) named the same way, such as `2XL`; the schema refuses any other (`2xs`, `CUSTOM`), which the NodeGroup API could never create. The NodeGroup API accepts only `2XS`…`XL` today: a new flavor it does not accept yet is refused at every launch and held out of provisioning 5 minutes at a time. No price field: prices are derived from cpu and memoryKi, so pin every flavor the same way or none, and a leftover `priceHourly` fails schema validation. Empty = built-in catalogue unchanged. Mounted via a ConfigMap; overrides always win. Nodes of the controller's own NodeGroups then correct memory within 10% of the entry (same cpu required; prices do not follow); a pin further off is served as-is and its nodes are counted as refused reports |
 | `controller.resources` | 200m/256Mi, limit 512Mi | Controller container resources |
-| `controller.env` | `[]` | Extra environment variables |
+| `controller.env` | `[]` | Extra environment variables; `NODE_NAME` is reserved for `settings.ephemeralStorageReference` |
 | `service.enabled` | `true` | ClusterIP service exposing `/metrics` |
 | `podDisruptionBudget.enabled` | `true` | maxUnavailable: 1 |
 
@@ -92,6 +94,13 @@ flag) works as well, provided it holds every value you have customized and
 nothing else: Helm then reuses none of the previous release's values, so
 anything set earlier and missing from the file is dropped, and a full copy of
 an older `values.yaml` pins every default the same way.
+
+Disk sizing stays `static` by default on upgrade. Opt in to `host` or `node`
+only after verifying the reference's capacity and allocatable against a new
+worker. The chart renders one `NODE_NAME` in every mode, empty in `static`;
+remove any old `controller.env` entry with that name and replace it with the
+dedicated setting. See [local disk reference](../../docs/getting-started/installation.md#local-disk-reference)
+for placement, multiple replicas and upgrade examples.
 
 The controller talks to nothing but the cluster's Kubernetes API: it needs no
 Clever Cloud API token and no egress beyond the API server. Earlier releases

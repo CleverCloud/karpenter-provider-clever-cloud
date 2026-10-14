@@ -488,6 +488,8 @@ func (p *Provider) ResolveAndCreate(ctx context.Context, nodeClaim *karpv1.NodeC
 	// late rejection (RecordLateRefusal, which does not take createMu) can
 	// land between a resolver's own check and this one. Only the flavors the
 	// rejection covers fail fast; a smaller one may fit and goes to the API.
+	// An existing owned group already holds its reservation: adopting it
+	// must not fail because a different launch exhausted the remaining quota.
 	// No event on the fast-fail: karpenter-core already publishes an
 	// InsufficientCapacityError event per attempt, and claims get fresh names
 	// each retry so per-claim dedupe cannot bound the volume.
@@ -545,7 +547,7 @@ func (p *Provider) ResolveAndCreate(ctx context.Context, nodeClaim *karpv1.NodeC
 	mark := p.holdOutMark()
 	observed := launch.Existing
 	if observed != nil {
-		if observed.Name != nodeClaim.Name || !ownedByNodeClaim(observed, nodeClaim) {
+		if !OwnedByNodeClaim(observed, nodeClaim) {
 			return nil, fmt.Errorf("nodegroup %q already exists and is not managed by this nodeclaim", observed.Name)
 		}
 		ng = observed
@@ -567,7 +569,7 @@ func (p *Provider) ResolveAndCreate(ctx context.Context, nodeClaim *karpv1.NodeC
 		if getErr := p.kubeClient.Get(ctx, types.NamespacedName{Name: ng.Name}, existing); getErr != nil {
 			return nil, fmt.Errorf("getting existing nodegroup, %w", getErr)
 		}
-		if !ownedByNodeClaim(existing, nodeClaim) {
+		if !OwnedByNodeClaim(existing, nodeClaim) {
 			return nil, fmt.Errorf("nodegroup %q already exists and is not managed by this nodeclaim", ng.Name)
 		}
 		ng = existing
@@ -624,6 +626,11 @@ func (p *Provider) ResolveAndCreate(ctx context.Context, nodeClaim *karpv1.NodeC
 		}
 		return nil, err
 	}
+	message := "created nodegroup"
+	if observed != nil {
+		message = "adopted existing nodegroup"
+	}
+	log.FromContext(ctx).WithValues("NodeGroup", ng.Name, "flavor", ng.Spec.Flavor).Info(message)
 	if accepted == unacknowledged {
 		// Optimistic-launch path. Healthy launches are acknowledged about 1 s
 		// after creation, so this is the signal of an operator that is down,
@@ -653,8 +660,12 @@ func (p *Provider) ResolveAndCreate(ctx context.Context, nodeClaim *karpv1.NodeC
 	return ng, nil
 }
 
-func ownedByNodeClaim(ng *ngv1.NodeGroup, claim *karpv1.NodeClaim) bool {
-	if !IsManaged(ng) || ng.Labels[v1alpha1.NodeClaimLabelKey] != claim.Name {
+// OwnedByNodeClaim verifies the complete identity needed for adoption: the
+// provider's managed marker, matching group/claim names and label, and a
+// NodeClaim owner reference with the current claim's UID. Labels or an owner
+// name alone are not sufficient when a claim was replaced under the same name.
+func OwnedByNodeClaim(ng *ngv1.NodeGroup, claim *karpv1.NodeClaim) bool {
+	if ng.Name != claim.Name || !IsManaged(ng) || ng.Labels[v1alpha1.NodeClaimLabelKey] != claim.Name {
 		return false
 	}
 	for _, owner := range ng.OwnerReferences {

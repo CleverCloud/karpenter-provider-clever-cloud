@@ -65,3 +65,18 @@ func TestNewControllersWiresEveryProviderController(t *testing.T) {
 		t.Fatal("controller wiring must require a reference before provisioning starts")
 	}
 }
+
+func TestNewControllersWithoutReferenceKeepsStaticDisk(t *testing.T) {
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).Build()
+	provider := instancetype.NewProvider("par", nil, nil)
+	groups := nodegroup.NewProvider(kubeClient, noopRecorder{}, provider, clock.RealClock{})
+	registered := controllers.NewControllers(kubeClient, kubeClient, noopRecorder{}, groups, provider, "")
+	for _, c := range registered {
+		if fmt.Sprintf("%T", c) == "*ephemeralstorage.Controller" {
+			t.Fatal("static mode registered a reference controller")
+		}
+	}
+	if _, ready := provider.ListForProvisioning(); !ready {
+		t.Fatal("static mode now requires a reference observation")
+	}
+}

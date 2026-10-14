@@ -188,8 +188,8 @@ func TestHostStorageUnavailableCreateChecksRequestedDisk(t *testing.T) {
 			positive := claimFor("default-needs-disk", "128Mi", "2XS")
 			positive.Spec.Resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("1Gi")
 			stored(t, kubeClient, positive)
-			if _, err := cp.Create(ctx, positive); err == nil || corecloudprovider.IsInsufficientCapacityError(err) || corecloudprovider.IsNodeClassNotReadyError(err) {
-				t.Fatalf("positive disk request must wait with a retriable error: %T %v", err, err)
+			if _, err := cp.Create(ctx, positive); !corecloudprovider.IsInsufficientCapacityError(err) {
+				t.Fatalf("positive disk request must release the unlaunched claim for replanning: %T %v", err, err)
 			}
 			if operator.createCount() != 0 {
 				t.Fatalf("positive disk request caused %d POSTs", operator.createCount())
@@ -296,8 +296,8 @@ func TestHostStorageUnavailableAccountsForDaemonSetRequests(t *testing.T) {
 	claim.Name, claim.UID = "default-daemon-disk", "uid-default-daemon-disk"
 	stored(t, kubeClient, claim)
 	itp.InvalidateEphemeralStorageReference()
-	if _, err := cp.Create(coreContext(), claim); err == nil || corecloudprovider.IsInsufficientCapacityError(err) {
-		t.Fatalf("lost reference must hold the aggregate disk request for retry: %T %v", err, err)
+	if _, err := cp.Create(coreContext(), claim); !corecloudprovider.IsInsufficientCapacityError(err) {
+		t.Fatalf("lost reference must release the aggregate disk request for replanning: %T %v", err, err)
 	}
 	if operator.createCount() != 0 {
 		t.Fatalf("DaemonSet disk launch issued %d POSTs without a reference", operator.createCount())
@@ -314,14 +314,24 @@ func TestHostStorageUnavailablePreservesNodePoolDiskLimit(t *testing.T) {
 	limited.Spec.Limits = karpv1.Limits{corev1.ResourceEphemeralStorage: resource.MustParse("200Gi")}
 	plain := topologyNodePool("default")
 	seed(t, kubeClient, limited, plain)
-	if _, err := cp.GetInstanceTypes(coreContext(), limited); err == nil {
-		t.Fatal("an unknown per-worker disk must not bypass the NodePool's total disk limit")
+	instanceTypes, err := cp.GetInstanceTypes(coreContext(), limited)
+	if err != nil || len(instanceTypes) != len(instancetype.DefaultFlavors) {
+		t.Fatalf("limited pool types must remain visible to drift and disruption: types=%d error=%v", len(instanceTypes), err)
+	}
+	for _, it := range instanceTypes {
+		if len(it.Offerings.Available()) != 0 {
+			t.Fatalf("unknown worker disk bypasses pool limit through flavor %s", it.Name)
+		}
 	}
 	cluster := state.NewCluster(clock.RealClock{}, kubeClient, cp)
 	pod := pendingPod("without-local-request")
 	results := provisioningPass(t, cp, kubeClient, cluster, plain, pod)
 	if len(results.NewNodeClaims) != 1 || results.PodErrors[pod] != nil {
 		t.Fatalf("unlimited NodePool must remain schedulable: new=%d error=%v", len(results.NewNodeClaims), results.PodErrors[pod])
+	}
+	blocked := provisioningPass(t, cp, kubeClient, cluster, limited, pod)
+	if len(blocked.NewNodeClaims) != 0 || blocked.PodErrors[pod] == nil {
+		t.Fatalf("unavailable offerings must block a new limited-pool launch: new=%d error=%v", len(blocked.NewNodeClaims), blocked.PodErrors[pod])
 	}
 	hostDisk(t, itp, "40Gi", "36Gi")
 	results = provisioningPass(t, cp, kubeClient, cluster, limited, pod)
@@ -335,7 +345,7 @@ func TestHostStorageUnavailablePreservesNodePoolDiskLimit(t *testing.T) {
 	}
 	stored(t, kubeClient, claim)
 	itp.InvalidateEphemeralStorageReference()
-	if _, err := cp.Create(coreContext(), claim); err == nil || corecloudprovider.IsInsufficientCapacityError(err) {
+	if _, err := cp.Create(coreContext(), claim); !corecloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("launch must recheck the NodePool disk budget after invalidation: %T %v", err, err)
 	}
 	if operator.createCount() != 0 {

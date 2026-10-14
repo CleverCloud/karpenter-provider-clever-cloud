@@ -113,6 +113,122 @@ func TestHostStorageAdoptionPreservesLaunchSnapshot(t *testing.T) {
 	}
 }
 
+// An upgrade can find an accepted v0.14.0 group whose launch has not yet been
+// persisted on its NodeClaim. No snapshot exists to recover its historical disk,
+// but this must not turn a retry into another provisioning decision or POST.
+func TestPreFeatureAdoptionSurvivesReferenceChangesAndQuota(t *testing.T) {
+	for _, scenario := range []string{"smaller reference", "unavailable reference", "quota backoff"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := coreContext()
+			cp, kubeClient, itp, operator := hostStorageProvider(t)
+			hostDisk(t, itp, "160Gi", "144Gi")
+			wanted := testNodeClaim("default-pre-feature-launch")
+			wanted.Spec.Resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("100Gi")
+			stored(t, kubeClient, wanted)
+			first, err := cp.Create(ctx, wanted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ng := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(ctx, types.NamespacedName{Name: wanted.Name}, ng); err != nil {
+				t.Fatal(err)
+			}
+			delete(ng.Annotations, snapshotCapacity)
+			delete(ng.Annotations, snapshotAllocatable)
+			ng.Status = ngv1.NodeGroupStatus{Phase: "Creating", Conditions: []ngv1.NodeGroupCondition{
+				condTrue(ngv1.ConditionTypeReconcileInProgress, "Creating", ""),
+			}}
+			if err := kubeClient.Update(ctx, ng); err != nil {
+				t.Fatal(err)
+			}
+			nodeGroups := nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clock.RealClock{})
+			switch scenario {
+			case "smaller reference", "unavailable reference":
+				hostDisk(t, itp, "40Gi", "36Gi")
+				if scenario == "unavailable reference" {
+					itp.InvalidateEphemeralStorageReference()
+				}
+			case "quota backoff":
+				refused := managedNodeGroup("default-other-refused", ng.Spec.Flavor)
+				refused.Status = ngv1.NodeGroupStatus{Phase: ngv1.PhaseQuotaExceeded, Conditions: []ngv1.NodeGroupCondition{
+					condTrue(ngv1.ConditionTypeReconcileFailed, ngv1.ReasonQuotaExceeded, "quota exhausted"),
+				}}
+				nodeGroups.RecordLateRefusal(testNodeClaim(refused.Name), refused)
+				if !nodeGroups.Unavailable(ng.Spec.Flavor) {
+					t.Fatal("test did not arm quota backoff")
+				}
+			}
+			cp = cloudprovider.New(kubeClient, kubeClient, itp, nodeGroups)
+			// Without a historical snapshot, Get/List already use the catalogue.
+			// Adoption preserves that behavior instead of inventing a past size.
+			described, err := cp.Get(ctx, first.Status.ProviderID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			capacity := described.Status.Capacity[corev1.ResourceEphemeralStorage]
+			allocatable := described.Status.Allocatable[corev1.ResourceEphemeralStorage]
+			adopted, err := cp.Create(ctx, wanted)
+			if err != nil {
+				t.Fatalf("pre-feature launch must be adopted without re-planning: %v", err)
+			}
+			assertClaimDisk(t, adopted, capacity.String(), allocatable.String())
+			if adopted.Status.ProviderID != first.Status.ProviderID || operator.createCount() != 1 {
+				t.Fatalf("adoption changed identity or attempted another POST: providerID=%s POSTs=%d", adopted.Status.ProviderID, operator.createCount())
+			}
+			storedGroup := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(ctx, types.NamespacedName{Name: ng.Name}, storedGroup); err != nil {
+				t.Fatal(err)
+			}
+			if storedGroup.ResourceVersion != ng.ResourceVersion {
+				t.Fatal("adoption changed the existing group")
+			}
+			if _, exists := storedGroup.Annotations[snapshotCapacity]; exists {
+				t.Fatal("adoption invented a historical disk snapshot")
+			}
+		})
+	}
+}
+
+func TestPreFeatureAdoptionRequiresCurrentClaimOwnership(t *testing.T) {
+	for _, scenario := range []string{"unmanaged", "old owner UID", "missing owner", "wrong claim label"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := coreContext()
+			cp, kubeClient, itp, operator := hostStorageProvider(t)
+			hostDisk(t, itp, "160Gi", "144Gi")
+			claim := stored(t, kubeClient, testNodeClaim("default-pre-feature-identity"))
+			if _, err := cp.Create(ctx, claim); err != nil {
+				t.Fatal(err)
+			}
+			ng := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(ctx, types.NamespacedName{Name: claim.Name}, ng); err != nil {
+				t.Fatal(err)
+			}
+			delete(ng.Annotations, snapshotCapacity)
+			delete(ng.Annotations, snapshotAllocatable)
+			switch scenario {
+			case "unmanaged":
+				delete(ng.Labels, v1alpha1.ManagedLabelKey)
+			case "old owner UID":
+				ng.OwnerReferences[0].UID = "older-claim-with-same-name"
+			case "missing owner":
+				ng.OwnerReferences = nil
+			case "wrong claim label":
+				ng.Labels[v1alpha1.NodeClaimLabelKey] = "another-claim"
+			}
+			if err := kubeClient.Update(ctx, ng); err != nil {
+				t.Fatal(err)
+			}
+			_, err := cp.Create(ctx, claim)
+			if err == nil || !strings.Contains(err.Error(), "not managed by this nodeclaim") || corecloudprovider.IsInsufficientCapacityError(err) {
+				t.Fatalf("foreign pre-feature group must be refused with a plain identity error: %v", err)
+			}
+			if operator.createCount() != 1 {
+				t.Fatalf("unsafe adoption attempted another POST: %d", operator.createCount())
+			}
+		})
+	}
+}
+
 func TestHostStorageInvalidSnapshotRetriesCreateButKeepsGetList(t *testing.T) {
 	for _, corrupt := range []string{"missing capacity", "invalid quantity", "fractional", "allocatable exceeds capacity", "zero capacity", "zero allocatable", "negative capacity", "negative allocatable", "both negative", "overflow"} {
 		t.Run(corrupt, func(t *testing.T) {

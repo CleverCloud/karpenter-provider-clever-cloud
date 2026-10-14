@@ -569,6 +569,89 @@ func TestCreateReusesExistingManagedNodeGroup(t *testing.T) {
 	}
 }
 
+func TestExistingAdoptionBypassesQuotaBackoffWithoutAnotherPOST(t *testing.T) {
+	for name, status := range map[string]ngv1.NodeGroupStatus{
+		"ready":        syncedStatus(),
+		"acknowledged": acknowledgedStatus(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			claim := testNodeClaim("default-adopt-during-quota")
+			existing := ownedNodeGroup(claim.Name, "2XS", status)
+			existing.UID = "already-provisioned"
+			_, base, recorder, clk := newClockedTestProvider(t, existing)
+			posts := 0
+			kubeClient := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if _, ok := obj.(*ngv1.NodeGroup); ok {
+						posts++
+					}
+					return c.Create(ctx, obj, opts...)
+				},
+			})
+			provider := nodegroup.NewProvider(kubeClient, recorder, catalogue, clk)
+			refused := ownedNodeGroup("default-recent-quota", "2XS", quotaRejectedStatus())
+			provider.RecordLateRefusal(testNodeClaim(refused.Name), refused)
+			if !provider.Unavailable("2XS") {
+				t.Fatal("test did not arm quota backoff")
+			}
+			adopted, err := provider.ResolveAndCreate(ctx, claim, func(context.Context) (*nodegroup.Launch, error) {
+				return &nodegroup.Launch{NodeClass: testNodeClass("default"), Flavor: "2XS", Existing: existing, ExistingReader: base}, nil
+			})
+			if err != nil {
+				t.Fatalf("an existing accepted machine must be adopted during quota backoff: %v", err)
+			}
+			if adopted.UID != existing.UID || posts != 0 {
+				t.Fatalf("adoption changed machine identity or attempted another POST: UID=%s POSTs=%d", adopted.UID, posts)
+			}
+			if !provider.Unavailable("2XS") {
+				t.Fatal("adopting existing capacity must not release quota backoff for new machines")
+			}
+			_, err = provider.Create(ctx, testNodeClaim("default-new-during-quota"), testNodeClass("default"), "2XS")
+			var quotaErr *nodegroup.ErrQuotaExceeded
+			if !errors.As(err, &quotaErr) || posts != 0 {
+				t.Fatalf("new launches must still fail fast: error=%v POSTs=%d", err, posts)
+			}
+		})
+	}
+}
+
+func TestAlreadyExistsRejectsPreviousNodeClaimUID(t *testing.T) {
+	for _, ownerUID := range []types.UID{"previous-claim-uid", ""} {
+		t.Run(string(ownerUID), func(t *testing.T) {
+			ctx := context.Background()
+			claim := testNodeClaim("default-reused-claim-name")
+			existing := ownedNodeGroup(claim.Name, "2XS", syncedStatus())
+			existing.UID = "foreign-nodegroup"
+			existing.OwnerReferences[0].UID = ownerUID
+			_, base := newTestProvider(t, existing)
+			posts := 0
+			kubeClient := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if _, ok := obj.(*ngv1.NodeGroup); ok {
+						posts++
+					}
+					return c.Create(ctx, obj, opts...)
+				},
+			})
+			provider := nodegroup.NewProvider(kubeClient, &fakeRecorder{}, catalogue, clock.RealClock{})
+			// Calling Create directly deliberately exercises POST/AlreadyExists,
+			// independently of the cloudprovider's preflight adoption lookup.
+			_, err := provider.Create(ctx, claim, testNodeClass("default"), "2XS")
+			if err == nil || !strings.Contains(err.Error(), "not managed by this nodeclaim") || posts != 1 {
+				t.Fatalf("AlreadyExists must reject a matching name with another owner UID: error=%v POSTs=%d", err, posts)
+			}
+			stored := &ngv1.NodeGroup{}
+			if err := base.Get(ctx, types.NamespacedName{Name: existing.Name}, stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.UID != existing.UID || stored.OwnerReferences[0].UID != ownerUID {
+				t.Fatal("refusing adoption modified the foreign group")
+			}
+		})
+	}
+}
+
 func TestCreateRejectsForeignNodeGroup(t *testing.T) {
 	t.Run("unmanaged nodegroup with the same name", func(t *testing.T) {
 		existing := &ngv1.NodeGroup{

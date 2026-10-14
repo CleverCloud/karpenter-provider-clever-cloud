@@ -62,6 +62,12 @@ func TestHarnessDiskReferencePreflight(t *testing.T) {
 	}{
 		{name: "healthy reference"},
 		{name: "missing node", absent: true, want: "not found"},
+		{name: "managed reference", change: func(n *corev1.Node) {
+			n.Labels = map[string]string{karpv1.NodePoolLabelKey: "test-pool"}
+		}, want: "cannot deprovision"},
+		{name: "empty nodepool marker", change: func(n *corev1.Node) {
+			n.Labels = map[string]string{karpv1.NodePoolLabelKey: ""}
+		}, want: "cannot deprovision"},
 		{name: "not ready", change: func(n *corev1.Node) { n.Status.Conditions = nil }, want: "not Ready"},
 		{name: "terminating", change: func(n *corev1.Node) {
 			n.DeletionTimestamp = &metav1.Time{Time: time.Now()}

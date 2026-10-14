@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,7 +74,23 @@ var (
 	// Dedicated to the host-disk watch test; the existing NodeGroup tests
 	// retain their independent provider and static sizing behavior.
 	hostStorageProvider *instancetype.Provider
+	hostStorageLastRead atomic.Value // referenceRead, recorded after the API GET
 )
+
+type referenceRead struct {
+	resourceVersion string
+	missing         bool
+}
+
+type observingReferenceReader struct{ client.Reader }
+
+func (r observingReferenceReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	err := r.Reader.Get(ctx, key, obj, opts...)
+	if key.Name == hostStorageNodeName {
+		hostStorageLastRead.Store(referenceRead{resourceVersion: obj.GetResourceVersion(), missing: apierrors.IsNotFound(err)})
+	}
+	return err
+}
 
 // noopRecorder discards events: the unit tests assert on them.
 type noopRecorder struct{}
@@ -144,7 +161,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	hostStorageProvider = instancetype.NewProvider("par", nil, nil)
-	if err := ephemeralstorage.NewController(mgr.GetAPIReader(), hostStorageProvider, hostStorageNodeName).Register(ctx, mgr); err != nil {
+	if err := ephemeralstorage.NewController(observingReferenceReader{mgr.GetAPIReader()}, hostStorageProvider, hostStorageNodeName).Register(ctx, mgr); err != nil {
 		fmt.Printf("registering host ephemeral storage controller: %v\n", err)
 		os.Exit(1)
 	}

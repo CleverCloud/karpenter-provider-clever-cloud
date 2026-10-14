@@ -42,9 +42,13 @@ func TestHostStorageFollowsNodeWatch(t *testing.T) {
 	ctx := context.Background()
 	cp := cloudprovider.New(kubeClient, apiReader, hostStorageProvider,
 		nodegroup.NewProvider(kubeClient, noopRecorder{}, hostStorageProvider, clock.RealClock{}))
-	assertWaiting := func() {
+	assertWaiting := func(resourceVersion string) {
 		t.Helper()
 		eventually(t, 10*time.Second, func(ctx context.Context) error {
+			read, observed := hostStorageLastRead.Load().(referenceRead)
+			if !observed || (resourceVersion == "" && !read.missing) || (resourceVersion != "" && read.resourceVersion != resourceVersion) {
+				return fmt.Errorf("controller has not read expected reference state: resourceVersion=%q, last=%+v", resourceVersion, read)
+			}
 			if hostStorageProvider.EphemeralStorageReady() {
 				return fmt.Errorf("host disk is still considered ready")
 			}
@@ -81,8 +85,9 @@ func TestHostStorageFollowsNodeWatch(t *testing.T) {
 			return nil
 		})
 	}
-	writeDisk := func(capacity, allocatable string) {
+	writeDisk := func(capacity, allocatable string) string {
 		t.Helper()
+		var version string
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			node := &corev1.Node{}
 			if err := apiReader.Get(ctx, types.NamespacedName{Name: hostStorageNodeName}, node); err != nil {
@@ -90,12 +95,17 @@ func TestHostStorageFollowsNodeWatch(t *testing.T) {
 			}
 			node.Status.Capacity = corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse(capacity)}
 			node.Status.Allocatable = corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse(allocatable)}
-			return kubeClient.Status().Update(ctx, node)
+			if err := kubeClient.Status().Update(ctx, node); err != nil {
+				return err
+			}
+			version = node.ResourceVersion
+			return nil
 		}); err != nil {
 			t.Fatalf("writing host status: %v", err)
 		}
+		return version
 	}
-	assertWaiting() // the controller starts before its configured node exists
+	assertWaiting("") // requires an actual startup GET, not just initial ready=false
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: hostStorageNodeName}}
 	if err := kubeClient.Create(ctx, node); err != nil {
 		t.Fatalf("creating reference node: %v", err)
@@ -103,19 +113,18 @@ func TestHostStorageFollowsNodeWatch(t *testing.T) {
 	t.Cleanup(func() {
 		_ = kubeClient.Delete(ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: hostStorageNodeName}})
 	})
-	assertWaiting() // a created node is not a usable measurement without status
+	assertWaiting(node.ResourceVersion) // the watch must observe its missing status
 	writeDisk("160Gi", "144Gi")
 	assertDisk("160Gi", "144Gi")
 	writeDisk("40Gi", "36Gi")
 	assertDisk("40Gi", "36Gi")
-	writeDisk("40Gi", "41Gi")
-	assertWaiting() // invalid status must not preserve readiness indefinitely
+	assertWaiting(writeDisk("40Gi", "41Gi")) // invalid status must withdraw readiness
 	writeDisk("40Gi", "36Gi")
 	assertDisk("40Gi", "36Gi")
 	if err := kubeClient.Delete(ctx, node); err != nil {
 		t.Fatalf("deleting reference node: %v", err)
 	}
-	assertWaiting()
+	assertWaiting("")
 	replacement := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: hostStorageNodeName}}
 	if err := kubeClient.Create(ctx, replacement); err != nil {
 		t.Fatalf("recreating reference node: %v", err)

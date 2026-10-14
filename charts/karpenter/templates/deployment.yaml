@@ -1,3 +1,19 @@
+{{- $diskReference := .Values.settings.ephemeralStorageReference -}}
+{{- if not (has $diskReference.mode (list "static" "host" "node")) -}}
+{{- fail "settings.ephemeralStorageReference.mode must be static, host or node" -}}
+{{- end -}}
+{{- if eq $diskReference.mode "node" -}}
+{{- if not $diskReference.nodeName -}}
+{{- fail "settings.ephemeralStorageReference.nodeName is required in node mode" -}}
+{{- end -}}
+{{- else if $diskReference.nodeName -}}
+{{- fail "settings.ephemeralStorageReference.nodeName must be empty outside node mode" -}}
+{{- end -}}
+{{- range .Values.controller.env -}}
+{{- if eq .name "NODE_NAME" -}}
+{{- fail "controller.env must not contain NODE_NAME; use settings.ephemeralStorageReference" -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -72,9 +88,15 @@ spec:
             readOnlyRootFilesystem: true
           env:
             - name: NODE_NAME
+              {{- if eq $diskReference.mode "host" }}
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+              {{- else if eq $diskReference.mode "node" }}
+              value: {{ $diskReference.nodeName | quote }}
+              {{- else }}
+              value: ""
+              {{- end }}
             - name: CLEVER_CLOUD_REGION
               value: {{ .Values.settings.region | quote }}
             - name: LOG_LEVEL
