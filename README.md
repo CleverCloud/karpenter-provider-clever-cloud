@@ -134,12 +134,13 @@ controller talks to nothing but the cluster's Kubernetes API, so it needs no egr
 
 ### Global
 
-The controller is configured through environment variables, all set by the helm chart from its
-[values](charts/karpenter/README.md):
+The controller is configured through environment variables set by the Helm chart
+from its [values](charts/karpenter/README.md) and the pod's Downward API:
 
 | Name                      | Kind       | Default            | Required | Description                                                  |
 | ------------------------- | ---------- | ------------------ | -------- | ------------------------------------------------------------ |
 | `CLEVER_CLOUD_REGION`     | `String`   | `par`              | no       | Value of the `topology.kubernetes.io/region` and `topology.kubernetes.io/zone` labels on instance types and nodes (CKE is single-zone, Paris-only today) |
+| `NODE_NAME`              | `String`   | _(unset outside the chart)_ | no | Reference node for local ephemeral storage; the chart supplies `spec.nodeName`. Unset, the measured static disk fallback is used. |
 | `LOG_LEVEL`               | `String`   | `info`             | no       | `debug`, `info` or `error`                                   |
 | `METRICS_PORT`            | `Integer`  | `8080`             | no       | Port of the `/metrics` endpoint                              |
 | `HEALTH_PROBE_PORT`       | `Integer`  | `8081`             | no       | Port of the liveness/readiness probes                        |
@@ -195,11 +196,17 @@ reads that node's `status.capacity.ephemeral-storage` and
 `status.allocatable.ephemeral-storage` and uses them for **every new worker's disk**.
 The reference follows Node updates, with a one-minute periodic refresh; increases and
 decreases replace the previous disk profile instead of accumulating a minimum.
-Provisioning waits for the first valid observation. If the reference node disappears,
-starts terminating or reports invalid quantities, new provisioning waits for a valid
-reference again; existing-node cleanup continues. Transient API read failures retain
-the last valid observation. Capacity and allocatable must be positive whole bytes,
-with allocatable no greater than capacity.
+Before the first valid observation, or if the reference node disappears, starts
+terminating or reports invalid quantities, the scheduling catalogue advertises zero
+local disk capacity and allocatable. CPU, memory and pod capacity stay available:
+workloads whose combined `ephemeral-storage` requests are zero can still get workers.
+Positive requests, including those of applicable DaemonSets, wait for a valid disk
+reference. A NodePool with an explicit `spec.limits.ephemeral-storage` also waits,
+because an unknown disk size cannot be counted safely against that budget.
+Existing-node scheduling and cleanup continue. A valid observation automatically
+restores the disk capacity; transient API read failures retain the last valid
+observation without a TTL. Host capacity and allocatable must be positive whole
+bytes, with allocatable no greater than capacity.
 
 **Assumption: the controller's host has the disk and reservations that new workers
 will receive.** It is deliberately trusted for disk sizing, even when it belongs to a
@@ -214,8 +221,12 @@ so a leader change does not change the advertised disk.
 Each new NodeGroup records the resolved disk capacity and allocatable in its initial
 creation annotations. Retries and controller restarts describe that group with its
 original disk profile even after the host reference changes; adopting such a group
-never creates a replacement if the original disappears. Groups created before this
-feature have no snapshot and retain the previous catalogue-based description.
+never creates a replacement if the original disappears. A launch without a valid
+reference records a `0/0` snapshot: no local disk capacity was guaranteed when it was
+planned. This does not mean the VM has no disk. Once the node registers, core schedules
+against its actual Node status; a later reference observation does not rewrite the
+launch snapshot. Groups created before this feature have no snapshot and retain the
+previous catalogue-based description.
 
 Existing workers retain their actual disks. Their disk observations never change the
 new-launch profile, whether they are smaller or larger, and a profile change alone

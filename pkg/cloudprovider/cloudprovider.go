@@ -242,10 +242,19 @@ func (c *CloudProvider) resolveNodeGroupInstanceType(ctx context.Context, ng *ng
 var errEphemeralStorageNotReady = errors.New("waiting for valid ephemeral storage capacity from the controller's node")
 
 func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
-	if !c.instanceTypeProvider.EphemeralStorageReady() {
-		return nil, errEphemeralStorageNotReady
+	instanceTypes, diskReady := c.instanceTypes()
+	if !diskReady && hasDiskLimit(nodePool) {
+		return nil, fmt.Errorf("%w: nodepool %s has an ephemeral-storage limit", errEphemeralStorageNotReady, nodePool.Name)
 	}
-	return c.instanceTypes(), nil
+	return instanceTypes, nil
+}
+
+func hasDiskLimit(nodePool *karpv1.NodePool) bool {
+	if nodePool == nil {
+		return false
+	}
+	_, limited := nodePool.Spec.Limits[corev1.ResourceEphemeralStorage]
+	return limited
 }
 
 // instanceTypes is the catalogue as karpenter-core's scheduler must see it:
@@ -263,8 +272,8 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 // Get and List describe running NodeGroups from the plain catalogue instead:
 // buildNodeClaim takes the claim's zone, region and capacity-type labels from
 // the first available offering.
-func (c *CloudProvider) instanceTypes() []*cloudprovider.InstanceType {
-	instanceTypes := c.instanceTypeProvider.List()
+func (c *CloudProvider) instanceTypes() ([]*cloudprovider.InstanceType, bool) {
+	instanceTypes, diskReady := c.instanceTypeProvider.ListForProvisioning()
 	for _, it := range instanceTypes {
 		if !c.nodeGroupProvider.Unavailable(it.Name) {
 			continue
@@ -273,7 +282,7 @@ func (c *CloudProvider) instanceTypes() []*cloudprovider.InstanceType {
 			o.Available = false
 		}
 	}
-	return instanceTypes
+	return instanceTypes, diskReady
 }
 
 func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim) (cloudprovider.DriftReason, error) {
@@ -378,7 +387,7 @@ func (c *CloudProvider) resolveLaunch(ctx context.Context, nodeClaim *karpv1.Nod
 		instanceType, err := c.resolveNodeGroupInstanceType(ctx, existing)
 		return nodeClass, instanceType, err
 	}
-	instanceType, err := c.resolveInstanceType(nodeClaim)
+	instanceType, err := c.resolveInstanceType(ctx, nodeClaim)
 	if err != nil {
 		if errors.Is(err, errEphemeralStorageNotReady) {
 			return nil, nil, err // retry the existing claim when the reference recovers
@@ -431,11 +440,26 @@ func (c *CloudProvider) resolveNodeClassFromNodeClaim(ctx context.Context, nodeC
 // its cheapest option — including a rejection recorded while its launch
 // waited for the creation lock (see resolveLaunch) — falls to the next one, or
 // fails fast with none.
-func (c *CloudProvider) resolveInstanceType(nodeClaim *karpv1.NodeClaim) (*cloudprovider.InstanceType, error) {
+func (c *CloudProvider) resolveInstanceType(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*cloudprovider.InstanceType, error) {
 	// Recheck under the NodeGroup creation lock: a claim can have been planned
 	// before the reference disappeared or while its disk was still larger.
-	if !c.instanceTypeProvider.EphemeralStorageReady() {
-		return nil, errEphemeralStorageNotReady
+	instanceTypes, diskReady := c.instanceTypes()
+	if !diskReady {
+		requested := nodeClaim.Spec.Resources.Requests[corev1.ResourceEphemeralStorage]
+		if requested.Sign() > 0 {
+			return nil, errEphemeralStorageNotReady
+		}
+		// NodePool limits count machine capacity, not pod requests. Zero is
+		// an unknown disk, so it cannot be used to bypass an explicit budget.
+		if name := nodeClaim.Labels[karpv1.NodePoolLabelKey]; name != "" {
+			nodePool := &karpv1.NodePool{}
+			if err := c.apiReader.Get(ctx, types.NamespacedName{Name: name}, nodePool); err != nil {
+				return nil, fmt.Errorf("%w: checking nodepool disk limit: %w", errEphemeralStorageNotReady, err)
+			}
+			if hasDiskLimit(nodePool) {
+				return nil, fmt.Errorf("%w: nodepool %s has an ephemeral-storage limit", errEphemeralStorageNotReady, name)
+			}
+		}
 	}
 	requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
 	var best *cloudprovider.InstanceType
@@ -443,7 +467,7 @@ func (c *CloudProvider) resolveInstanceType(nodeClaim *karpv1.NodeClaim) (*cloud
 	// Flavors that would serve the claim but are unavailable right now, so
 	// that a failure names that cause only when it is the cause.
 	unavailable := 0
-	for _, it := range c.instanceTypes() {
+	for _, it := range instanceTypes {
 		if it.Requirements.Intersects(requirements) != nil {
 			continue
 		}

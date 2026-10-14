@@ -293,8 +293,8 @@ func NewProvider(region string, base []Flavor, overrides []FlavorOverride) *Prov
 }
 
 // RequireEphemeralStorageReference enables dynamic disk sizing. Call it before
-// starting provisioning: EphemeralStorageReady remains false until a valid
-// reference arrives. Repeated calls preserve an already established reference.
+// starting provisioning: new launches advertise no guaranteed disk until a
+// valid reference arrives. Repeated calls preserve an established reference.
 // Without this opt-in the measured static profiles retain their usual behavior.
 func (p *Provider) RequireEphemeralStorageReference() {
 	p.mu.Lock()
@@ -312,17 +312,17 @@ func (p *Provider) RequireEphemeralStorageReference() {
 }
 
 // EphemeralStorageReady reports whether provisioning has a usable disk profile.
-// Static mode is always ready. The caller gates new launches with this method;
-// Get/List keep describing instance types during a reference outage.
+// Static mode is always ready. An unknown disk permits launches with no disk
+// requests; ListForProvisioning returns their conservative resource catalogue.
 func (p *Provider) EphemeralStorageReady() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return !p.ephemeralStorageRequired || p.ephemeralStorageReady
 }
 
-// InvalidateEphemeralStorageReference suspends new provisioning without losing
-// the last valid profile used to describe existing instances. A subsequent Set
-// restores readiness, including when its values equal the previous reference.
+// InvalidateEphemeralStorageReference withdraws the disk guarantee for new
+// launches without losing the last profile describing existing instances.
+// A subsequent Set restores readiness, even with the same previous quantities.
 func (p *Provider) InvalidateEphemeralStorageReference() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -737,6 +737,30 @@ func (p *Provider) List() []*cloudprovider.InstanceType {
 		its = append(its, p.newInstanceTypeLocked(f))
 	}
 	return its
+}
+
+// ListForProvisioning returns a coherent catalogue and its disk readiness.
+// Without a valid dynamic reference, new workers advertise zero disk capacity
+// and allocatable: CPU/RAM-only requests can still launch, but a positive disk
+// request cannot consume an unmeasured fallback. Get/List keep the last profile
+// for existing machines. Callers must also preserve explicit NodePool disk
+// limits, which cannot account for a new worker whose disk size is unknown.
+func (p *Provider) ListForProvisioning() ([]*cloudprovider.InstanceType, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	ready := !p.ephemeralStorageRequired || p.ephemeralStorageReady
+	its := make([]*cloudprovider.InstanceType, 0, len(p.flavors))
+	for _, f := range p.flavors {
+		it := p.newInstanceTypeLocked(f)
+		if !ready {
+			it.Capacity[corev1.ResourceEphemeralStorage] = resource.Quantity{}
+			delete(it.Overhead.KubeReserved, corev1.ResourceEphemeralStorage)
+			delete(it.Overhead.SystemReserved, corev1.ResourceEphemeralStorage)
+			delete(it.Overhead.EvictionThreshold, corev1.ResourceEphemeralStorage)
+		}
+		its = append(its, it)
+	}
+	return its, ready
 }
 
 // served returns the catalogue entry for a flavor name.

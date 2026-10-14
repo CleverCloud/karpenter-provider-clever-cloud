@@ -48,8 +48,10 @@ func diskSnapshotAnnotations(it *cloudprovider.InstanceType) map[string]string {
 	return map[string]string{diskCapacityAnnotation: capacity.String(), diskAllocatableAnnotation: allocatable.String()}
 }
 
-// An absent snapshot is a pre-feature group. A partial or malformed snapshot
-// must not silently become a different disk during a retried Create.
+// An absent snapshot is a pre-feature group. A zero/zero pair explicitly records
+// a launch whose disk was unknown: it must not acquire the current reference's
+// capacity on a later read or adoption. A partial or malformed snapshot must not
+// silently become a different disk during a retried Create.
 func readDiskSnapshot(ng *ngv1.NodeGroup) (*diskSnapshot, error) {
 	capacity, hasCapacity := ng.Annotations[diskCapacityAnnotation]
 	allocatable, hasAllocatable := ng.Annotations[diskAllocatableAnnotation]
@@ -69,10 +71,13 @@ func readDiskSnapshot(ng *ngv1.NodeGroup) (*diskSnapshot, error) {
 			return nil, fmt.Errorf("nodegroup %s has invalid %s=%q: %w", ng.Name, field.name, field.value, err)
 		}
 		bytes := quantity.Value()
-		if bytes <= 0 || quantity.Cmp(*resource.NewQuantity(bytes, resource.DecimalSI)) != 0 {
-			return nil, fmt.Errorf("nodegroup %s has invalid %s=%q: expected positive whole bytes representable by int64", ng.Name, field.name, field.value)
+		if bytes < 0 || quantity.Cmp(*resource.NewQuantity(bytes, resource.DecimalSI)) != 0 {
+			return nil, fmt.Errorf("nodegroup %s has invalid %s=%q: expected non-negative whole bytes representable by int64", ng.Name, field.name, field.value)
 		}
-		*field.target = quantity
+		*field.target = *resource.NewQuantity(bytes, resource.BinarySI)
+	}
+	if snapshot.capacity.IsZero() != snapshot.allocatable.IsZero() {
+		return nil, fmt.Errorf("nodegroup %s disk snapshot must have two positive quantities or the unknown zero/zero pair", ng.Name)
 	}
 	if snapshot.allocatable.Cmp(snapshot.capacity) > 0 {
 		return nil, fmt.Errorf("nodegroup %s disk snapshot allocatable %s exceeds capacity %s", ng.Name, allocatable, capacity)

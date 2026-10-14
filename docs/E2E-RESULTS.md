@@ -558,3 +558,27 @@ change or outage and refuse to recreate a vanished or replaced NodeGroup.
 The full local validation passed: vet, lint, build, unit and race tests,
 envtest, chart lint/tests, e2e harness tests, generated CRD/manifest checks
 without drift, and govulncheck with no reachable vulnerabilities.
+
+## Provisioning without a disk measurement
+
+A subsequent change on 2026-10-14 removes the global startup gate. When
+the dynamic reference is unavailable, future workers advertise zero
+guaranteed ephemeral storage while retaining CPU, memory and pod capacity.
+This permits requests without local disk reservations. Positive disk
+requests, including DaemonSet overhead, and NodePools with an explicit
+ephemeral-storage limit still require a valid reference.
+
+Tests using the real Karpenter scheduler pass for mixed batches at startup
+and after reference invalidation: only the pod requiring disk waits, the
+other launches exactly one worker and reuses it while in flight. A zero/zero
+launch snapshot survives adoption and controller restart; once the Node
+registers, its actual disk status permits scheduling onto that worker.
+Other regressions cover DaemonSet disk reservations, NodePool disk limits,
+recovery, and remote 200Gi PVCs without a local disk request. Envtest checks
+the zero-disk catalogue through the real Node watch and its recovery.
+
+The follow-up passed vet, build, lint, all unit/race tests, envtest, chart
+lint/tests and e2e harness tests on Go 1.26.9. The live run `f27ee4` above
+predates this follow-up. An additional live probe was deferred because
+another review was actively using the test cluster; no controller was
+started and no cluster resources were changed for this follow-up.

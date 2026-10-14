@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -33,7 +34,10 @@ import (
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/disruption"
+	coresched "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/cloudprovider"
@@ -43,8 +47,8 @@ import (
 )
 
 // hostStorageProvider uses the same core scheduler/client harness as the
-// topology tests, with the production requirement that disk capacity be
-// learned before provisioning. The fake operator counts every NodeGroup POST.
+// topology tests, with the production requirement that disk capacity be learned
+// before provisioning claims that request it. The fake operator counts POSTs.
 func hostStorageProvider(t *testing.T) (*cloudprovider.CloudProvider, client.Client, *instancetype.Provider, *fakeOperator) {
 	t.Helper()
 	_, baseClient := newClusterStateProvider(t)
@@ -96,46 +100,250 @@ func registerHostStorageWorker(t *testing.T, cp *cloudprovider.CloudProvider, ku
 	return claim, node.Name
 }
 
-func TestHostStorageReferenceGatesProvisioning(t *testing.T) {
-	cp, kubeClient, itp, operator := hostStorageProvider(t)
+func TestHostStorageUnavailableMixedBatch(t *testing.T) {
+	for _, stage := range []string{"startup", "invalidated reference"} {
+		t.Run(stage, func(t *testing.T) {
+			cp, kubeClient, itp, operator := hostStorageProvider(t)
+			if stage == "invalidated reference" {
+				hostDisk(t, itp, "160Gi", "144Gi")
+				itp.InvalidateEphemeralStorageReference()
+			}
+			np := topologyNodePool("default")
+			seed(t, kubeClient, np)
+			cluster := state.NewCluster(clock.RealClock{}, kubeClient, cp)
+			plain, disk := pendingPod("without-disk-request"), diskPod("requires-disk", "1Gi")
+			results := provisioningPass(t, cp, kubeClient, cluster, np, disk, plain)
+			if len(results.NewNodeClaims) != 1 || results.PodErrors[plain] != nil || results.PodErrors[disk] == nil {
+				t.Fatalf("mixed batch must provision only the pod without disk requests: claims=%d plain=%v disk=%v", len(results.NewNodeClaims), results.PodErrors[plain], results.PodErrors[disk])
+			}
+			if pods := results.NewNodeClaims[0].Pods; len(pods) != 1 || pods[0].UID != plain.UID {
+				t.Fatalf("planned claim contains the wrong pods: %v", pods)
+			}
+			launched := launchPlanned(t, cp, kubeClient, results.NewNodeClaims[0], "default-unknown-disk")
+			assertClaimDisk(t, launched, "0", "0")
+			ng := &ngv1.NodeGroup{}
+			if err := kubeClient.Get(coreContext(), types.NamespacedName{Name: launched.Name}, ng); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{snapshotCapacity, snapshotAllocatable} {
+				quantity, err := resource.ParseQuantity(ng.Annotations[key])
+				if err != nil || !quantity.IsZero() {
+					t.Fatalf("unknown disk must persist a zero snapshot, %s=%q: %v", key, ng.Annotations[key], err)
+				}
+			}
+			cluster.UpdateNodeClaim(launched)
+			inflight := provisioningPass(t, cp, kubeClient, cluster, np, disk, plain)
+			if len(inflight.NewNodeClaims) != 0 || inflight.PodErrors[plain] != nil || inflight.PodErrors[disk] == nil || len(inflight.ExistingNodeToPodMapping()[launched.Name]) != 1 {
+				t.Fatalf("unknown in-flight disk must absorb only the plain pod: new=%d plain=%v disk=%v mapping=%v", len(inflight.NewNodeClaims), inflight.PodErrors[plain], inflight.PodErrors[disk], inflight.ExistingNodeToPodMapping())
+			}
+			// Recovery describes future workers, not the disk of a machine
+			// already launched while its capacity was unknown.
+			hostDisk(t, itp, "40Gi", "36Gi")
+			got, err := cp.Get(coreContext(), launched.Status.ProviderID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertClaimDisk(t, got, "0", "0")
+			again, err := cp.Create(coreContext(), launched)
+			if err != nil {
+				t.Fatalf("adopting the unknown-disk launch after recovery: %v", err)
+			}
+			assertClaimDisk(t, again, "0", "0")
+			recovered := provisioningPass(t, cp, kubeClient, cluster, np, disk)
+			if len(recovered.NewNodeClaims) != 1 || recovered.PodErrors[disk] != nil {
+				t.Fatalf("recovery must plan a known-disk worker: new=%d error=%v", len(recovered.NewNodeClaims), recovered.PodErrors[disk])
+			}
+			known := launchPlanned(t, cp, kubeClient, recovered.NewNodeClaims[0], "default-known-disk")
+			assertClaimDisk(t, known, "40Gi", "36Gi")
+			if operator.createCount() != 2 {
+				t.Fatalf("expected one unknown-disk and one known-disk launch, got %d POSTs", operator.createCount())
+			}
+			// Once the initially unknown worker registers, core must use the
+			// real Node status despite its immutable zero launch snapshot.
+			node := joinNode(t, kubeClient, ng, "0")
+			stampNode(t, kubeClient, node.Name)
+			registerNode(t, kubeClient, launched, node.Name)
+			actual := launched.DeepCopy()
+			actual.Status.Capacity[corev1.ResourceEphemeralStorage] = resource.MustParse("40Gi")
+			actual.Status.Allocatable[corev1.ResourceEphemeralStorage] = resource.MustParse("36Gi")
+			reportCapacity(t, kubeClient, node.Name, actual)
+			observeNode(t, kubeClient, cluster, node.Name)
+			cluster.UpdateNodeClaim(launched)
+			itp.InvalidateEphemeralStorageReference()
+			requireAbsorbed(t, provisioningPass(t, cp, kubeClient, cluster, np, disk), disk, "real node status supersedes unknown launch disk")
+		})
+	}
+}
+
+func TestHostStorageUnavailableCreateChecksRequestedDisk(t *testing.T) {
+	for _, stage := range []string{"startup", "invalidated reference"} {
+		t.Run(stage, func(t *testing.T) {
+			cp, kubeClient, itp, operator := hostStorageProvider(t)
+			if stage == "invalidated reference" {
+				hostDisk(t, itp, "160Gi", "144Gi")
+				itp.InvalidateEphemeralStorageReference()
+			}
+			ctx := coreContext()
+			seed(t, kubeClient, topologyNodePool("default"))
+			positive := claimFor("default-needs-disk", "128Mi", "2XS")
+			positive.Spec.Resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("1Gi")
+			stored(t, kubeClient, positive)
+			if _, err := cp.Create(ctx, positive); err == nil || corecloudprovider.IsInsufficientCapacityError(err) || corecloudprovider.IsNodeClassNotReadyError(err) {
+				t.Fatalf("positive disk request must wait with a retriable error: %T %v", err, err)
+			}
+			if operator.createCount() != 0 {
+				t.Fatalf("positive disk request caused %d POSTs", operator.createCount())
+			}
+			for _, request := range []string{"absent", "zero"} {
+				claim := claimFor("default-disk-"+request, "128Mi", "2XS")
+				if request == "zero" {
+					claim.Spec.Resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("0")
+				}
+				created, err := cp.Create(ctx, stored(t, kubeClient, claim))
+				if err != nil {
+					t.Fatalf("%s disk request must provision without a reference: %v", request, err)
+				}
+				assertClaimDisk(t, created, "0", "0")
+			}
+			if operator.createCount() != 2 {
+				t.Fatalf("expected exactly the absent/zero disk launches, got %d", operator.createCount())
+			}
+			hostDisk(t, itp, "40Gi", "36Gi")
+			created, err := cp.Create(ctx, positive)
+			if err != nil {
+				t.Fatalf("retrying positive disk request after recovery: %v", err)
+			}
+			assertClaimDisk(t, created, "40Gi", "36Gi")
+		})
+	}
+}
+
+func TestHostStorageUnavailablePreservesExistingWorker(t *testing.T) {
+	cp, kubeClient, itp, _ := hostStorageProvider(t)
+	hostDisk(t, itp, "160Gi", "144Gi")
+	np := topologyNodePool("default")
+	seed(t, kubeClient, np)
+	cluster := state.NewCluster(clock.RealClock{}, kubeClient, cp)
+	claim, _ := registerHostStorageWorker(t, cp, kubeClient, cluster, np)
+	itp.InvalidateEphemeralStorageReference()
+	pod := diskPod("uses-existing-disk", "100Gi")
+	requireAbsorbed(t, provisioningPass(t, cp, kubeClient, cluster, np, pod), pod, "known existing disk during reference outage")
+	got, err := cp.Get(coreContext(), claim.Status.ProviderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertClaimDisk(t, got, "160Gi", "144Gi")
+	list, err := cp.List(coreContext())
+	if err != nil || len(list) != 1 {
+		t.Fatalf("reference loss hid an existing worker: claims=%d error=%v", len(list), err)
+	}
+	assertClaimDisk(t, list[0], "160Gi", "144Gi")
+	if err := cp.Delete(coreContext(), claim); err != nil {
+		t.Fatalf("reference loss blocked worker deletion: %v", err)
+	}
+}
+
+// daemonStoragePass uses core's DaemonSet overhead calculation, passing its
+// pod template exactly as Provisioner does before scheduler construction.
+func daemonStoragePass(t *testing.T, cp *cloudprovider.CloudProvider, kubeClient client.Client, cluster *state.Cluster, np *karpv1.NodePool, ds *appsv1.DaemonSet, pod *corev1.Pod) coresched.Results {
+	t.Helper()
 	ctx := coreContext()
-	if types, err := cp.GetInstanceTypes(ctx, topologyNodePool("default")); err == nil || len(types) != 0 {
-		t.Fatalf("unmeasured host disk must not expose a schedulable catalogue: types=%d error=%v", len(types), err)
+	types, err := cp.GetInstanceTypes(ctx, np)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Even a claim with no ephemeral-storage request must wait: allowing the
-	// fallback seed here would silently promise an unmeasured disk at startup.
-	claim := stored(t, kubeClient, claimFor("default-before-measurement", "128Mi", "2XS"))
-	if _, err := cp.Create(ctx, claim); err == nil || corecloudprovider.IsInsufficientCapacityError(err) || corecloudprovider.IsNodeClassNotReadyError(err) {
-		t.Fatalf("Create must return a retriable observation error, got %T: %v", err, err)
+	instanceTypes := map[string][]*corecloudprovider.InstanceType{np.Name: types}
+	nodePools := []*karpv1.NodePool{np}
+	nodes := cluster.DeepCopyNodes().Active()
+	topology, err := coresched.NewTopology(ctx, kubeClient, cluster, nodes, nodePools, instanceTypes, []*corev1.Pod{pod})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := operator.createCount(); got != 0 {
-		t.Fatalf("created %d NodeGroups before the host was measured", got)
+	scheduler := coresched.NewScheduler(ctx, kubeClient, nodePools, cluster, nodes, topology, instanceTypes,
+		[]*corev1.Pod{daemonset.PodForDaemonSet(ds)}, noopRecorder{}, clock.RealClock{}, nil, nil,
+		coresched.DisableReservedCapacityFallback, coresched.MinValuesPolicy(options.MinValuesPolicyStrict))
+	results, err := scheduler.Solve(ctx, []*corev1.Pod{pod})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return results
+}
+
+func TestHostStorageUnavailableAccountsForDaemonSetRequests(t *testing.T) {
+	cp, kubeClient, itp, operator := hostStorageProvider(t)
+	np := topologyNodePool("default")
+	seed(t, kubeClient, np)
+	cluster := state.NewCluster(clock.RealClock{}, kubeClient, cp)
+	pod := pendingPod("app-without-disk-request")
+	daemonPod := diskPod("daemon", "256Mi")
+	ds := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "disk-agent", Namespace: "default", UID: "uid-disk-agent"},
+		Spec:       appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: daemonPod.Spec}},
+	}
+	results := daemonStoragePass(t, cp, kubeClient, cluster, np, ds, pod)
+	if len(results.NewNodeClaims) != 0 || results.PodErrors[pod] == nil {
+		t.Fatalf("DaemonSet disk request must block an otherwise plain pod: new=%d error=%v", len(results.NewNodeClaims), results.PodErrors[pod])
 	}
 	hostDisk(t, itp, "40Gi", "36Gi")
-	if _, err := cp.GetInstanceTypes(ctx, topologyNodePool("default")); err != nil {
-		t.Fatalf("catalogue remained blocked after measurement: %v", err)
+	results = daemonStoragePass(t, cp, kubeClient, cluster, np, ds, pod)
+	if len(results.NewNodeClaims) != 1 || results.PodErrors[pod] != nil {
+		t.Fatalf("known disk must fit the DaemonSet and app: new=%d error=%v", len(results.NewNodeClaims), results.PodErrors[pod])
 	}
-	created, err := cp.Create(ctx, claim)
-	if err != nil {
-		t.Fatalf("retrying the same claim after measurement: %v", err)
+	claim := results.NewNodeClaims[0].ToNodeClaim()
+	if requested := claim.Spec.Resources.Requests[corev1.ResourceEphemeralStorage]; requested.Cmp(resource.MustParse("256Mi")) != 0 {
+		t.Fatalf("scheduler omitted DaemonSet disk overhead: %s", requested.String())
 	}
-	if got := operator.createCount(); got != 1 {
-		t.Fatalf("retry created %d NodeGroups, want exactly one", got)
-	}
-	// Losing the source suspends new scheduling, but must not block the
-	// reads and deletion core needs to clean up an already launched worker.
+	claim.Name, claim.UID = "default-daemon-disk", "uid-default-daemon-disk"
+	stored(t, kubeClient, claim)
 	itp.InvalidateEphemeralStorageReference()
-	if _, err := cp.GetInstanceTypes(ctx, topologyNodePool("default")); err == nil {
-		t.Fatal("invalidated reference still permits new scheduling")
+	if _, err := cp.Create(coreContext(), claim); err == nil || corecloudprovider.IsInsufficientCapacityError(err) {
+		t.Fatalf("lost reference must hold the aggregate disk request for retry: %T %v", err, err)
 	}
-	if _, err := cp.Get(ctx, created.Status.ProviderID); err != nil {
-		t.Fatalf("reference loss blocked Get of an existing worker: %v", err)
+	if operator.createCount() != 0 {
+		t.Fatalf("DaemonSet disk launch issued %d POSTs without a reference", operator.createCount())
 	}
-	if claims, err := cp.List(ctx); err != nil || len(claims) != 1 {
-		t.Fatalf("reference loss hid an existing worker from List: claims=%d error=%v", len(claims), err)
+	hostDisk(t, itp, "40Gi", "36Gi")
+	if _, err := cp.Create(coreContext(), claim); err != nil {
+		t.Fatalf("aggregate request did not recover: %v", err)
 	}
-	if err := cp.Delete(ctx, created); err != nil {
-		t.Fatalf("reference loss blocked deletion of an existing worker: %v", err)
+}
+
+func TestHostStorageUnavailablePreservesNodePoolDiskLimit(t *testing.T) {
+	cp, kubeClient, itp, operator := hostStorageProvider(t)
+	limited := topologyNodePool("limited")
+	limited.Spec.Limits = karpv1.Limits{corev1.ResourceEphemeralStorage: resource.MustParse("200Gi")}
+	plain := topologyNodePool("default")
+	seed(t, kubeClient, limited, plain)
+	if _, err := cp.GetInstanceTypes(coreContext(), limited); err == nil {
+		t.Fatal("an unknown per-worker disk must not bypass the NodePool's total disk limit")
+	}
+	cluster := state.NewCluster(clock.RealClock{}, kubeClient, cp)
+	pod := pendingPod("without-local-request")
+	results := provisioningPass(t, cp, kubeClient, cluster, plain, pod)
+	if len(results.NewNodeClaims) != 1 || results.PodErrors[pod] != nil {
+		t.Fatalf("unlimited NodePool must remain schedulable: new=%d error=%v", len(results.NewNodeClaims), results.PodErrors[pod])
+	}
+	hostDisk(t, itp, "40Gi", "36Gi")
+	results = provisioningPass(t, cp, kubeClient, cluster, limited, pod)
+	if len(results.NewNodeClaims) != 1 || results.PodErrors[pod] != nil {
+		t.Fatalf("measured disk must permit the limited NodePool: new=%d error=%v", len(results.NewNodeClaims), results.PodErrors[pod])
+	}
+	claim := results.NewNodeClaims[0].ToNodeClaim()
+	claim.Name, claim.UID = "limited-planned-without-disk-request", "uid-limited-planned-without-disk-request"
+	if disk := claim.Spec.Resources.Requests[corev1.ResourceEphemeralStorage]; !disk.IsZero() {
+		t.Fatalf("harness claim unexpectedly requests disk: %s", disk.String())
+	}
+	stored(t, kubeClient, claim)
+	itp.InvalidateEphemeralStorageReference()
+	if _, err := cp.Create(coreContext(), claim); err == nil || corecloudprovider.IsInsufficientCapacityError(err) {
+		t.Fatalf("launch must recheck the NodePool disk budget after invalidation: %T %v", err, err)
+	}
+	if operator.createCount() != 0 {
+		t.Fatalf("unknown worker disk bypassed the NodePool limit with %d POSTs", operator.createCount())
+	}
+	hostDisk(t, itp, "40Gi", "36Gi")
+	if _, err := cp.Create(coreContext(), claim); err != nil {
+		t.Fatalf("limited NodePool launch did not recover: %v", err)
 	}
 }
 
@@ -232,14 +440,26 @@ func TestHostStorageDecreaseRecheckedBeforeCreate(t *testing.T) {
 }
 
 func TestHostStorageDoesNotLimitRemotePersistentVolumes(t *testing.T) {
-	for _, bound := range []bool{false, true} {
-		name := "WaitForFirstConsumer"
-		if bound {
-			name = "bound CSI volume"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		bound     bool
+		reference string
+	}{
+		{name: "WaitForFirstConsumer/known disk", reference: "known"},
+		{name: "bound CSI volume/known disk", bound: true, reference: "known"},
+		{name: "WaitForFirstConsumer/startup", reference: "startup"},
+		{name: "bound CSI volume/startup", bound: true, reference: "startup"},
+		{name: "WaitForFirstConsumer/invalidated", reference: "invalidated"},
+		{name: "bound CSI volume/invalidated", bound: true, reference: "invalidated"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			cp, kubeClient, itp, _ := hostStorageProvider(t)
-			hostDisk(t, itp, "40Gi", "36Gi")
+			if tc.reference != "startup" {
+				hostDisk(t, itp, "40Gi", "36Gi")
+			}
+			if tc.reference == "invalidated" {
+				itp.InvalidateEphemeralStorageReference()
+			}
 			bindingMode := storagev1.VolumeBindingWaitForFirstConsumer
 			sc := &storagev1.StorageClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "remote"}, Provisioner: "csi.example.com", VolumeBindingMode: &bindingMode,
@@ -254,7 +474,7 @@ func TestHostStorageDoesNotLimitRemotePersistentVolumes(t *testing.T) {
 					Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("200Gi")}},
 				},
 			}
-			if bound {
+			if tc.bound {
 				pv := &corev1.PersistentVolume{
 					ObjectMeta: metav1.ObjectMeta{Name: "remote-data"},
 					Spec: corev1.PersistentVolumeSpec{
@@ -270,16 +490,22 @@ func TestHostStorageDoesNotLimitRemotePersistentVolumes(t *testing.T) {
 			}
 			seed(t, kubeClient, sc, pvc)
 			np := topologyNodePool("default")
+			seed(t, kubeClient, np)
 			cluster := state.NewCluster(clock.RealClock{}, kubeClient, cp)
-			pod := diskPod("remote-data", "1Gi")
+			pod := pendingPod("remote-data")
+			if tc.reference == "known" {
+				pod = diskPod("remote-data", "1Gi")
+			}
 			withClaim(pod, pvc.Name)
 			results := provisioningPass(t, cp, kubeClient, cluster, np, pod)
 			if len(results.NewNodeClaims) != 1 || results.PodErrors[pod] != nil {
-				t.Fatalf("a 200Gi remote volume must fit alongside 1Gi local storage: claims=%d error=%v", len(results.NewNodeClaims), results.PodErrors[pod])
+				t.Fatalf("a 200Gi remote volume must not require 200Gi local storage: claims=%d error=%v", len(results.NewNodeClaims), results.PodErrors[pod])
 			}
 			claim := launchPlanned(t, cp, kubeClient, results.NewNodeClaims[0], "default-remote-volume")
-			if disk := claim.Status.Capacity[corev1.ResourceEphemeralStorage]; disk.Cmp(resource.MustParse("40Gi")) != 0 {
-				t.Fatalf("remote PVC changed local capacity: %s", disk.String())
+			if tc.reference == "known" {
+				assertClaimDisk(t, claim, "40Gi", "36Gi")
+			} else {
+				assertClaimDisk(t, claim, "0", "0")
 			}
 			cluster.UpdateNodeClaim(claim)
 			requireAbsorbed(t, provisioningPass(t, cp, kubeClient, cluster, np, pod), pod, "remote volume on a smaller in-flight local disk")

@@ -107,6 +107,10 @@ controller:
   # NODE_NAME is supplied by the downward API: the host node's local
   # ephemeral-storage capacity and allocatable define the disk resources
   # advertised for future workers.
+  # While the reference is unavailable, only disk capacity is advertised as
+  # zero: workloads with no ephemeral-storage request can still provision.
+  # Positive requests (including DaemonSets), and NodePools with an explicit
+  # ephemeral-storage limit, wait for a valid reference.
   # The host must represent newly provisioned workers, including their disk
   # reserve; old hosts do not discover a platform change affecting only new
   # nodes. Replicas must run on hosts with the same disk profile. This does

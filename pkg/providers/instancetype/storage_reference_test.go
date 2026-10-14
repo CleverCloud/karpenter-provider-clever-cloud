@@ -64,11 +64,60 @@ func TestEphemeralStorageReferenceReadiness(t *testing.T) {
 	}
 	p.InvalidateEphemeralStorageReference()
 	if p.EphemeralStorageReady() {
-		t.Fatal("an invalidated reference must stop provisioning")
+		t.Fatal("an invalidated reference must withdraw the disk guarantee")
 	}
 	assertDisk(t, p, "120Gi", "108Gi")
 	if !setDiskReference(t, p, "120Gi", "108Gi") || !p.EphemeralStorageReady() {
 		t.Fatal("the same valid reference must restore readiness")
+	}
+}
+
+func TestUnknownDiskPreservesOtherLaunchResources(t *testing.T) {
+	p := instancetype.NewProvider("par", nil, []instancetype.FlavorOverride{{Name: "2XL", CPU: ptr(int64(24)), MemoryKi: ptr(int64(40000000))}})
+	capacity, allocatable := nodeReport(4, 3700000, 3597600)
+	record(t, p, "2XS", capacity, allocatable)
+	// Static deployments keep their existing measured disk fallback.
+	static, ready := p.ListForProvisioning()
+	if !ready || len(static) != 7 {
+		t.Fatalf("static catalogue: ready=%t flavors=%d", ready, len(static))
+	}
+	p.RequireEphemeralStorageReference()
+	for _, phase := range []string{"startup", "invalidated"} {
+		if phase == "invalidated" {
+			setDiskReference(t, p, "160Gi", "144Gi")
+			p.InvalidateEphemeralStorageReference()
+			assertDisk(t, p, "160Gi", "144Gi") // existing-instance descriptions survive
+		}
+		launches, ready := p.ListForProvisioning()
+		if ready || len(launches) != len(static) {
+			t.Fatalf("%s: ready=%t flavors=%d", phase, ready, len(launches))
+		}
+		for i, it := range launches {
+			for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourcePods, corev1.ResourceEphemeralStorage} {
+				wantCapacity, wantAllocatable := static[i].Capacity[name], static[i].Allocatable()[name]
+				if name == corev1.ResourceEphemeralStorage {
+					wantCapacity, wantAllocatable = resource.Quantity{}, resource.Quantity{}
+				}
+				gotCapacity, gotAllocatable := it.Capacity[name], it.Allocatable()[name]
+				if gotCapacity.Cmp(wantCapacity) != 0 || gotAllocatable.Cmp(wantAllocatable) != 0 {
+					t.Fatalf("%s %s %s: capacity/allocatable=%s/%s, want %s/%s", phase, it.Name, name, gotCapacity.String(), gotAllocatable.String(), wantCapacity.String(), wantAllocatable.String())
+				}
+			}
+			if it.Offerings[0].Price != static[i].Offerings[0].Price || !it.Offerings[0].Available {
+				t.Fatalf("%s %s: unknown disk changed price or availability", phase, it.Name)
+			}
+		}
+	}
+	setDiskReference(t, p, "40Gi", "36Gi")
+	launches, ready := p.ListForProvisioning()
+	if !ready {
+		t.Fatal("valid reference did not restore the disk guarantee")
+	}
+	for _, it := range launches {
+		capacity, allocatable := it.Capacity[corev1.ResourceEphemeralStorage], it.Allocatable()[corev1.ResourceEphemeralStorage]
+		if capacity.Cmp(resource.MustParse("40Gi")) != 0 || allocatable.Cmp(resource.MustParse("36Gi")) != 0 {
+			t.Fatalf("%s retained unknown disk after recovery: %s/%s", it.Name, capacity.String(), allocatable.String())
+		}
 	}
 }
 
@@ -196,7 +245,7 @@ func TestEphemeralStorageReferenceConcurrentUpdatesAndObservations(t *testing.T)
 	p.RequireEphemeralStorageReference()
 	setDiskReference(t, p, "100Gi", "90Gi")
 	var workers sync.WaitGroup
-	for worker := range 4 {
+	for worker := range 5 {
 		workers.Go(func() {
 			for i := range 50 {
 				switch worker {
@@ -230,6 +279,19 @@ func TestEphemeralStorageReferenceConcurrentUpdatesAndObservations(t *testing.T)
 						if capacity.Cmp(resource.MustParse("100Gi")) == 0 && allocatable.Cmp(resource.MustParse("90Gi")) != 0 ||
 							capacity.Cmp(resource.MustParse("200Gi")) == 0 && allocatable.Cmp(resource.MustParse("180Gi")) != 0 {
 							t.Errorf("disk capacity/allocatable came from different profiles: %s/%s", capacity.String(), allocatable.String())
+						}
+					}
+				case 4:
+					launches, ready := p.ListForProvisioning()
+					var previous resource.Quantity
+					for i, it := range launches {
+						capacity, allocatable := it.Capacity[corev1.ResourceEphemeralStorage], it.Allocatable()[corev1.ResourceEphemeralStorage]
+						if i > 0 && previous.Cmp(capacity) != 0 {
+							t.Errorf("launch catalogue mixed disk profiles: %s/%s", previous.String(), capacity.String())
+						}
+						previous = capacity
+						if ready == capacity.IsZero() || ready == allocatable.IsZero() {
+							t.Errorf("launch disk readiness and resources disagree: ready=%t disk=%s/%s", ready, capacity.String(), allocatable.String())
 						}
 					}
 				}
