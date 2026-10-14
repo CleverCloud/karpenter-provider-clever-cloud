@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package ephemeralstorage uses the controller's own node as the explicitly
+// Package ephemeralstorage uses an explicitly selected node as the
 // trusted disk reference for future workers. It assumes that node's disk and
 // reservations represent new workers; it cannot discover a platform change
 // that has not reached the reference node.
@@ -31,9 +31,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics"
@@ -46,10 +46,11 @@ type Controller struct {
 	nodeName string
 }
 
-// NewController is only wired when NODE_NAME is set. The chart supplies it
-// from the pod's spec.nodeName, not a label a different kubelet can forge.
-// This node may be a fixed worker or control plane, so the normal managed
-// NodeGroup observation rules deliberately do not apply to this one source.
+// NewController is only wired when NODE_NAME is set. The chart can supply
+// the pod's spec.nodeName or an explicitly configured reference, never a label
+// another kubelet can forge. The operator must verify that its disk and
+// reservations represent future workers; control-plane equivalence has not
+// been measured. Normal managed-NodeGroup observation rules do not apply here.
 func NewController(reader client.Reader, provider *instancetype.Provider, nodeName string) *Controller {
 	provider.RequireEphemeralStorageReference()
 	metrics.HostEphemeralStorageReady.Set(0, nil)
@@ -88,7 +89,7 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	metrics.HostEphemeralStorageAllocatable.Set(allocatable.AsApproximateFloat64(), nil)
 	metrics.HostEphemeralStorageReady.Set(1, nil)
 	if changed {
-		log.FromContext(ctx).WithValues("Node", node.Name, "uid", node.UID,
+		log.FromContext(ctx).WithValues("referenceNode", node.Name, "uid", node.UID,
 			"capacity", capacity.String(), "allocatable", allocatable.String()).
 			Info("using controller node ephemeral storage for new workers")
 	}
@@ -103,10 +104,15 @@ func (c *Controller) invalidate() {
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
-		For(&corev1.Node{}).
-		WithEventFilter(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetName() == c.nodeName })).
-		// Also reconcile when the node is missing at startup: no Node event
-		// exists in that case, but disk requests need the reference to recover.
+		// All sources use the same queue key, so watch events and the periodic
+		// refresh share one retry/backoff loop. The singleton also observes and
+		// logs a missing reference at startup, before any Node event exists.
+		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+			if obj.GetName() != c.nodeName {
+				return nil
+			}
+			return []reconcile.Request{{}}
+		})).
 		WatchesRawSource(singleton.Source()).
 		Complete(c)
 }

@@ -412,7 +412,8 @@ func (f *framework) checkCluster(ctx context.Context) {
 
 // A reference typo or unhealthy test cluster must fail before CRDs and billed
 // workloads are created. Unlike the production controller, this preflight also
-// requires Ready: a live test needs a healthy baseline, not only valid numbers.
+// requires Ready and excludes Karpenter-managed nodes: a live test needs a
+// stable baseline that its own controller cannot consolidate away.
 func loadDiskReference(ctx context.Context, kubeClient client.Client, name string) (*corev1.Node, error) {
 	node := &corev1.Node{}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Name: name}, node); err != nil {
@@ -420,6 +421,9 @@ func loadDiskReference(ctx context.Context, kubeClient client.Client, name strin
 	}
 	if !node.DeletionTimestamp.IsZero() {
 		return nil, fmt.Errorf("node is terminating")
+	}
+	if _, managed := node.Labels[karpv1.NodePoolLabelKey]; managed {
+		return nil, fmt.Errorf("node carries %s: choose a fixed reference the test controller cannot deprovision", karpv1.NodePoolLabelKey)
 	}
 	ready := false
 	for _, condition := range node.Status.Conditions {

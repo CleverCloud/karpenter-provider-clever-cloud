@@ -85,35 +85,58 @@ plus `settings.flavors`. Delete any alert or dashboard built on them.
 
 ## Controller-node disk reference
 
-The chart sets `NODE_NAME` from the pod's `spec.nodeName`. The controller reads only
-that exact Node through the Kubernetes API; a worker label cannot nominate a
-reference. It trusts the host's disk report as representative of **future workers**,
-including its reservations. This is a deployment assumption, not something the
-provider can prove from old workers. CPU/RAM/pod capacity remain flavor-specific.
-The host may be a fixed worker or a control-plane node; verify that its disk and
-reservations match workers. With multiple controller replicas, use consistent hosts.
+The chart defaults to `settings.ephemeralStorageReference.mode: static`, preserving
+the measured worker disk profile across upgrades. Opt into `host` to derive
+`NODE_NAME` from the pod's `spec.nodeName`, or `node` with an explicit `nodeName`.
+The controller reads only that exact Node through the Kubernetes API; a worker
+label cannot nominate a reference. Its disk and reservations must represent
+**future workers**, which cannot be proved from old workers. CPU/RAM/pod capacity
+remain flavor-specific. Older fixed nodes can still have the former 39Gi disk,
+while new workers receive about 98Gi. Control-plane disk equivalence on ALL_IN_ONE
+has not been measured. Compare capacity **and allocatable** before opting in;
+see the [upgrade instructions](getting-started/installation.md#upgrading).
+With `host`, use `nodeSelector` to choose a representative fixed node and consistent
+hosts across replicas. With `node`, all replicas use the same explicit reference.
 
 `using controller node ephemeral storage for new workers` logs the source name, UID,
-capacity and allocatable on initialization, a profile change or recovery. The three
+capacity and allocatable on initialization, a profile change or recovery; the node
+name is the `referenceNode` field. The three
 host metrics expose the profile without adding per-node metric labels. No Kubernetes
-Event is emitted. Watch events and a one-minute refresh pick up updates. A reference
-may move in either direction; old workers cannot cap or inflate it.
+Event is emitted. Watch events and a one-minute refresh share one reconciliation
+queue and pick up updates. A reference may move in either direction; old workers cannot cap or inflate it.
 
 Before the first valid read, or after the host is observed missing, terminating or
 invalid, `host_ephemeral_storage_ready=0` means the disk size for future workers is
 unknown. The scheduling catalogue then exposes zero disk capacity and allocatable,
 while CPU, memory and pod capacity remain unchanged. A workload with zero total
-`ephemeral-storage` requests can still cause a launch. Positive requests, including
-those of applicable DaemonSets, wait for the reference to recover. A NodePool with an
+`ephemeral-storage` requests can still cause a launch. Positive requests wait for the
+reference to recover. Applicable DaemonSets count in that total: one DaemonSet with a positive disk request blocks **every new launch
+of that NodePool**, even for application pods requesting only CPU/RAM. A disk limit
+without a request can also become a request through Kubernetes defaulting, as can
+a LimitRange. Inspect the admitted pod and DaemonSet resources. A NodePool with an
 explicit `spec.limits.ephemeral-storage` waits as well: counting unknown disks as zero
-would bypass that budget. No static disk capacity is promised in this state.
+would bypass that budget. Its instance types remain present with unavailable
+offerings, so it can still remove empty nodes or consolidate without a replacement.
+No static disk capacity is promised in this state.
 
-A claim already planned with a positive disk request waits for recovery; if the
-next valid profile is too small, launch fails with insufficient capacity and core
-re-plans. Existing instances remain describable, their actual Node status remains
-available for scheduling, and termination/GC keep running. A transient API GET
+If the reference disappears after a claim was planned but before a new group is
+created, a positive disk request or explicit NodePool disk limit fails with
+insufficient capacity. Core deletes that unlaunched claim and re-plans against the
+zero-disk/unavailable catalogue; it does not retain a provider-ID-less claim that
+would suspend cluster-wide provisioning and disruption. Existing groups are adopted
+instead, including groups created before snapshots existed. A valid decrease that
+no longer fits a new launch also causes re-planning. Existing instances remain
+describable and actual Node status remains available for scheduling. Deletions and
+GC continue; replacements still require sufficient known resources. A transient API GET
 failure preserves the last valid profile and is retried; there is no TTL that makes
 it expire during an API outage, and a failed read cannot initialize a reference.
+An API failure checking launch prerequisites remains retriable rather than being
+misreported as insufficient capacity; core can still wait for that failed launch.
+
+Treat a prolonged loss of the reference as urgent when workloads need local disk.
+Expiration and other forced deletions are not paused by this signal. A worker can
+expire while no suitable replacement can be launched, leaving its disk-requesting
+pods Pending.
 
 The reference controller is leader-local. With multiple replicas, followers can
 expose zero until elected; aggregate by the labels identifying the installation
@@ -138,9 +161,24 @@ snapshot means no local disk capacity was guaranteed for that launch; it does no
 describe the physical disk. It stays zero after the reference recovers. Once the
 worker registers, core schedules against its actual Node status. Positive snapshots
 describe the original launch profile. Do not edit snapshots to resize a VM.
-Malformed/partial annotations make a retried Create wait with an error; Get/List
-log the problem and use the catalogue so cleanup remains possible. Groups predating
-this feature have no snapshot and keep their previous catalogue-based description.
+Malformed/partial annotations make a retried Create fail with an error; Get/List
+log the problem and use the catalogue so cleanup remains possible. This is not an
+indefinite hold: a claim without a provider ID blocks core's cluster synchronization
+and can reach its launch timeout (normally five minutes from the Launched condition's
+last transition), after which its group may be garbage-collected. Restore the exact
+original annotation pair from a reliable capture; do not guess a larger disk or
+remove platform finalizers. Groups predating this feature are adopted without a new
+POST and retain a catalogue-based description, which is not a historical measurement.
+Rollback to v0.14.0 ignores existing annotations without removing them; they are used
+again on re-upgrade. Groups created during rollback have no snapshot.
+
+A pending pod can show `FailedScheduling` with `no instance type has enough
+resources` and `ephemeral-storage`, which also occurs for genuinely oversized
+requests. Check reference readiness and byte gauges alongside controller errors,
+then inspect pod/DaemonSet requests and the NodePool disk limit. For an interrupted
+launch, inspect the NodeClaim's Launched condition and its events. The insufficient
+capacity event explains a lost reference; `launch_timeout` indicates a claim that
+remained unlaunched, for example because an API read or malformed snapshot failed.
 
 Inspect `kubectl get node <NODE_NAME> -o yaml` for missing, zero, fractional or
 inconsistent disk quantities; both capacity and allocatable must be positive whole
@@ -149,10 +187,12 @@ restores readiness automatically, even if the quantities are unchanged.
 
 If CKE changes future disks while the host retains its old disk, the reference
 remains old too; restarting the pod on that host cannot discover the change. Place
-Karpenter on a representative fixed node. The reference is for local ephemeral
-storage only: it neither sizes remote PVCs nor resizes existing disks. Local runs
+Karpenter on a representative fixed node using `nodeSelector`, or select the
+reference explicitly with `settings.ephemeralStorageReference.mode: node`. The
+reference is for local ephemeral storage only: it neither sizes remote PVCs nor resizes existing disks. Local runs
 without `NODE_NAME` use the static measured fallback and expose none of these three
-host gauges; set `NODE_NAME` explicitly to test the dynamic path.
+host gauges. `make run` clears an inherited `NODE_NAME`; use
+`make run RUN_NODE_NAME=<reference>` to opt in locally.
 
 ## Blocked cluster operations
 

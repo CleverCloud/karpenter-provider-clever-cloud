@@ -90,6 +90,9 @@ kubeconfig (leader election disabled):
 $ make run
 ```
 
+This uses the static disk profile. To select a representative node for dynamic local
+disk sizing, use `make run RUN_NODE_NAME=<reference-node>`.
+
 #### Build the docker image
 
 To build the docker image and push it to your registry, you can use the following commands:
@@ -140,7 +143,7 @@ from its [values](charts/karpenter/README.md) and the pod's Downward API:
 | Name                      | Kind       | Default            | Required | Description                                                  |
 | ------------------------- | ---------- | ------------------ | -------- | ------------------------------------------------------------ |
 | `CLEVER_CLOUD_REGION`     | `String`   | `par`              | no       | Value of the `topology.kubernetes.io/region` and `topology.kubernetes.io/zone` labels on instance types and nodes (CKE is single-zone, Paris-only today) |
-| `NODE_NAME`              | `String`   | _(unset outside the chart)_ | no | Reference node for local ephemeral storage; the chart supplies `spec.nodeName`. Unset, the measured static disk fallback is used. |
+| `NODE_NAME`              | `String`   | `""` | no | Reference node for local ephemeral storage. The chart controls it through `settings.ephemeralStorageReference`: empty in `static` mode, `spec.nodeName` in `host` mode, the configured name in `node` mode. |
 | `LOG_LEVEL`               | `String`   | `info`             | no       | `debug`, `info` or `error`                                   |
 | `METRICS_PORT`            | `Integer`  | `8080`             | no       | Port of the `/metrics` endpoint                              |
 | `HEALTH_PROBE_PORT`       | `Integer`  | `8081`             | no       | Port of the liveness/readiness probes                        |
@@ -191,9 +194,33 @@ another flavor when the claim allows one; pods that only that flavor fits stay p
 Overrides always win over the built-in values. Leave `settings.flavors` empty to use the built-in
 catalogue unchanged.
 
-The chart supplies `NODE_NAME` from the controller pod's `spec.nodeName`. The provider
-reads that node's `status.capacity.ephemeral-storage` and
-`status.allocatable.ephemeral-storage` and uses them for **every new worker's disk**.
+The chart defaults to **static local disk sizing**, preserving the measured profile
+from v0.14.0: `102624184Ki` capacity (about 97.9 Gi), with a 10% eviction reserve,
+and compatibility with old workers' `40971488Ki` disks (about 39.1 Gi). It cannot
+discover a future platform disk change. Choose the source explicitly through
+`settings.ephemeralStorageReference`:
+
+| `mode` | Disk source for future workers | `nodeName` |
+| --- | --- | --- |
+| `static` (default) | Built-in measured profile | Empty |
+| `host` | Controller pod's host, from `spec.nodeName` | Empty |
+| `node` | Explicitly selected reference Node | Required |
+
+For example, to follow a representative fixed worker independently of the
+controller's placement:
+
+```yaml
+settings:
+  ephemeralStorageReference:
+    mode: node
+    nodeName: fixed-workers-node0
+```
+
+In `host` and `node` modes, the provider reads the reference Node's
+`status.capacity.ephemeral-storage` and `status.allocatable.ephemeral-storage`
+and uses them for **every new worker's disk**. The chart always renders exactly
+one `NODE_NAME`, including an empty value in static mode; do not set it through
+`controller.env`, which rejects this reserved name.
 The reference follows Node updates, with a one-minute periodic refresh; increases and
 decreases replace the previous disk profile instead of accumulating a minimum.
 Before the first valid observation, or if the reference node disappears, starts
@@ -202,21 +229,34 @@ local disk capacity and allocatable. CPU, memory and pod capacity stay available
 workloads whose combined `ephemeral-storage` requests are zero can still get workers.
 Positive requests, including those of applicable DaemonSets, wait for a valid disk
 reference. A NodePool with an explicit `spec.limits.ephemeral-storage` also waits,
-because an unknown disk size cannot be counted safely against that budget.
-Existing-node scheduling and cleanup continue. A valid observation automatically
+because an unknown disk size cannot be counted safely against that budget. Its types
+remain in the catalogue with unavailable offerings, so empty-node cleanup continues.
+If the reference is lost after planning a disk-dependent claim, that unlaunched claim
+is failed as insufficient capacity and re-planned; it does not block cluster-wide
+synchronization while waiting for the reference. Existing-node scheduling and cleanup continue. A valid observation automatically
 restores the disk capacity; transient API read failures retain the last valid
 observation without a TTL. Host capacity and allocatable must be positive whole
 bytes, with allocatable no greater than capacity.
 
-**Assumption: the controller's host has the disk and reservations that new workers
-will receive.** It is deliberately trusted for disk sizing, even when it belongs to a
-fixed NodeGroup or is a control-plane node; CPU, memory and pod capacity are never
-copied from it. Its kubelet's disk report is authoritative and is not bounded by the
-old static seed. If CKE changes only future workers while that host remains old,
-this mechanism cannot discover the new size. Move the controller to a representative
-host when the platform changes; restarting it on the same old host is insufficient.
-If several controller replicas are configured, their hosts must agree on the profile
-so a leader change does not change the advertised disk.
+**Dynamic sizing assumes the reference has the disk and reservations that new
+workers will receive.** Verify both before opting in. Existing fixed workers retain
+their old disks after a platform change. The control-plane disk in `ALL_IN_ONE` has
+not been measured against the enlarged worker profile; being the controller's host
+does not establish that it is representative. CPU, memory and pod capacity are never
+copied from this reference.
+
+Use a stable node that Karpenter cannot deprovision. In `host` mode,
+`nodeSelector: {kubernetes.io/hostname: <representative-host>}` can restrict the
+controller to a verified host without weakening the default placement affinity.
+With several replicas, their hosts must have the same disk and reservations;
+`node` mode lets every replica use one explicit reference independently of placement.
+If CKE changes only future workers while the reference stays old, this mechanism
+cannot discover the new size: select a representative reference, or move the
+controller in host mode. Restarting it on the same old host is insufficient.
+
+A valid reference is authoritative in both directions. A disk near the historical
+39 Gi profile is not silently replaced with the larger static profile: that would
+overstate capacity after a genuine platform disk decrease.
 
 Each new NodeGroup records the resolved disk capacity and allocatable in its initial
 creation annotations. Retries and controller restarts describe that group with its
@@ -226,7 +266,8 @@ reference records a `0/0` snapshot: no local disk capacity was guaranteed when i
 planned. This does not mean the VM has no disk. Once the node registers, core schedules
 against its actual Node status; a later reference observation does not rewrite the
 launch snapshot. Groups created before this feature have no snapshot and retain the
-previous catalogue-based description.
+previous catalogue-based description; they are adopted without rechecking their
+original launch against the current disk reference.
 
 Existing workers retain their actual disks. Their disk observations never change the
 new-launch profile, whether they are smaller or larger, and a profile change alone
@@ -234,11 +275,12 @@ neither resizes nor drifts them. Remote PVCs provisioned through a StorageClass/
 are independent: a pod can use a 200Gi remote PVC on a node with a smaller local disk.
 Only its separate `ephemeral-storage` request consumes this local scheduling capacity.
 
-For local runs, set `NODE_NAME` explicitly to a representative node in the target
-cluster. With `NODE_NAME` unset, the provider retains the measured static fallback:
-`102624184Ki` capacity (about 97.9 Gi) with a 10% eviction reserve, and compatibility
-with the former `40971488Ki` disk (about 39.1 Gi). That fallback cannot discover a
-future platform disk change.
+For local runs, use `make run RUN_NODE_NAME=<reference-node>` to enable dynamic
+sizing. `make run` otherwise clears an inherited `NODE_NAME`. When starting the
+binary directly, set `NODE_NAME` to the representative node; unset or empty uses
+the same measured static profile as the chart's default. See the
+[installation and upgrade guide](docs/getting-started/installation.md#local-disk-reference)
+for choosing the reference and migrating existing environment overrides.
 
 CPU, memory and pod capacity still follow bounded observations from managed workers:
 

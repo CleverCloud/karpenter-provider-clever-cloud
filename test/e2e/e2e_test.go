@@ -226,6 +226,9 @@ func testProvision(t *testing.T, ctx context.Context, f *framework) {
 		if owners := nodegroup.NodeClaimOwners(ng); len(owners) != 1 || owners[0] != claim.Name {
 			t.Errorf("nodegroup %s owner references = %v, want [%s]", ng.Name, owners, claim.Name)
 		}
+		if err := validateProvisionDiskSnapshot(&claim, ng, f.referenceNode); err != nil {
+			t.Errorf("nodegroup %s disk snapshot: %v", ng.Name, err)
+		}
 		node := &corev1.Node{}
 		if err := f.client.Get(ctx, types.NamespacedName{Name: claim.Status.NodeName}, node); err != nil {
 			t.Errorf("node of claim %s: %v", claim.Name, err)

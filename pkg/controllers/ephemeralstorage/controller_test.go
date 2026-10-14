@@ -35,7 +35,25 @@ import (
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 )
 
-const readyMetric = "karpenter_clevercloud_instancetype_host_ephemeral_storage_ready"
+const (
+	readyMetric       = "karpenter_clevercloud_instancetype_host_ephemeral_storage_ready"
+	capacityMetric    = "karpenter_clevercloud_instancetype_host_ephemeral_storage_capacity_bytes"
+	allocatableMetric = "karpenter_clevercloud_instancetype_host_ephemeral_storage_allocatable_bytes"
+)
+
+func assertMetrics(t *testing.T, ready float64, capacity, allocatable string) {
+	t.Helper()
+	c, a := resource.MustParse(capacity), resource.MustParse(allocatable)
+	for name, want := range map[string]float64{
+		readyMetric:       ready,
+		capacityMetric:    c.AsApproximateFloat64(),
+		allocatableMetric: a.AsApproximateFloat64(),
+	} {
+		if got := metricstest.Value(t, name); got != want {
+			t.Errorf("%s = %g, want %g", name, got, want)
+		}
+	}
+}
 
 func host(capacity, allocatable string) *corev1.Node {
 	return &corev1.Node{
@@ -71,6 +89,7 @@ func TestHostReferenceUsesOnlyNamedNodeAndTracksBothDirections(t *testing.T) {
 	other := host("500Gi", "450Gi")
 	other.Name = "unrelated"
 	ctrl, provider, kubeClient := newController(node, other)
+	assertMetrics(t, 0, "0", "0")
 	if provider.EphemeralStorageReady() {
 		t.Fatal("must await first observation")
 	}
@@ -86,6 +105,7 @@ func TestHostReferenceUsesOnlyNamedNodeAndTracksBothDirections(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDisk(t, provider, "40Gi", "36Gi")
+	assertMetrics(t, 1, "40Gi", "36Gi")
 	if !provider.EphemeralStorageReady() || metricstest.Value(t, readyMetric) != 1 {
 		t.Fatal("valid reference did not enable provisioning")
 	}
@@ -98,10 +118,11 @@ func TestHostReferenceUsesOnlyNamedNodeAndTracksBothDirections(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertDisk(t, provider, disk.capacity, disk.allocatable)
+		assertMetrics(t, 1, disk.capacity, disk.allocatable)
 	}
 }
 
-func TestInvalidReferenceBlocksProvisioningUntilRecovery(t *testing.T) {
+func TestInvalidReferenceWithdrawsDiskGuaranteeUntilRecovery(t *testing.T) {
 	for _, failure := range []string{"missing", "missing-capacity", "missing-allocatable", "allocatable-exceeds-capacity", "terminating"} {
 		t.Run(failure, func(t *testing.T) {
 			ctx := context.Background()
@@ -140,10 +161,11 @@ func TestInvalidReferenceBlocksProvisioningUntilRecovery(t *testing.T) {
 				t.Fatal("invalid reference was accepted")
 			}
 			if provider.EphemeralStorageReady() || metricstest.Value(t, readyMetric) != 0 {
-				t.Fatal("invalid reference still allows provisioning")
+				t.Fatal("invalid reference still guarantees disk capacity")
 			}
 			// Existing instances can still be described with the last snapshot.
 			assertDisk(t, provider, "160Gi", "144Gi")
+			assertMetrics(t, 0, "160Gi", "144Gi")
 			if failure == "terminating" {
 				return
 			}
@@ -165,6 +187,7 @@ func TestInvalidReferenceBlocksProvisioningUntilRecovery(t *testing.T) {
 			if !provider.EphemeralStorageReady() || metricstest.Value(t, readyMetric) != 1 {
 				t.Fatal("valid unchanged quantities did not restore readiness")
 			}
+			assertMetrics(t, 1, "160Gi", "144Gi")
 		})
 	}
 }
@@ -187,12 +210,14 @@ func TestAPIFailurePreservesLastObservationButCannotInitialize(t *testing.T) {
 	reader := &failingReader{Reader: kubeClient, err: errors.New("API unavailable")}
 	provider := instancetype.NewProvider("par", nil, nil)
 	ctrl := ephemeralstorage.NewController(reader, provider, "controller-host")
+	assertMetrics(t, 0, "0", "0")
 	if _, err := ctrl.Reconcile(ctx, reconcile.Request{}); err == nil {
 		t.Fatal("expected API error")
 	}
 	if provider.EphemeralStorageReady() {
 		t.Fatal("API error cannot enable static fallback")
 	}
+	assertMetrics(t, 0, "0", "0")
 	reader.err = nil
 	if _, err := ctrl.Reconcile(ctx, reconcile.Request{}); err != nil {
 		t.Fatal(err)
@@ -205,4 +230,5 @@ func TestAPIFailurePreservesLastObservationButCannotInitialize(t *testing.T) {
 		t.Fatal("transient API error discarded the valid reference")
 	}
 	assertDisk(t, provider, "80Gi", "72Gi")
+	assertMetrics(t, 1, "80Gi", "72Gi")
 }

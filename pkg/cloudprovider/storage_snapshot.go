@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
 const (
@@ -85,13 +86,12 @@ func readDiskSnapshot(ng *ngv1.NodeGroup) (*diskSnapshot, error) {
 	return snapshot, nil
 }
 
-// Read uncached under createMu, before selecting a new launch profile. A known
-// snapshot turns this attempt into adoption only; the provider must never POST
-// a replacement if this group disappears after the read.
+// Read uncached under createMu, before selecting a new launch profile. An owned
+// group turns this attempt into adoption only, including a pre-feature group
+// without a disk snapshot; the provider must never POST a replacement if this
+// group disappears after the read. resolveLaunch checks that the claim is still
+// wanted after this lookup and before the provider can launch or adopt anything.
 func (c *CloudProvider) existingDiskLaunch(ctx context.Context, claim *karpv1.NodeClaim) (*ngv1.NodeGroup, error) {
-	if err := c.checkNodeClaimWanted(ctx, claim); err != nil {
-		return nil, err
-	}
 	existing := &ngv1.NodeGroup{}
 	if err := c.apiReader.Get(ctx, types.NamespacedName{Name: claim.Name}, existing); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -99,12 +99,11 @@ func (c *CloudProvider) existingDiskLaunch(ctx context.Context, claim *karpv1.No
 		}
 		return nil, fmt.Errorf("checking for an existing nodegroup launch, %w", err)
 	}
-	snapshot, err := readDiskSnapshot(existing)
-	if err != nil {
-		return nil, err
+	if !nodegroup.OwnedByNodeClaim(existing, claim) {
+		return nil, fmt.Errorf("nodegroup %q already exists and is not managed by this nodeclaim", existing.Name)
 	}
-	if snapshot == nil {
-		return nil, nil
+	if _, err := readDiskSnapshot(existing); err != nil {
+		return nil, err
 	}
 	return existing, nil
 }

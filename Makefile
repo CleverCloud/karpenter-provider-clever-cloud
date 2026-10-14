@@ -19,6 +19,7 @@ SETUP_ENVTEST_VERSION ?= v0.25.1
 ENVTEST_K8S_VERSION ?= 1.37.0
 IMAGE ?= ghcr.io/clevercloud/karpenter
 TAG ?= dev
+RUN_NODE_NAME ?=
 # Helm chart version derived from TAG (v0.2.0 -> 0.2.0)
 CHART_VERSION ?= $(TAG:v%=%)
 
@@ -31,7 +32,7 @@ build: ## Build the controller binary
 
 .PHONY: run
 run: build ## Run the controller locally against the current kubeconfig
-	DISABLE_LEADER_ELECTION=true ./bin/karpenter-clevercloud
+	NODE_NAME="$(RUN_NODE_NAME)" DISABLE_LEADER_ELECTION=true ./bin/karpenter-clevercloud
 
 .PHONY: test
 test: ## Run unit tests
@@ -43,7 +44,7 @@ test-envtest: ## Run controller integration tests against a real kube-apiserver 
 	@# command's env prefix is silently discarded by sh, and the suite would
 	@# skip itself on the resulting empty KUBEBUILDER_ASSETS — a green no-op.
 	assets="$$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) -p path)" && \
-		KUBEBUILDER_ASSETS="$$assets" go test -count=1 ./test/envtest/...
+		KUBEBUILDER_ASSETS="$$assets" go test -count=1 ./test/envtest/... ./test/chart/...
 
 .PHONY: test-chart
 test-chart: ## Assert the rendered chart's controller placement (requires helm)
