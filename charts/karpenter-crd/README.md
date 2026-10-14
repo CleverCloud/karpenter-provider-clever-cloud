@@ -25,8 +25,8 @@ sync-chart-crds` regenerates both charts from them.
 ## Install
 
 Each release publishes the chart to ghcr.io as an OCI artifact, versioned on
-the release tag without the `v` prefix (release `v0.13.0` → chart version
-`0.13.0`):
+the release tag without the `v` prefix (release `v0.14.0` → chart version
+`0.14.0`):
 
 ```sh
 helm upgrade --install karpenter-crd \
