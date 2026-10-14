@@ -420,3 +420,82 @@ separately by deterministic tests with the real event deduplication logic.
 The production GC cadence remains two minutes. The prior upgrade and
 this zero-worker diagnostic probe establish different properties; neither
 reproduces a persistently `FAILED` cluster.
+
+
+---
+
+# Expanded worker disk capacity (2026-10-14)
+
+The platform rollout enlarges the disk of every newly created worker,
+including workers launched in older clusters; existing workers retain
+their disk size. This rollout contract was confirmed by the platform owner.
+
+Measured on `karpenter-review`
+(`kubernetes_01M4WSYD7Q0BS4FRV9GSTCT4A2`, Kubernetes 1.36.3,
+kernel 7.2.10) on 2026-10-14: the baseline XS and a freshly created,
+NoSchedule-tainted 2XS worker reported the same disk values. The new 2XS
+Node appeared at 12:38:58 Europe/Paris (CEST, UTC+02:00). Read-only checks
+of eight workers created on 2026-10-07 in the older `csi-migration-tests`
+cluster also returned those disk values. No Kubernetes 1.37 cluster was
+available for this measurement; the current disk size was not inferred
+from its Kubernetes version.
+
+| Resource | Current worker | Former worker profile |
+|---|---|---|
+| Ephemeral-storage capacity | 102624184Ki (about 97.9Gi) | 40971488Ki (about 39.1Gi) |
+| Ephemeral-storage allocatable | 94578447818 bytes (about 88.1Gi) | 37759323279 bytes (about 35.2Gi) |
+
+The new seed reserves 10262419Ki (10% rounded up), advertising 92361765Ki
+allocatable before observation: 458 bytes below the measured value.
+The former profile remains valid evidence from the September measurement,
+but cannot reduce the disk advertised for new launches. Its CPU, memory
+and pod observations still contribute to their normal per-resource minima.
+Existing-node placement continues to use that Node's actual capacity;
+the change does not resize or drift old workers. Unknown intermediate or
+inflated disk reports remain refused rather than widening the tolerance
+across the gap between the two profiles.
+
+The disposable measurement group was deleted through the NodeGroup API;
+no platform finalizer was removed manually. Unit tests cover both profile
+orders, missing-disk overhead fallback, and invalid profile pairs. A test
+using core's scheduler shows a 1Gi request using an old worker, a 50Gi
+request getting a new worker, and the same request staying on that in-flight
+claim without another launch; the old claim does not drift.
+
+
+## Combined end-to-end validation
+
+The complete suite passed against `karpenter-review` with the security,
+quota, deletion-observability and disk fixes combined (run `60416a`,
+2026-10-14; Go 1.26.9). The integration tree was `b412b5b`; stacking the
+PR branches reproduced that tree exactly before the final documentation
+and test-comment clarification. No capacity assertion was disabled.
+
+| Scenario | Result | Duration |
+|---|---|---|
+| Provision | PASS | 60.71 s |
+| ConsolidationScaleToZero | PASS | 65.40 s |
+| Drift | PASS | 115.71 s |
+| GarbageCollection | PASS | 346.20 s |
+| QuotaFastFail | PASS | 10.61 s |
+
+`TestE2E` completed in 725.28 s including setup and cleanup. There were no
+managed workers at startup: the two pending pods, each requesting 50Gi of
+ephemeral storage, became Running on two freshly provisioned 2XS workers
+in 55 s. Both reported the new disk capacity and allocatable above. The
+Provision assertions verified zero capacity-rejection and acceptance-timeout
+deltas. A metrics snapshot during final cleanup still showed both counters
+at zero, the deletion-overdue gauge at zero, and one expected quota
+rejection. No overdue-deletion diagnostic appeared in the controller log.
+
+The ownerless decoy survived the GC, and the orphaned group's owner-reference
+cascade reaped it before the provider sweep. After normal cleanup and its
+two-minute recheck, Kubernetes showed only the original manual NodeGroup
+and Node, with their original UIDs, and no NodeClaims, NodePools,
+CleverNodeClasses or test namespace. The platform API independently showed
+an ACTIVE cluster with only its original worker group. Pre-existing Karpenter
+CRDs were retained.
+
+The full local validation also passed on the standalone changes and their
+combined tree: vet, lint, build, unit/race tests, envtest, chart lint/tests,
+vulnerability scan, and generated CRD/manifest checks without drift.

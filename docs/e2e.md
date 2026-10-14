@@ -127,11 +127,17 @@ kubectl --context <kubeconfig-context> -n karpenter scale deployment/karpenter -
 
 ### Scenarios (serial — they share the org quota)
 
-1. **Provision** — 2 pending pods → running pods; every NodeClaim
+1. **Provision** — 2 pending pods requesting 50Gi ephemeral storage each →
+   running pods. These requests exceed the former ~35Gi allocatable disk
+   catalogue. On a cluster with no pre-existing managed nodes, they prove
+   provisioning with the expanded worker disk before any live capacity
+   observation; the harness warns about existing managed groups but does not
+   refuse them. These requests reserve scheduling capacity without writing data. Every NodeClaim
    `Registered`, its NodeGroup managed + `nodeCount: 1` + owner-referenced,
    its node stamped with `clevercloud://<nodegroup>`; the node's
    `status.capacity` matches the built-in catalogue (cpu exactly, memory
-   within 1%) and the controller refused no capacity report
+   within 1%); ephemeral-storage capacity and allocatable also match the
+   catalogue within 1%, and the controller refused no capacity report
    (`instancetype_observed_capacity_rejections_total` scraped and = 0; it
    counts every node of a managed group the controller watches — in a
    dedicated test cluster, the suite's own), and no launch ended in an

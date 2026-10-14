@@ -17,9 +17,11 @@ limitations under the License.
 // Package instancetype exposes the Clever Kubernetes Engine node flavors as
 // Karpenter instance types.
 //
-// Capacity figures for every flavor were measured on live CKE nodes
-// (status.capacity on 2026-09-30: Kubernetes 1.37.0, kernel 7.2.8). The
-// kernel-visible memory moves with the platform's node image, so nodes of this
+// CPU and memory figures for every flavor were measured on live CKE nodes
+// (status.capacity on 2026-09-30: Kubernetes 1.37.0, kernel 7.2.8). Disk
+// capacity was re-measured on 2026-10-14 (Kubernetes 1.36.3, kernel 7.2.10)
+// after the platform enlarged every new worker's disk; old workers keep theirs.
+// The kernel-visible memory moves with the platform's node image, so nodes of this
 // provider's NodeGroups keep correcting it at runtime, within bounds
 // (RecordObservedCapacity). Offering prices are not a currency: they are a
 // unitless cost relative to the smallest flavor, derived from each flavor's cpu
@@ -61,9 +63,9 @@ const (
 	// observedTolerance is how far a node's reported memory, ephemeral
 	// storage and pod capacity, and every allocatable figure, may stray from
 	// what its flavor's catalogue entry advertises before
-	// RecordObservedCapacity refuses the report (cpu capacity must be equal). The VMs of a flavor are
-	// identical, and the two node images measured so far differ by at most
-	// 5.3%; a report beyond 10% does not describe a VM of that flavor.
+	// RecordObservedCapacity refuses the report (cpu capacity must be equal).
+	// The historical smaller disk has its own bounded profile, which never
+	// changes the disk advertised for new launches (see RecordObservedCapacity).
 	observedTolerance = 0.10
 )
 
@@ -145,14 +147,20 @@ var (
 		return flavors
 	}()
 
-	// All flavors share the same disk and pod capacity (measured).
-	ephemeralStorage = resource.MustParse("40971488Ki")
+	// Every new worker now receives this disk, including on older clusters
+	// (measured 2026-10-14). Existing workers retain their smaller disk.
+	ephemeralStorage = resource.MustParse("102624184Ki")
 	maxPods          = resource.MustParse("110")
+	// The disk measured on 2026-09-30. Its reports remain valid, but cannot
+	// describe what a new launch will receive after the platform rollout.
+	legacyEphemeralStorage     = resource.MustParse("40971488Ki")
+	legacyEphemeralAllocatable = resource.MustParse("37759323279")
 
 	// Measured overhead: exactly 100MiB of memory reserved for the kubelet,
-	// and a 10% hard eviction threshold on ephemeral storage.
+	// and a 10% hard eviction threshold on ephemeral storage (rounded up to
+	// KiB, conservatively below the measured 94578447818 allocatable bytes).
 	kubeReservedMemory         = resource.MustParse("100Mi")
-	evictionEphemeralThreshold = resource.MustParse("4097149Ki")
+	evictionEphemeralThreshold = resource.MustParse("10262419Ki")
 )
 
 // RelativePrice is the price of every offering: the unitless cost of a flavor
@@ -448,7 +456,7 @@ var ErrImplausibleCapacity = errors.New("implausible observed capacity")
 // the catalogue follows the capacity the platform really delivers: the
 // kernel-visible memory moves with the node image, and a seed measured on
 // another image makes karpenter pack pods no real node can hold. Only the
-// resources that generalize across a flavor's homogeneous VMs are kept;
+// resources that generalize across new VMs of a flavor are kept;
 // per-node extended resources never enter the catalogue. A report without
 // cpu or memory (a node that has not posted its status yet) is ignored.
 //
@@ -458,11 +466,14 @@ var ErrImplausibleCapacity = errors.New("implausible observed capacity")
 // flavor's capacity for the whole cluster. So a report is refused (an error
 // wrapping ErrImplausibleCapacity) unless it could describe a VM of the
 // flavor's catalogue entry (checkObservation), and accepted reports are
-// aggregated per resource by MINIMUM: the catalogue never promises more than
-// the smallest node of the flavor delivered, whatever order nodes report in,
-// and no node can raise a figure another one lowered. The minimum lasts for
-// the process lifetime — a node's departure does not raise it back, a
-// restart re-learns it from the nodes then running.
+// aggregated per resource by MINIMUM, whatever order nodes report in, so no
+// node can raise a figure another one lowered. The minimum lasts for the
+// process lifetime. The one exception is a disk matching the documented
+// legacy profile: old workers keep it, but every new worker receives the
+// larger disk. Its capacity and allocatable are validated against that
+// profile, then omitted from observations so an old worker cannot cap new
+// launches at its obsolete disk size. Its other resources still contribute
+// to the minimum; scheduling onto existing nodes uses their actual status.
 //
 // A flavor with no catalogue entry and no sizing seed (an override-only
 // flavor whose override was removed while its nodes still run) has nothing to
@@ -478,8 +489,17 @@ func (p *Provider) RecordObservedCapacity(flavor string, capacity, allocatable c
 	}
 	observed := observedCapacity{capacity: filterGeneralizable(capacity), allocatable: filterGeneralizable(allocatable)}
 	if ref, ok := p.reference(flavor); ok {
+		legacyDisk := math.Abs(deviation(observed.capacity[corev1.ResourceEphemeralStorage], legacyEphemeralStorage)) <= observedTolerance
+		if legacyDisk {
+			ref.capacity[corev1.ResourceEphemeralStorage] = legacyEphemeralStorage
+			ref.allocatable[corev1.ResourceEphemeralStorage] = legacyEphemeralAllocatable
+		}
 		if err := checkObservation(ref, observed); err != nil {
 			return 0, fmt.Errorf("%w for flavor %q: %v", ErrImplausibleCapacity, flavor, err)
+		}
+		if legacyDisk {
+			delete(observed.capacity, corev1.ResourceEphemeralStorage)
+			delete(observed.allocatable, corev1.ResourceEphemeralStorage)
 		}
 		memoryDeviation = deviation(observed.capacity[corev1.ResourceMemory], ref.capacity[corev1.ResourceMemory])
 	} else if err := checkConsistent(observed); err != nil {
@@ -546,6 +566,14 @@ func checkObservation(ref, obs observedCapacity) error {
 		got, want = obs.allocatable[name], ref.allocatable[name]
 		if math.Abs(deviation(got, want)) > observedTolerance {
 			return fmt.Errorf("%s allocatable %s is more than %.0f%% off the catalogue entry's %s", name, got.String(), observedTolerance*100, want.String())
+		}
+		if name == corev1.ResourceEphemeralStorage {
+			capacity, referenceCapacity := obs.capacity[name], ref.capacity[name]
+			ratio := got.AsApproximateFloat64() / capacity.AsApproximateFloat64()
+			referenceRatio := want.AsApproximateFloat64() / referenceCapacity.AsApproximateFloat64()
+			if math.Abs(ratio/referenceRatio-1) > observedTolerance {
+				return fmt.Errorf("ephemeral-storage allocatable/capacity ratio %.1f%% is more than %.0f%% off the disk profile's %.1f%%", ratio*100, observedTolerance*100, referenceRatio*100)
+			}
 		}
 	}
 	return nil
@@ -709,9 +737,13 @@ func (p *Provider) newInstanceType(f Flavor) *cloudprovider.InstanceType {
 	capacity, overhead := staticCapacity(f)
 	p.mu.RLock()
 	if obs, ok := p.observed[f.Name]; ok {
+		// A missing resource keeps both its capacity AND its allocatable
+		// fallback. In particular, ignoring a legacy disk must not discard
+		// the new disk's eviction reserve when memory was observed.
+		allocatable := lo.Assign(resources.Subtract(capacity, overhead.Total()), obs.allocatable)
 		capacity = lo.Assign(capacity, obs.capacity)
 		overhead = &cloudprovider.InstanceTypeOverhead{
-			KubeReserved: resources.Subtract(obs.capacity, obs.allocatable),
+			KubeReserved: resources.Subtract(capacity, allocatable),
 		}
 	}
 	p.mu.RUnlock()
