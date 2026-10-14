@@ -191,7 +191,7 @@ func TestRecordObservedCapacityRefusesImplausibleReports(t *testing.T) {
 			if pods := it.Capacity[corev1.ResourcePods]; pods.Value() != 110 {
 				t.Errorf("served pods %s, want the entry's 110", pods.String())
 			}
-			if storage, want := it.Capacity[corev1.ResourceEphemeralStorage], resource.MustParse("40971488Ki"); storage.Cmp(want) != 0 {
+			if storage, want := it.Capacity[corev1.ResourceEphemeralStorage], resource.MustParse(currentDiskCapacity); storage.Cmp(want) != 0 {
 				t.Errorf("served ephemeral storage %s, want the entry's %s", storage.String(), want.String())
 			}
 		})

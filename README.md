@@ -151,8 +151,9 @@ The controller is configured through environment variables, all set by the helm 
 
 ### Flavor catalogue
 
-The controller ships a built-in catalogue (`2XS`…`XL`) with capacities measured on live CKE nodes
-(2026-09-30, Kubernetes 1.37, kernel 7.2.8); it fetches nothing at runtime. `settings.flavors` lets
+The controller ships a built-in catalogue (`2XS`…`XL`) with CPU and memory measured on live CKE
+nodes (2026-09-30, Kubernetes 1.37, kernel 7.2.8), and disk capacity re-measured on 2026-10-14
+(Kubernetes 1.36.3, kernel 7.2.10); it fetches nothing at runtime. `settings.flavors` lets
 you **overlay per-flavor overrides** on top of that built-in catalogue — the chart renders it into a
 ConfigMap mounted at `/etc/karpenter/flavors/flavors.yaml` and points `FLAVORS_CONFIG_PATH` at it.
 Every field except `name` is optional: set only what you want to pin, the rest fall through to the
@@ -197,10 +198,20 @@ status, so a report is only trusted within bounds:
   flavor. The node's group is the one its **name** designates (CKE names a group's nodes
   `<nodegroup>-node<N>`, and a kubelet cannot rename its node), so nodes of fixed nodegroups
   and of the control plane are never used, whatever their labels claim;
-- its `cpu` must equal the catalogue entry's (built-in or overridden), and its memory, disk and
-  pod figures must be within 10% of it;
-- the smallest accepted node of a flavor wins, so the catalogue never promises more than the
-  smallest node of that flavor delivered.
+- its `cpu` must equal the catalogue entry's (built-in or overridden), and its memory and pod
+  figures must be within 10% of it. Disk capacity, allocatable and their ratio must be within
+  10% of a measured current or legacy disk profile;
+- the smallest accepted figure of a flavor wins for each resource, except legacy disks,
+  which cannot describe what a new worker receives.
+
+Every new worker, including on existing clusters, now receives `102624184Ki` (about 97.9 Gi)
+of ephemeral storage, with about 88.1 Gi allocatable after the 10% eviction reserve. Old workers
+keep their `40971488Ki` disk (about 39.1 Gi). Their bounded capacity reports still correct memory
+and other resources, but their disk figures are excluded from the new-launch catalogue, so an
+old worker cannot prevent provisioning pods requesting more than its roughly 35.2 Gi allocatable.
+Existing-node scheduling uses each node's actual capacity. This catalogue update neither resizes
+old disks nor marks their NodeClaims drifted. Unknown disk sizes are still rejected; the
+compatibility allowance covers only the measured legacy profile, with its own 10% bounds.
 
 A `memoryKi` override is therefore corrected by nodes within 10% of it, and served as-is
 otherwise. What a compromised node of a karpenter NodeGroup can still do is move its own

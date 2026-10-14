@@ -40,6 +40,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -151,7 +152,14 @@ func testProvision(t *testing.T, ctx context.Context, f *framework) {
 	if err != nil || !found {
 		t.Fatalf("scraping acceptance_timeouts_total before the launches: found=%v, err=%v", found, err)
 	}
-	if err := f.client.Create(ctx, f.deployment("inflate", 2, "1", "1500Mi", false)); err != nil {
+	deployment := f.deployment("inflate", 2, "1", "1500Mi", false)
+	// A new worker has about 88Gi allocatable after the platform's disk
+	// expansion. This request cannot fit the old ~35Gi catalogue. On a
+	// cluster with no pre-existing managed nodes, it exercises scheduling
+	// before any node can teach the provider its capacity. Requests reserve
+	// scheduling capacity without writing data.
+	deployment.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("50Gi")
+	if err := f.client.Create(ctx, deployment); err != nil {
 		t.Fatalf("creating deployment: %v", err)
 	}
 
@@ -253,6 +261,26 @@ func checkSeedCapacity(t *testing.T, node *corev1.Node, flavor string) {
 			"re-measure FlavorSizing in pkg/providers/instancetype", node.Name, flavor, gotKi, seed.MemoryKi, deviation*100)
 	} else {
 		t.Logf("node %s (%s): capacity memory %dKi, catalogue %dKi (%+.2f%%)", node.Name, flavor, gotKi, seed.MemoryKi, deviation*100)
+	}
+	instanceType, err := instancetype.NewProvider("par", nil, nil).Get(flavor)
+	if err != nil {
+		t.Fatalf("getting catalogue entry for %s: %v", flavor, err)
+	}
+	for _, pair := range []struct {
+		name      string
+		got, want corev1.ResourceList
+	}{
+		{"capacity", node.Status.Capacity, instanceType.Capacity},
+		{"allocatable", node.Status.Allocatable, instanceType.Allocatable()},
+	} {
+		got, want := pair.got[corev1.ResourceEphemeralStorage], pair.want[corev1.ResourceEphemeralStorage]
+		if deviation := float64(got.Value())/float64(want.Value()) - 1; math.Abs(deviation) > 0.01 {
+			t.Errorf("node %s (%s): %s ephemeral-storage %s, catalogue %s (%+.1f%%): re-measure the disk capacity and eviction reserve",
+				node.Name, flavor, pair.name, got.String(), want.String(), deviation*100)
+		} else {
+			t.Logf("node %s (%s): %s ephemeral-storage %s, catalogue %s (%+.2f%%)",
+				node.Name, flavor, pair.name, got.String(), want.String(), deviation*100)
+		}
 	}
 }
 
