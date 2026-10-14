@@ -33,6 +33,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/awslabs/operatorpkg/reconciler"
@@ -62,8 +64,12 @@ const (
 	// informer lag.
 	minAge = 2 * time.Minute
 	// deletionOverdueAfter is an observability threshold, not a deadline:
-	// finalizers remain the platform's responsibility, however long it takes.
+	// finalizers remain their owners' responsibility, however long it takes.
 	deletionOverdueAfter = 5 * time.Minute
+	// ckeFinalizer is the platform operator's currently observed finalizer.
+	// Unknown finalizers use generic guidance; their names cannot establish
+	// whether cleanup belongs to CKE or another controller.
+	ckeFinalizer = "clever-nodegroup-operator"
 )
 
 type Controller struct {
@@ -211,13 +217,24 @@ func (c *Controller) reportOverdueDeletions(ctx context.Context, nodeGroups []ng
 		}
 		key := client.ObjectKeyFromObject(ng)
 		overdue[key] = ng.UID
-		msg := fmt.Sprintf("NodeGroup %s is still present at least %s after deletion was requested (remaining finalizers: %v). "+
-			"Inspect the NodeGroup and the CKE cluster state; an updating or failed cluster can block platform operations. "+
-			"Report persistent blockage to Clever Cloud support; do not remove finalizers. VM deletion is not confirmed by this signal",
-			ng.Name, deletionOverdueAfter, ng.Finalizers)
+		age := now.Sub(ng.DeletionTimestamp.Time).Truncate(time.Second)
+		state := deletionOperatorState(ng)
+		action := "Inspect the controllers responsible for the remaining finalizers."
+		if slices.Contains(ng.Finalizers, ckeFinalizer) {
+			action += " The CKE operator finalizer is present: also check the CKE cluster state and contact Clever Cloud support if its wait persists; its presence does not establish the cause."
+		} else if len(ng.Finalizers) == 0 {
+			action = "No finalizers remain in this observation; inspect the current object and API server deletion state if the wait persists."
+		}
+		// Events are hourly snapshots, not live status: the recorder's key
+		// intentionally excludes age and status to avoid one event per sweep.
+		msg := fmt.Sprintf("Observed NodeGroup %s still present %s after deletion was requested (threshold %s; last reported %s; remaining finalizers: %v). "+
+			"%s Inspect current state with kubectl get nodegroup %s -o yaml. "+
+			"Do not remove finalizers to bypass cleanup. VM deletion is not confirmed by this signal",
+			ng.Name, age, deletionOverdueAfter, state, ng.Finalizers, action, ng.Name)
 		if uid, logged := c.deletionWarned[key]; !logged || uid != ng.UID {
 			log.FromContext(ctx).WithValues("NodeGroup", ng.Name, "upstreamID", ng.Status.UpstreamID,
-				"deletionTimestamp", ng.DeletionTimestamp, "finalizers", ng.Finalizers).Info(msg)
+				"deletionTimestamp", ng.DeletionTimestamp, "deletionAge", age.String(),
+				"status", state, "finalizers", ng.Finalizers).Info("nodegroup deletion remains overdue; inspect current finalizers and their controllers")
 		}
 		c.recorder.Publish(events.Event{
 			InvolvedObject: ng,
@@ -233,6 +250,19 @@ func (c *Controller) reportOverdueDeletions(ctx context.Context, nodeGroups []ng
 	// the last observation instead of falsely reporting recovery.
 	c.deletionWarned = overdue
 	metrics.NodeGroupDeletionOverdue.Set(float64(len(overdue)), nil)
+}
+
+// deletionOperatorState is the operator's last report, not a conclusion
+// about cleanup. Ready can remain true throughout a blocked deletion.
+func deletionOperatorState(ng *ngv1.NodeGroup) string {
+	conditions := []string{}
+	for _, condition := range ng.Status.Conditions {
+		if condition.Status == corev1.ConditionTrue {
+			conditions = append(conditions, fmt.Sprintf("%s (%s)", condition.Type,
+				nodegroup.DescribeFailure(condition.Reason, condition.Message)))
+		}
+	}
+	return fmt.Sprintf("phase %q, true conditions [%s]", ng.Status.Phase, strings.Join(conditions, "; "))
 }
 
 // anyClaimAliveUncached reports whether any of the named NodeClaims exists on

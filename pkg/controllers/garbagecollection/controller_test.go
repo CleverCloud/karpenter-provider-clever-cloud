@@ -406,7 +406,7 @@ func TestReconcileReportsOverdueDeletionsWithoutDependingOnClaimsOrStatus(t *tes
 	ctx := context.Background()
 	overdue := func(name string) *ngv1.NodeGroup {
 		ng := managedNodeGroup(name, "", time.Hour, true)
-		ng.UID = types.UID(name)
+		ng.UID = types.UID("uid-" + name)
 		deleted := metav1.NewTime(time.Now().Add(-5*time.Minute - time.Second))
 		ng.DeletionTimestamp = &deleted
 		return ng
@@ -468,7 +468,7 @@ func TestReconcileReportsOverdueDeletionsWithoutDependingOnClaimsOrStatus(t *tes
 		if len(event.DedupeValues) != 2 || event.DedupeValues[1] != string(ng.UID) {
 			t.Errorf("event must distinguish recreated groups: %+v", event.DedupeValues)
 		}
-		for _, detail := range []string{"test.finalizer/keep", "CKE cluster state", "VM deletion is not confirmed"} {
+		for _, detail := range []string{"test.finalizer/keep", "controllers responsible", "VM deletion is not confirmed"} {
 			if !strings.Contains(event.Message, detail) {
 				t.Errorf("event lacks %q: %s", detail, event.Message)
 			}
@@ -552,7 +552,7 @@ func TestOverdueDeletionLogsForgetGroupsNoLongerMonitored(t *testing.T) {
 	ctrl, kubeClient, _ := newTestControllerWithRecorder(t, ng)
 	logs := 0
 	ctx := log.IntoContext(context.Background(), funcr.New(func(_, line string) {
-		if strings.Contains(line, "VM deletion is not confirmed") {
+		if strings.Contains(line, "nodegroup deletion remains overdue") {
 			logs++
 		}
 	}, funcr.Options{}))

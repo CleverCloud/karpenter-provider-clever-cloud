@@ -37,7 +37,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/clock"
-	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -161,6 +160,8 @@ func TestGetReleasesTheNodeOfATerminatingNodeGroup(t *testing.T) {
 // accepted DELETE. Core must retain the NodeClaim until the group disappears
 // and resume automatically afterwards. Its five-second retry has no timeout:
 // the deletion-overdue signal must report this without forcing progress.
+// This characterizes the existing core/provider contract after drain; it
+// does not exercise the overdue signal or measure a maximum waiting time.
 func TestBlockedDeletionWaitsAndResumesWhenThePlatformRecovers(t *testing.T) {
 	for _, ready := range []corev1.ConditionStatus{corev1.ConditionTrue, corev1.ConditionUnknown} {
 		t.Run(string(ready), func(t *testing.T) {
@@ -173,7 +174,7 @@ func TestBlockedDeletionWaitsAndResumesWhenThePlatformRecovers(t *testing.T) {
 			now := metav1.Now()
 			node.DeletionTimestamp, claim.DeletionTimestamp = &now, &now
 			kubeClient := newCoreIndexedClient(readyNodeClass("default"), group, claim, node)
-			clk := clocktesting.NewFakeClock(time.Now())
+			clk := clock.RealClock{}
 			itp := instancetype.NewProvider("par", nil, nil)
 			cp := cloudprovider.New(kubeClient, kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clk))
 			nodeController := termination.NewController(clk, kubeClient, cp, terminator.NewTerminator(clk, kubeClient, terminator.NewQueue(kubeClient, noopRecorder{}), noopRecorder{}), noopRecorder{})
@@ -215,7 +216,6 @@ func TestBlockedDeletionWaitsAndResumesWhenThePlatformRecovers(t *testing.T) {
 					!claim.StatusConditions().IsTrue(karpv1.ConditionTypeInstanceTerminating) {
 					t.Fatalf("blocked claim lost its finalizer or InstanceTerminating: %+v", claim)
 				}
-				clk.Step(24 * time.Hour)
 			}
 			// Simulate the platform completing its own finalizer. Production
 			// code never removes it; only its disappearance allows completion.
