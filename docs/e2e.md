@@ -78,9 +78,17 @@ day, typically before a release or after a karpenter-core bump.
 E2E_CONTEXT=<kubeconfig-context> make e2e
 ```
 
+To exercise the automatic host-disk reference used by the chart, supply a
+representative existing node explicitly for the local controller process:
+
+```sh
+E2E_CONTEXT=<kubeconfig-context> E2E_NODE_NAME=<reference-node-name> make e2e
+```
+
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `E2E_CONTEXT` | **yes** | — | kubeconfig context of the dedicated test cluster. The suite refuses to run against an implicit current-context: it creates and deletes real VMs, and test-cluster kubeconfigs can have their current-context rotated externally. |
+| `E2E_NODE_NAME` | no | — | existing Ready node whose local ephemeral-storage capacity and allocatable describe future workers. Passed explicitly as `NODE_NAME` to the local controller to exercise the chart's automatic host-disk reference. The suite validates it before creating resources and checks the reference metrics before provisioning. Unset, it clears any inherited `NODE_NAME` and tests the built-in disk fallback; it never guesses a host for the out-of-cluster process. |
 | `KUBECONFIG` | no | `~/.kube/config` | kubeconfig file; the suite writes a private copy with `E2E_CONTEXT` pinned so the controller subprocess cannot drift to another cluster mid-run. |
 | `E2E_TIMEOUT` | no | `40m` | suite-wide deadline. The suite reserves 22 minutes plus `E2E_CLEANUP_RECHECK` (24 minutes by default) of cleanup budget inside `go test -timeout` (90m in the Makefile) and clamps `E2E_TIMEOUT` down if it would eat into that reserve — a go test timeout kills the process without running cleanups, leaking billed VMs, so the invariant is enforced at startup rather than documented and hoped for. |
 | `E2E_METRICS_PORT` / `E2E_HEALTH_PORT` | no | free ports | local ports of the controller subprocess (scenarios assert on the provider metrics). Unset, the suite picks a free port for each at startup, so suites against sibling clusters run in parallel without clashing. It picks them at random outside the kernel's ephemeral range (`net.ipv4.ip_local_port_range`): outbound connections take their source ports from that range, so none can take a port between its reservation and the controller's bind. The suite binds the ports set here before it picks the others, so a picked port is never one of them. A port set here that another process holds fails the run at once, naming it; the same port for both, or a value that is not a TCP port (1-65535), fails the run too. |
@@ -127,17 +135,24 @@ kubectl --context <kubeconfig-context> -n karpenter scale deployment/karpenter -
 
 ### Scenarios (serial — they share the org quota)
 
-1. **Provision** — 2 pending pods requesting 50Gi ephemeral storage each →
-   running pods. These requests exceed the former ~35Gi allocatable disk
-   catalogue. On a cluster with no pre-existing managed nodes, they prove
-   provisioning with the expanded worker disk before any live capacity
-   observation; the harness warns about existing managed groups but does not
-   refuse them. These requests reserve scheduling capacity without writing data. Every NodeClaim
+1. **Provision** — 2 pending pods requesting ephemeral storage → running
+   pods. With `E2E_NODE_NAME`, each pod requests 60% of the reference node's
+   allocatable disk, so the case follows future increases and decreases and
+   cannot pack both replicas onto one disk. The controller must expose
+   `instancetype_host_ephemeral_storage_ready = 1` and capacity/allocatable
+   gauges matching that reference before the workload is created. Without
+   a reference, each pod requests 50Gi: this exceeds the former ~35Gi
+   allocatable seed and checks the current built-in fallback. On a cluster
+   with no pre-existing managed nodes, provisioning exercises capacity
+   prediction before the first managed worker reports; the harness warns
+   about existing managed groups but does not refuse them. These requests
+   reserve scheduling capacity without writing data. Every NodeClaim
    `Registered`, its NodeGroup managed + `nodeCount: 1` + owner-referenced,
    its node stamped with `clevercloud://<nodegroup>`; the node's
    `status.capacity` matches the built-in catalogue (cpu exactly, memory
    within 1%); ephemeral-storage capacity and allocatable also match the
-   catalogue within 1%, and the controller refused no capacity report
+   reference node (or built-in catalogue when unset) within 1%, and the
+   controller refused no capacity report
    (`instancetype_observed_capacity_rejections_total` scraped and = 0; it
    counts every node of a managed group the controller watches — in a
    dedicated test cluster, the suite's own), and no launch ended in an

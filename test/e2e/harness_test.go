@@ -39,6 +39,8 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -50,6 +52,60 @@ import (
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 )
+
+func TestHarnessDiskReferencePreflight(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		change func(*corev1.Node)
+		absent bool
+		want   string
+	}{
+		{name: "healthy reference"},
+		{name: "missing node", absent: true, want: "not found"},
+		{name: "not ready", change: func(n *corev1.Node) { n.Status.Conditions = nil }, want: "not Ready"},
+		{name: "terminating", change: func(n *corev1.Node) {
+			n.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+			n.Finalizers = []string{"test.example/keep"}
+		}, want: "terminating"},
+		{name: "capacity missing", change: func(n *corev1.Node) {
+			delete(n.Status.Capacity, corev1.ResourceEphemeralStorage)
+		}, want: "0 < allocatable <= capacity"},
+		{name: "allocatable missing", change: func(n *corev1.Node) {
+			delete(n.Status.Allocatable, corev1.ResourceEphemeralStorage)
+		}, want: "0 < allocatable <= capacity"},
+		{name: "allocatable above capacity", change: func(n *corev1.Node) {
+			n.Status.Allocatable[corev1.ResourceEphemeralStorage] = resource.MustParse("101Gi")
+		}, want: "0 < allocatable <= capacity"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "reference"},
+				Status: corev1.NodeStatus{
+					Conditions:  []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},
+					Capacity:    corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("100Gi")},
+					Allocatable: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("90Gi")},
+				},
+			}
+			if tt.change != nil {
+				tt.change(node)
+			}
+			builder := fake.NewClientBuilder().WithScheme(scheme.Scheme)
+			if !tt.absent {
+				builder.WithObjects(node)
+			}
+			got, err := loadDiskReference(context.Background(), builder.Build(), node.Name)
+			if tt.want != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.want) {
+					t.Fatalf("loadDiskReference returned %v, want an error containing %q", err, tt.want)
+				}
+				return
+			}
+			if err != nil || got == nil || got.Name != node.Name {
+				t.Fatalf("loadDiskReference = %v, %v; want the requested node", got, err)
+			}
+		})
+	}
+}
 
 func listen(t *testing.T, network, addr string) (net.Listener, int) {
 	t.Helper()

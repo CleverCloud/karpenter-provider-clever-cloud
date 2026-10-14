@@ -190,35 +190,65 @@ another flavor when the claim allows one; pods that only that flavor fits stay p
 Overrides always win over the built-in values. Leave `settings.flavors` empty to use the built-in
 catalogue unchanged.
 
-At runtime the catalogue follows the capacity real nodes report, because the memory the kernel
-exposes moves with Clever Cloud's node image. A kubelet can rewrite its own node's labels and
-status, so a report is only trusted within bounds:
+The chart supplies `NODE_NAME` from the controller pod's `spec.nodeName`. The provider
+reads that node's `status.capacity.ephemeral-storage` and
+`status.allocatable.ephemeral-storage` and uses them for **every new worker's disk**.
+The reference follows Node updates, with a one-minute periodic refresh; increases and
+decreases replace the previous disk profile instead of accumulating a minimum.
+Provisioning waits for the first valid observation. If the reference node disappears,
+starts terminating or reports invalid quantities, new provisioning waits for a valid
+reference again; existing-node cleanup continues. Transient API read failures retain
+the last valid observation. Capacity and allocatable must be positive whole bytes,
+with allocatable no greater than capacity.
 
-- it must come from a node of a NodeGroup this controller created, carrying that NodeGroup's
-  flavor. The node's group is the one its **name** designates (CKE names a group's nodes
-  `<nodegroup>-node<N>`, and a kubelet cannot rename its node), so nodes of fixed nodegroups
-  and of the control plane are never used, whatever their labels claim;
-- its `cpu` must equal the catalogue entry's (built-in or overridden), and its memory and pod
-  figures must be within 10% of it. Disk capacity, allocatable and their ratio must be within
-  10% of a measured current or legacy disk profile;
-- the smallest accepted figure of a flavor wins for each resource, except legacy disks,
-  which cannot describe what a new worker receives.
+**Assumption: the controller's host has the disk and reservations that new workers
+will receive.** It is deliberately trusted for disk sizing, even when it belongs to a
+fixed NodeGroup or is a control-plane node; CPU, memory and pod capacity are never
+copied from it. Its kubelet's disk report is authoritative and is not bounded by the
+old static seed. If CKE changes only future workers while that host remains old,
+this mechanism cannot discover the new size. Move the controller to a representative
+host when the platform changes; restarting it on the same old host is insufficient.
+If several controller replicas are configured, their hosts must agree on the profile
+so a leader change does not change the advertised disk.
 
-Every new worker, including on existing clusters, now receives `102624184Ki` (about 97.9 Gi)
-of ephemeral storage, with about 88.1 Gi allocatable after the 10% eviction reserve. Old workers
-keep their `40971488Ki` disk (about 39.1 Gi). Their bounded capacity reports still correct memory
-and other resources, but their disk figures are excluded from the new-launch catalogue, so an
-old worker cannot prevent provisioning pods requesting more than its roughly 35.2 Gi allocatable.
-Existing-node scheduling uses each node's actual capacity. This catalogue update neither resizes
-old disks nor marks their NodeClaims drifted. Unknown disk sizes are still rejected; the
-compatibility allowance covers only the measured legacy profile, with its own 10% bounds.
+Each new NodeGroup records the resolved disk capacity and allocatable in its initial
+creation annotations. Retries and controller restarts describe that group with its
+original disk profile even after the host reference changes; adopting such a group
+never creates a replacement if the original disappears. Groups created before this
+feature have no snapshot and retain the previous catalogue-based description.
 
-A `memoryKi` override is therefore corrected by nodes within 10% of it, and served as-is
-otherwise. What a compromised node of a karpenter NodeGroup can still do is move its own
-flavor's figures by up to 10%. Every refused report is counted in
-`karpenter_clevercloud_instancetype_observed_capacity_rejections_total` (see
-[docs/observability.md](docs/observability.md)). The runtime correction changes the capacity
-karpenter packs pods against, never a flavor's price.
+Existing workers retain their actual disks. Their disk observations never change the
+new-launch profile, whether they are smaller or larger, and a profile change alone
+neither resizes nor drifts them. Remote PVCs provisioned through a StorageClass/CSI
+are independent: a pod can use a 200Gi remote PVC on a node with a smaller local disk.
+Only its separate `ephemeral-storage` request consumes this local scheduling capacity.
+
+For local runs, set `NODE_NAME` explicitly to a representative node in the target
+cluster. With `NODE_NAME` unset, the provider retains the measured static fallback:
+`102624184Ki` capacity (about 97.9 Gi) with a 10% eviction reserve, and compatibility
+with the former `40971488Ki` disk (about 39.1 Gi). That fallback cannot discover a
+future platform disk change.
+
+CPU, memory and pod capacity still follow bounded observations from managed workers:
+
+- The node must belong to a NodeGroup this controller created and carry its immutable
+  flavor. CKE names a group's nodes `<nodegroup>-node<N>`; the name must agree with
+  the nodegroup label, so another kubelet cannot select an unrelated group's flavor.
+- CPU must equal the catalogue entry's; memory and pod capacity/allocatable must stay
+  within 10%. Allocatable cannot exceed capacity, and resource pairs must be complete.
+- The smallest accepted figure per flavor wins for the process lifetime. Ordinary
+  worker disks are ignored in host-reference mode, preserving useful CPU/RAM reports
+  across disk generations. In static fallback mode, disk capacity, allocatable and
+  their ratio must fit the current or legacy profile within 10%; legacy disks do not
+  lower the new-launch profile.
+
+A `memoryKi` override is therefore corrected by nodes within 10% of it, and served
+as-is otherwise. A managed worker's kubelet can still move its flavor's learned
+figures within those bounds. Refusals are counted in
+`karpenter_clevercloud_instancetype_observed_capacity_rejections_total`; the host
+reference has separate readiness and byte gauges (see
+[docs/observability.md](docs/observability.md#controller-node-disk-reference)).
+Runtime capacity corrections never change a flavor's price.
 
 **Prices are relative, not a currency.** Karpenter only compares and adds up offering prices, to
 launch the cheapest flavor that fits and to consolidate onto cheaper capacity, so every flavor is

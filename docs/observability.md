@@ -21,8 +21,11 @@ All provider series are prefixed `karpenter_clevercloud_`.
 | `nodegroup_external_resizes` | gauge | Managed NodeGroups whose `nodeCount` is not 1 — something outside karpenter resizes them (the platform's alert-driven scaler via an inherited `autoscalingEnabled`, a human, anything with `nodegroups/scale` RBAC). | **Non-zero breaks the 1 NodeClaim = 1 NodeGroup invariant**: the extra nodes are never registered — they get no provider ID and keep the `karpenter.sh/unregistered` taint — so karpenter neither manages nor prices them. Find the resizer; ensure the cluster's `autoscalingEnabled` feature is off (the two autoscalers must never run together), then set `nodeCount` back to 1. **Also check karpenter-core's `karpenter_cluster_state_synced`**: a node carrying `karpenter.sh/nodepool` without a `spec.providerID` keeps it at 0 after every controller restart — provisioning and disruption stop cluster-wide and `cluster is waiting on sync for extended duration` is logged every 10 s. NodeGroups created by the current version never put that label on their nodes; for older groups, whose immutable `spec.labels` still carry it, the providerid controller removes it from the extra node it refuses to stamp (logged once per node). The controller never touches nodes of unmanaged groups, and that includes an older group recreated upstream without its `karpenter.clever-cloud.com/managed` label but with its old `spec.labels`: its single node carries the label with no provider ID and freezes the sync the same way. If `karpenter_cluster_state_synced` stays at 0 anyway, list the culprits with `kubectl get nodes -l karpenter.sh/nodepool -o custom-columns=NAME:.metadata.name,PROVIDERID:.spec.providerID` and remove the label from any node with an empty provider ID, or revert the resize. |
 | `gc_reaped_nodegroups_total` | counter | The GC safety net deleted an orphaned NodeGroup (its NodeClaim was force-deleted outside the normal flow). | Occasional ticks are the safety net working. Frequent ticks mean something force-deletes NodeClaims — find it. |
 | `gc_refused_nodegroups` | gauge | NodeGroups the last GC sweep refused to reap: managed label present, but no verified dead NodeClaim owner. | **Non-zero needs attention** — each one is a VM billing hourly. A copied manifest: remove the `karpenter.clever-cloud.com/managed` label. A deliberately orphaned group: delete it manually. Details in the `GarbageCollectionRefused` event on the NodeGroup. |
+| `instancetype_host_ephemeral_storage_ready` | gauge | 1 after a valid disk observation from `NODE_NAME`; 0 before initialization or while the node is absent, terminating or reports invalid disk quantities. Exists only when `NODE_NAME` is set. | New provisioning waits at 0. Inspect the named Node and controller errors; see [controller-node disk reference](#controller-node-disk-reference). |
+| `instancetype_host_ephemeral_storage_capacity_bytes` | gauge | Last valid host disk capacity used for future workers, across all flavors; 0 before the first valid reference. | Compare with the reference Node's status and what new workers receive. Consult readiness: this snapshot is retained while the reference is invalid. |
+| `instancetype_host_ephemeral_storage_allocatable_bytes` | gauge | Last valid host disk allocatable used for future workers; 0 before the first valid reference. | Includes the host's actual disk reservations; do not substitute raw disk capacity. Consult readiness before treating this snapshot as current. |
 | `instancetype_flavors_config_invalid` | gauge | 1 while the `settings.flavors` overrides file failed to load: the controller runs on the base catalogue WITHOUT the configured overrides instead of crashlooping. Any key the controller does not know invalidates the whole file, including `priceHourly`, which earlier releases accepted (prices are now derived from `cpu` and `memoryKi`), and so does a name that cannot be a Clever Cloud flavor (`2xs`, `CUSTOM`: the NodeGroup API could never create it), which earlier releases accepted too. | Fix `settings.flavors` (the chart also validates it at install time via values.schema.json, so this mostly fires when the ConfigMap was written outside the chart): remove `priceHourly` and any other unknown key, and fix or remove any name the error log refuses (it suggests the uppercase spelling when that one is a flavor name); the next pod roll picks it up. **Note**: a flavor that only the overrides kept in the catalogue leaves it while the gauge is 1 — its nodes are then rolled by drift (see [Flavor removal semantics](#flavor-removal-semantics)). |
-| `instancetype_observed_capacity_rejections_total` | counter | A node's capacity report was refused by the instance-type catalogue. The catalogue follows what nodes report (the memory the kernel exposes moves with the node image), but a kubelet can rewrite its own node's labels and status, and an accepted report sets the flavor's capacity for the whole cluster. A report is refused when the node's `clever-cloud.com/nodegroup` label names a managed NodeGroup the node is not a node of (the platform names a group's nodes `<nodegroup>-node<N>`, and a kubelet cannot rename its Node, so the name decides), when its `clever-cloud.com/flavor` label contradicts that NodeGroup's `spec.flavor`, when its `cpu` differs from the catalogue entry, when its memory or pod count (capacity or allocatable) is more than 10% off the entry, when its disk capacity, allocatable or their ratio is more than 10% off both measured disk profiles (current and legacy), when its allocatable exceeds its capacity, or when a resource appears in only one of capacity and allocatable. A valid legacy disk report is not a rejection: its other resources are learned, while its smaller disk is excluded from the catalogue for new launches (every new worker now has the larger disk; existing-node scheduling keeps using actual node status). Counted on every reconcile of the node (each status update); logged at most once an hour per node. Nodes whose nodegroup label names no managed NodeGroup are not reports and are never counted. What the bounds leave by design: the kubelet of a node of a managed group can move its own group's flavor by up to 10%. | **Non-zero needs a look.** The log line names the node and the reason. A single node: inspect it — a kubelet claiming another nodegroup, reporting another flavor's figures or rewriting its flavor label is misconfigured or compromised (drain and replace it). Every node of a flavor: either a `settings.flavors` `cpu`/`memoryKi` pin more than 10% off reality (fix or remove it — until then the pin is served as-is), or a platform node image that moved more than 10% (report it; pin `memoryKi` to the measured value meanwhile, on every flavor the same way — a lone pin skews the relative prices, see the README's Flavor catalogue). Every node, each refused as "not one of its nodes": the platform changed how it names nodes (report it). The catalogue keeps serving its previous figures in all cases. Related, without a metric: an **accepted** report more than 1% off the catalogue entry is logged once per flavor (`node memory differs from the flavor's catalogue entry`) — the node image moved; the catalogue already follows the smallest node of that flavor, but a restarted controller packs pods against the entry until it sees one, so pin `memoryKi` (every flavor the same way) if the entry is above the nodes. |
+| `instancetype_observed_capacity_rejections_total` | counter | A node's capacity report was refused by the instance-type catalogue. The catalogue follows what nodes report (the memory the kernel exposes moves with the node image), but a kubelet can rewrite its own node's labels and status, and an accepted report sets the flavor's capacity for the whole cluster. A report is refused when the node's `clever-cloud.com/nodegroup` label names a managed NodeGroup the node is not a node of (the platform names a group's nodes `<nodegroup>-node<N>`, and a kubelet cannot rename its Node, so the name decides), when its `clever-cloud.com/flavor` label contradicts that NodeGroup's `spec.flavor`, when its `cpu` differs from the catalogue entry, when its memory or pod count (capacity or allocatable) is more than 10% off the entry, in static fallback mode when its disk capacity, allocatable or their ratio is more than 10% off both measured disk profiles (current and legacy), when its allocatable exceeds its capacity, or when a resource appears in only one of capacity and allocatable. In host-reference mode, ordinary workers' disks are excluded from the new-launch catalogue after consistency checks; CPU/RAM/pod reports keep their bounds regardless of disk generation. In static fallback mode, a valid legacy disk is similarly excluded while its other resources are learned. Existing-node scheduling uses actual node status. Counted on every reconcile of the node (each status update); logged at most once an hour per node. Nodes whose nodegroup label names no managed NodeGroup are not reports and are never counted. What the bounds leave by design: the kubelet of a node of a managed group can move its own group's flavor by up to 10%. | **Non-zero needs a look.** The log line names the node and the reason. A single node: inspect it — a kubelet claiming another nodegroup, reporting another flavor's figures or rewriting its flavor label is misconfigured or compromised (drain and replace it). Every node of a flavor: either a `settings.flavors` `cpu`/`memoryKi` pin more than 10% off reality (fix or remove it — until then the pin is served as-is), or a platform node image that moved more than 10% (report it; pin `memoryKi` to the measured value meanwhile, on every flavor the same way — a lone pin skews the relative prices, see the README's Flavor catalogue). Every node, each refused as "not one of its nodes": the platform changed how it names nodes (report it). The catalogue keeps serving its previous figures in all cases. Related, without a metric: an **accepted** report more than 1% off the catalogue entry is logged once per flavor (`node memory differs from the flavor's catalogue entry`) — the node image moved; the catalogue already follows the smallest node of that flavor, but a restarted controller packs pods against the entry until it sees one, so pin `memoryKi` (every flavor the same way) if the entry is above the nodes. |
 | `instancetype_unknown_flavor_lookups_total` | counter | An instance-type lookup referenced a flavor absent from the served catalogue. | A running NodeGroup uses a flavor the catalogue lost (a removed or invalid `settings.flavors` override, a release whose built-in catalogue dropped it). GC and termination keep working on a synthesized type, and the affected nodes are **rolled by drift under disruption budgets** (see [Flavor removal semantics](#flavor-removal-semantics)); restore the flavor via `settings.flavors` to stop the roll. |
 
 Suggested alert expressions:
@@ -71,13 +74,74 @@ increase(karpenter_clevercloud_instancetype_unknown_flavor_lookups_total[30m]) >
 increase(karpenter_clevercloud_instancetype_observed_capacity_rejections_total[1h]) > 0
 ```
 
-All counters and gauges are pre-seeded at startup so the series exist from the
-first scrape.
+Counters and gauges are pre-seeded at startup so the series exist from the
+first scrape. The three host-disk gauges are only initialized when `NODE_NAME`
+enables the reference controller; they are absent in static fallback mode.
 
 The controller no longer exports `pricing_refresh_failures_total` nor
 `pricing_last_successful_refresh_timestamp_seconds`: the dynamic pricing
 refresher that fed them was removed, and the catalogue is now the built-in one
 plus `settings.flavors`. Delete any alert or dashboard built on them.
+
+## Controller-node disk reference
+
+The chart sets `NODE_NAME` from the pod's `spec.nodeName`. The controller reads only
+that exact Node through the Kubernetes API; a worker label cannot nominate a
+reference. It trusts the host's disk report as representative of **future workers**,
+including its reservations. This is a deployment assumption, not something the
+provider can prove from old workers. CPU/RAM/pod capacity remain flavor-specific.
+The host may be a fixed worker or a control-plane node; verify that its disk and
+reservations match workers. With multiple controller replicas, use consistent hosts.
+
+`using controller node ephemeral storage for new workers` logs the source name, UID,
+capacity and allocatable on initialization, a profile change or recovery. The three
+host metrics expose the profile without adding per-node metric labels. No Kubernetes
+Event is emitted. Watch events and a one-minute refresh pick up updates. A reference
+may move in either direction; old workers cannot cap or inflate it.
+
+Before the first valid read, or after the host is observed missing, terminating or
+invalid, `host_ephemeral_storage_ready=0` blocks new provisioning without falling
+back to a potentially oversized static disk. A planned claim waits until the
+reference recovers; if a smaller valid profile no longer fits it, launch fails with
+insufficient capacity and core re-plans. Existing instances remain describable and
+termination/GC keep running. Other core operations that need instance types may
+also wait for the reference. A transient API GET failure preserves the last valid
+profile and is retried; it cannot initialize a reference.
+
+The reference controller is leader-local. With multiple replicas, followers can
+expose zero until elected; aggregate by the labels identifying the installation
+(e.g. cluster and namespace), excluding pod/instance. For a single installation,
+allow the brief startup observation with `for: 2m`:
+
+```promql
+max(karpenter_clevercloud_instancetype_host_ephemeral_storage_ready) == 0
+```
+
+In a Prometheus monitoring several installations, use `max by (...)` with their
+identifying labels so a healthy cluster cannot hide another cluster's missing
+reference. A former leader may retain its last snapshot until its process stops;
+filter to the current leader if your deployment keeps former leaders alive.
+
+A newly created NodeGroup stores its launch disk in the annotations
+`karpenter.clever-cloud.com/ephemeral-storage-capacity` and
+`karpenter.clever-cloud.com/ephemeral-storage-allocatable`. They survive a controller
+restart and prevent retries from relabelling an old machine with a new disk size.
+Do not edit these snapshots to resize a VM: they only describe the original launch.
+Malformed/partial annotations make a retried Create wait with an error; Get/List
+log the problem and use the catalogue so cleanup remains possible. Groups predating
+this feature have no snapshot and keep their previous catalogue-based description.
+
+Inspect `kubectl get node <NODE_NAME> -o yaml` for missing, zero, fractional or
+inconsistent disk quantities; both capacity and allocatable must be positive whole
+bytes with allocatable <= capacity. Check API access if reads fail. A valid read
+restores readiness automatically, even if the quantities are unchanged.
+
+If CKE changes future disks while the host retains its old disk, the reference
+remains old too; restarting the pod on that host cannot discover the change. Place
+Karpenter on a representative fixed node. The reference is for local ephemeral
+storage only: it neither sizes remote PVCs nor resizes existing disks. Local runs
+without `NODE_NAME` use the static measured fallback and expose none of these three
+host gauges; set `NODE_NAME` explicitly to test the dynamic path.
 
 ## Blocked cluster operations
 

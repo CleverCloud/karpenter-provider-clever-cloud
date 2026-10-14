@@ -24,7 +24,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -439,7 +438,20 @@ func NodeClaimOwners(ng *ngv1.NodeGroup) []string {
 // NodeClass the NodeGroup is built from and the flavor it runs. Its error
 // fails the launch as it is, before anything reaches the API. It runs with
 // createMu held, so it must not create a NodeGroup itself.
-type Resolver func(ctx context.Context) (*v1alpha1.CleverNodeClass, string, error)
+type Resolver func(ctx context.Context) (*Launch, error)
+
+// Launch is resolved under createMu. Annotations are captured in the initial
+// POST alongside the flavor. Existing requests adoption only: a disappeared
+// group must never be recreated using a plan for an older worker image.
+type Launch struct {
+	NodeClass   *v1alpha1.CleverNodeClass
+	Flavor      string
+	Annotations map[string]string
+	Existing    *ngv1.NodeGroup
+	// ExistingReader confirms an adoption through the same authoritative
+	// source that found it; informer lag must not turn it into a vanish.
+	ExistingReader client.Reader
+}
 
 // Create creates the NodeGroup backing a NodeClaim from nodeClass with flavor
 // and waits for the Clever Cloud operator's decision on it. It returns
@@ -451,8 +463,8 @@ type Resolver func(ctx context.Context) (*v1alpha1.CleverNodeClass, string, erro
 // It is idempotent: an already-existing NodeGroup owned by the same NodeClaim
 // is reused.
 func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.CleverNodeClass, flavor string) (*ngv1.NodeGroup, error) {
-	return p.ResolveAndCreate(ctx, nodeClaim, func(context.Context) (*v1alpha1.CleverNodeClass, string, error) {
-		return nodeClass, flavor, nil
+	return p.ResolveAndCreate(ctx, nodeClaim, func(context.Context) (*Launch, error) {
+		return &Launch{NodeClass: nodeClass, Flavor: flavor}, nil
 	})
 }
 
@@ -466,10 +478,11 @@ func (p *Provider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim, node
 func (p *Provider) ResolveAndCreate(ctx context.Context, nodeClaim *karpv1.NodeClaim, resolve Resolver) (*ngv1.NodeGroup, error) {
 	p.createMu.Lock()
 	defer p.createMu.Unlock()
-	nodeClass, flavor, err := resolve(ctx)
+	launch, err := resolve(ctx)
 	if err != nil {
 		return nil, err
 	}
+	nodeClass, flavor := launch.NodeClass, launch.Flavor
 	// Checked under createMu, after resolve: a flavor fixed before the wait
 	// (Create) may have been rejected by a launch ahead in the queue, and a
 	// late rejection (RecordLateRefusal, which does not take createMu) can
@@ -478,8 +491,10 @@ func (p *Provider) ResolveAndCreate(ctx context.Context, nodeClaim *karpv1.NodeC
 	// No event on the fast-fail: karpenter-core already publishes an
 	// InsufficientCapacityError event per attempt, and claims get fresh names
 	// each retry so per-claim dedupe cannot bound the volume.
-	if err := p.quotaFastFail(flavor); err != nil {
-		return nil, err
+	if launch.Existing == nil {
+		if err := p.quotaFastFail(flavor); err != nil {
+			return nil, err
+		}
 	}
 	ng := &ngv1.NodeGroup{
 		ObjectMeta: metav1.ObjectMeta{
@@ -520,10 +535,21 @@ func (p *Provider) ResolveAndCreate(ctx context.Context, nodeClaim *karpv1.NodeC
 			},
 		},
 	}
+	for key, value := range launch.Annotations {
+		if _, reserved := ng.Annotations[key]; !reserved {
+			ng.Annotations[key] = value
+		}
+	}
 	// Taken just before the create call: the acceptance below releases only
 	// the hold-outs recorded up to here (see clearFlavorRejection).
 	mark := p.holdOutMark()
-	if err := p.kubeClient.Create(ctx, ng); err != nil {
+	observed := launch.Existing
+	if observed != nil {
+		if observed.Name != nodeClaim.Name || !ownedByNodeClaim(observed, nodeClaim) {
+			return nil, fmt.Errorf("nodegroup %q already exists and is not managed by this nodeclaim", observed.Name)
+		}
+		ng = observed
+	} else if err := p.kubeClient.Create(ctx, ng); err != nil {
 		// A flavor outside the NodeGroup CRD's enum never reaches the
 		// operator: the API server refuses the create itself (422 Invalid).
 		// Returned as a plain error, karpenter-core retried the same claim
@@ -541,13 +567,17 @@ func (p *Provider) ResolveAndCreate(ctx context.Context, nodeClaim *karpv1.NodeC
 		if getErr := p.kubeClient.Get(ctx, types.NamespacedName{Name: ng.Name}, existing); getErr != nil {
 			return nil, fmt.Errorf("getting existing nodegroup, %w", getErr)
 		}
-		if !IsManaged(existing) || existing.Labels[v1alpha1.NodeClaimLabelKey] != nodeClaim.Name ||
-			!slices.Contains(NodeClaimOwners(existing), nodeClaim.Name) {
+		if !ownedByNodeClaim(existing, nodeClaim) {
 			return nil, fmt.Errorf("nodegroup %q already exists and is not managed by this nodeclaim", ng.Name)
 		}
 		ng = existing
+		observed = existing
 	}
-	accepted, retried, err := p.waitForAcceptance(ctx, ng.Name)
+	reader := client.Reader(p.kubeClient)
+	if launch.Existing != nil && launch.ExistingReader != nil {
+		reader = launch.ExistingReader
+	}
+	accepted, retried, err := p.waitForAcceptance(ctx, ng.Name, observed, reader)
 	// Before the error branches, not only on success: a group that vanished or
 	// was refused after the operator reported a transient failure must stay
 	// traceable to that platform incident.
@@ -621,6 +651,18 @@ func (p *Provider) ResolveAndCreate(ctx context.Context, nodeClaim *karpv1.NodeC
 	// out and let a refused one back in.
 	p.clearFlavorRejection(ng.Spec.Flavor, mark)
 	return ng, nil
+}
+
+func ownedByNodeClaim(ng *ngv1.NodeGroup, claim *karpv1.NodeClaim) bool {
+	if !IsManaged(ng) || ng.Labels[v1alpha1.NodeClaimLabelKey] != claim.Name {
+		return false
+	}
+	for _, owner := range ng.OwnerReferences {
+		if owner.APIVersion == "karpenter.sh/v1" && owner.Kind == "NodeClaim" && owner.Name == claim.Name && owner.UID == claim.UID {
+			return true
+		}
+	}
+	return false
 }
 
 // flavorField is the field an API server admission error names when the
@@ -795,15 +837,15 @@ const (
 // the poll, Ready included: it is not a refusal, and on its own it is not a
 // decision either. A shutdown returns none, for the same reason it returns no
 // timeout.
-func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (acceptance, *transientFailure, error) {
+func (p *Provider) waitForAcceptance(parentCtx context.Context, name string, observed *ngv1.NodeGroup, reader client.Reader) (acceptance, *transientFailure, error) {
 	ctx, cancel := context.WithTimeout(parentCtx, quotaCheckTimeout)
 	defer cancel()
-	seen := false
+	seen := observed != nil
 	accepted := unacknowledged
 	var retried *transientFailure
 	err := wait.PollUntilContextCancel(ctx, quotaCheckInterval, true, func(ctx context.Context) (bool, error) {
 		ng := &ngv1.NodeGroup{}
-		if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: name}, ng); err != nil {
+		if err := reader.Get(ctx, types.NamespacedName{Name: name}, ng); err != nil {
 			if apierrors.IsNotFound(err) {
 				// Not-seen-yet is informer lag right after Create; seen-then
 				// -gone is a vanish and must fail the launch, not proceed
@@ -816,6 +858,9 @@ func (p *Provider) waitForAcceptance(parentCtx context.Context, name string) (ac
 			return false, err
 		}
 		seen = true
+		if observed != nil && observed.UID != ng.UID {
+			return false, fmt.Errorf("%w: %q was replaced by another nodegroup", ErrNodeGroupVanished, name)
+		}
 		// Recorded first, before anything below can end the poll, Ready
 		// included: the operator keeps a transient failure set next to Ready
 		// (live), and the caller surfaces what the poll saw whatever ended it.

@@ -145,6 +145,29 @@ func controllerEnv(spec corev1.PodSpec, name string) *corev1.EnvVar {
 	return nil
 }
 
+// The reference disk must come from the pod's real host, in both supported
+// installation paths; an unset NODE_NAME silently selects the static fallback.
+func TestHostNodeNameUsesDownwardAPI(t *testing.T) {
+	assertHostNodeName := func(t *testing.T, manifest string) {
+		t.Helper()
+		env := controllerEnv(controllerPodSpec(t, manifest), "NODE_NAME")
+		if env == nil || env.Value != "" || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil ||
+			env.ValueFrom.FieldRef.FieldPath != "spec.nodeName" {
+			t.Fatalf("NODE_NAME must read spec.nodeName through the downward API, got %+v", env)
+		}
+	}
+	t.Run("chart", func(t *testing.T) {
+		assertHostNodeName(t, helmTemplate(t))
+	})
+	t.Run("raw manifest", func(t *testing.T) {
+		raw, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy", "karpenter.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertHostNodeName(t, string(raw))
+	})
+}
+
 // TestBooleanValuesRejectStringForms pins the values.schema.json type guard.
 // The templates gate on Go-template truthiness, where any non-empty string is
 // true: the STRING "false" (--set-string, or a quoted values file) renders the

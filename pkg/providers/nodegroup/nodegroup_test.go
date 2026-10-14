@@ -293,7 +293,7 @@ func ownedNodeGroup(name, flavor string, status ngv1.NodeGroupStatus) *ngv1.Node
 				v1alpha1.NodeClaimLabelKey: name,
 			},
 			OwnerReferences: []metav1.OwnerReference{
-				{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: name},
+				{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: name, UID: types.UID("uid-" + name)},
 			},
 		},
 		Spec:   ngv1.NodeGroupSpec{Flavor: flavor, NodeCount: 1},
@@ -423,8 +423,8 @@ func TestResolveAndCreateBuildsWhatTheResolverDecides(t *testing.T) {
 
 	unwanted := testNodeClaim("default-gone1")
 	errGone := errors.New("nodeclaim default-gone1 is being deleted")
-	_, err := provider.ResolveAndCreate(ctx, unwanted, func(context.Context) (*v1alpha1.CleverNodeClass, string, error) {
-		return nil, "", errGone
+	_, err := provider.ResolveAndCreate(ctx, unwanted, func(context.Context) (*nodegroup.Launch, error) {
+		return nil, errGone
 	})
 	if !errors.Is(err, errGone) {
 		t.Fatalf("want the resolver's error as it is, got %T: %v", err, err)
@@ -436,8 +436,8 @@ func TestResolveAndCreateBuildsWhatTheResolverDecides(t *testing.T) {
 	nodeClaim := testNodeClaim("default-rslv1")
 	nodeClass := testNodeClass("resolved")
 	done := acceptOnceCreated(t, kubeClient, nodeClaim.Name)
-	ng, err := provider.ResolveAndCreate(ctx, nodeClaim, func(context.Context) (*v1alpha1.CleverNodeClass, string, error) {
-		return nodeClass, "S", nil
+	ng, err := provider.ResolveAndCreate(ctx, nodeClaim, func(context.Context) (*nodegroup.Launch, error) {
+		return &nodegroup.Launch{NodeClass: nodeClass, Flavor: "S"}, nil
 	})
 	<-done
 	if err != nil {
@@ -548,7 +548,7 @@ func TestCreateReusesExistingManagedNodeGroup(t *testing.T) {
 				v1alpha1.NodeClaimLabelKey: "default-reuse",
 			},
 			OwnerReferences: []metav1.OwnerReference{
-				{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: "default-reuse"},
+				{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: "default-reuse", UID: "uid-default-reuse"},
 			},
 		},
 		Spec: ngv1.NodeGroupSpec{Flavor: "M", NodeCount: 1},
@@ -2074,7 +2074,7 @@ func TestAdoptionReleasesTheAdoptedGroupsFlavor(t *testing.T) {
 				v1alpha1.NodeClaimLabelKey: claim.Name,
 			},
 			OwnerReferences: []metav1.OwnerReference{
-				{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: claim.Name},
+				{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: claim.Name, UID: claim.UID},
 			},
 		},
 		Spec:   ngv1.NodeGroupSpec{Flavor: "XS", NodeCount: 1},
