@@ -36,7 +36,7 @@ var (
 	HostEphemeralStorageReady = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry, prometheus.GaugeOpts{
 			Namespace: namespace, Subsystem: "instancetype", Name: "host_ephemeral_storage_ready",
-			Help: "1 when the controller node has supplied a valid ephemeral storage reference. 0 blocks new provisioning; absent when NODE_NAME is unset.",
+			Help: "1 when the controller node has supplied a valid ephemeral storage reference. At 0, new workers guarantee no ephemeral storage; absent when NODE_NAME is unset.",
 		}, nil,
 	)
 	HostEphemeralStorageCapacity = opmetrics.NewPrometheusGauge(

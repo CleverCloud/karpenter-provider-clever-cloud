@@ -35,6 +35,7 @@ import (
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/cloudprovider"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
@@ -113,7 +114,7 @@ func TestHostStorageAdoptionPreservesLaunchSnapshot(t *testing.T) {
 }
 
 func TestHostStorageInvalidSnapshotRetriesCreateButKeepsGetList(t *testing.T) {
-	for _, corrupt := range []string{"missing capacity", "invalid quantity", "fractional", "allocatable exceeds capacity"} {
+	for _, corrupt := range []string{"missing capacity", "invalid quantity", "fractional", "allocatable exceeds capacity", "zero capacity", "zero allocatable", "negative capacity", "negative allocatable", "both negative", "overflow"} {
 		t.Run(corrupt, func(t *testing.T) {
 			ctx := coreContext()
 			cp, kubeClient, itp, operator := hostStorageProvider(t)
@@ -136,6 +137,19 @@ func TestHostStorageInvalidSnapshotRetriesCreateButKeepsGetList(t *testing.T) {
 				ng.Annotations[snapshotAllocatable] = "1500m"
 			case "allocatable exceeds capacity":
 				ng.Annotations[snapshotAllocatable] = "200Gi"
+			case "zero capacity":
+				ng.Annotations[snapshotCapacity] = "0"
+			case "zero allocatable":
+				ng.Annotations[snapshotAllocatable] = "0"
+			case "negative capacity":
+				ng.Annotations[snapshotCapacity] = "-160Gi"
+			case "negative allocatable":
+				ng.Annotations[snapshotAllocatable] = "-144Gi"
+			case "both negative":
+				ng.Annotations[snapshotCapacity] = "-160Gi"
+				ng.Annotations[snapshotAllocatable] = "-144Gi"
+			case "overflow":
+				ng.Annotations[snapshotCapacity] = "9223372036854775808"
 			}
 			if err := kubeClient.Update(ctx, ng); err != nil {
 				t.Fatal(err)
@@ -159,6 +173,58 @@ func TestHostStorageInvalidSnapshotRetriesCreateButKeepsGetList(t *testing.T) {
 			}
 			assertClaimDisk(t, list[0], "40Gi", "36Gi")
 		})
+	}
+}
+
+func TestHostStorageUnknownSnapshotSurvivesRecoveryAndRestart(t *testing.T) {
+	ctx := coreContext()
+	cp, kubeClient, itp, operator := hostStorageProvider(t)
+	seed(t, kubeClient, topologyNodePool("default"))
+	wanted := stored(t, kubeClient, testNodeClaim("default-unknown-snapshot"))
+	first, err := cp.Create(ctx, wanted)
+	if err != nil {
+		t.Fatalf("launching without an ephemeral-storage request: %v", err)
+	}
+	assertClaimDisk(t, first, "0", "0")
+	ng := &ngv1.NodeGroup{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: wanted.Name}, ng); err != nil {
+		t.Fatal(err)
+	}
+	if ng.Annotations[snapshotCapacity] != "0" || ng.Annotations[snapshotAllocatable] != "0" {
+		t.Fatalf("unknown disk must be explicit in the initial POST: %v", ng.Annotations)
+	}
+	assertUnknown := func(t *testing.T, provider *cloudprovider.CloudProvider) {
+		t.Helper()
+		again, err := provider.Create(ctx, wanted)
+		if err != nil {
+			t.Fatalf("adopting an unknown disk snapshot: %v", err)
+		}
+		assertClaimDisk(t, again, "0", "0")
+		got, err := provider.Get(ctx, first.Status.ProviderID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertClaimDisk(t, got, "0", "0")
+		list, err := provider.List(ctx)
+		if err != nil || len(list) != 1 {
+			t.Fatalf("List: %d claims, %v", len(list), err)
+		}
+		assertClaimDisk(t, list[0], "0", "0")
+	}
+	// A newly valid reference only describes new launches. The in-flight
+	// unknown group must not gain disk capacity it was never promised.
+	hostDisk(t, itp, "160Gi", "144Gi")
+	assertUnknown(t, cp)
+	// An empty process-local state still finds the persisted zero/zero pair
+	// and adopts it, rather than treating it as a pre-feature missing snapshot.
+	restarted := instancetype.NewProvider("par", nil, nil)
+	restarted.RequireEphemeralStorageReference()
+	cp = cloudprovider.New(kubeClient, kubeClient, restarted, nodegroup.NewProvider(kubeClient, noopRecorder{}, restarted, clock.RealClock{}))
+	assertUnknown(t, cp)
+	hostDisk(t, restarted, "40Gi", "36Gi")
+	assertUnknown(t, cp)
+	if count := operator.createCount(); count != 1 {
+		t.Fatalf("unknown snapshot adoption recreated a VM: %d POSTs", count)
 	}
 }
 

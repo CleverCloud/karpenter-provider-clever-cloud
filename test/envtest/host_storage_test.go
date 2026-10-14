@@ -48,8 +48,15 @@ func TestHostStorageFollowsNodeWatch(t *testing.T) {
 			if hostStorageProvider.EphemeralStorageReady() {
 				return fmt.Errorf("host disk is still considered ready")
 			}
-			if _, err := cp.GetInstanceTypes(ctx, nil); err == nil {
-				return fmt.Errorf("catalogue still permits new provisioning")
+			instanceTypes, err := cp.GetInstanceTypes(ctx, nil)
+			if err != nil || len(instanceTypes) == 0 {
+				return fmt.Errorf("unknown disk blocks CPU/RAM provisioning: types=%d error=%v", len(instanceTypes), err)
+			}
+			for _, it := range instanceTypes {
+				capacity, allocatable := it.Capacity[corev1.ResourceEphemeralStorage], it.Allocatable()[corev1.ResourceEphemeralStorage]
+				if !capacity.IsZero() || !allocatable.IsZero() {
+					return fmt.Errorf("unknown disk still guarantees storage for %s: %s/%s", it.Name, capacity.String(), allocatable.String())
+				}
 			}
 			return nil
 		})

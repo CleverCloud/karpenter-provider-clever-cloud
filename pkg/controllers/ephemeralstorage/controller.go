@@ -106,7 +106,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		For(&corev1.Node{}).
 		WithEventFilter(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetName() == c.nodeName })).
 		// Also reconcile when the node is missing at startup: no Node event
-		// exists in that case, but provisioning must wait and explain why.
+		// exists in that case, but disk requests need the reference to recover.
 		WatchesRawSource(singleton.Source()).
 		Complete(c)
 }
