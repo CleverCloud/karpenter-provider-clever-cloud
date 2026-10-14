@@ -47,7 +47,7 @@ Set `nodeSelector` to pin the controller further (it is ANDed with the affinity,
 ## Local disk reference
 
 The chart and generated raw manifest default to
-`settings.ephemeralStorageReference.mode: static`, preserving v0.14.0's measured
+`settings.ephemeralStorageReference.mode: static`, using the measured
 local disk capacity for new workers. This setting does not configure remote PVCs.
 Dynamic sizing is an explicit choice:
 
@@ -156,8 +156,8 @@ helm upgrade karpenter \
 
 `--reset-then-reuse-values` takes the new chart's defaults and re-applies only the values you set yourself, whereas `--reuse-values` replaces the new defaults with the previous release's, so every default a release changes silently keeps its old value (v0.12.0's placement fix never reaches a `--reuse-values` upgrade from v0.11.0: on `DEDICATED_COMPUTE` and `DISTRIBUTED` the controller stays `Pending`). An explicit values file (`-f` alone, with no reuse or reset flag) works as well, provided it holds every value you have customized and nothing else: Helm then reuses none of the previous release's values, so anything set at an earlier install or upgrade and missing from the file is dropped, and a full copy of an older `values.yaml` pins every default the same way.
 
-**Disk sizing on upgrade:** the default remains `static`, so upgrading from
-v0.14.0 does not silently substitute an old controller host's smaller disk. To
+**Disk sizing on upgrade:** the default remains `static`, so an upgrade does
+not silently substitute an old controller host's smaller disk. To
 opt in after checking the reference, add
 `--set settings.ephemeralStorageReference.mode=host` to the controller upgrade,
 or supply `mode: node` and `nodeName` in your values file as described
@@ -169,6 +169,12 @@ host reference, set `mode: host` explicitly to preserve that choice.
 so pass a corrected list during the upgrade; if it contained only `NODE_NAME`,
 `--set-json 'controller.env=[]'` clears it. Each mode renders exactly one variable:
 empty for `static`, a field reference for `host`, a literal name for `node`.
+
+**Republished v0.14.0:** this release replaces the initial v0.14.0 build to
+include configurable disk references. For an existing installation, repeat the
+chart upgrade and pin `image.digest` to the republished image's digest, or set
+`imagePullPolicy=Always` and restart the controller. Reusing the same image tag
+with the default `IfNotPresent` can keep the old binary cached on the host.
 
 If you did not install the CRD chart, apply the CRDs by hand instead (Helm does not upgrade CRDs shipped in the main chart's `crds/` directory), from a checkout of the matching release tag: `kubectl apply -f deploy/crds/`.
 

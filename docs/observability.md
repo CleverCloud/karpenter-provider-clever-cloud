@@ -169,8 +169,9 @@ last transition), after which its group may be garbage-collected. Restore the ex
 original annotation pair from a reliable capture; do not guess a larger disk or
 remove platform finalizers. Groups predating this feature are adopted without a new
 POST and retain a catalogue-based description, which is not a historical measurement.
-Rollback to v0.14.0 ignores existing annotations without removing them; they are used
-again on re-upgrade. Groups created during rollback have no snapshot.
+Earlier controller builds without snapshot support ignore existing annotations
+without removing them; they are used again on re-upgrade. Groups created by those
+builds have no snapshot.
 
 A pending pod can show `FailedScheduling` with `no instance type has enough
 resources` and `ephemeral-storage`, which also occurs for genuinely oversized

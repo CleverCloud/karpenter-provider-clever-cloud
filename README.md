@@ -194,8 +194,7 @@ another flavor when the claim allows one; pods that only that flavor fits stay p
 Overrides always win over the built-in values. Leave `settings.flavors` empty to use the built-in
 catalogue unchanged.
 
-The chart defaults to **static local disk sizing**, preserving the measured profile
-from v0.14.0: `102624184Ki` capacity (about 97.9 Gi), with a 10% eviction reserve,
+The chart defaults to **static local disk sizing**, using the measured worker profile: `102624184Ki` capacity (about 97.9 Gi), with a 10% eviction reserve,
 and compatibility with old workers' `40971488Ki` disks (about 39.1 Gi). It cannot
 discover a future platform disk change. Choose the source explicitly through
 `settings.ephemeralStorageReference`:
