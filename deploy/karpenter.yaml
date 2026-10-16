@@ -55,12 +55,22 @@ rules:
   - apiGroups: ["karpenter.sh"]
     resources: ["nodepools", "nodepools/status", "nodeclaims", "nodeclaims/status", "nodeoverlays", "nodeoverlays/status"]
     verbs: ["get", "list", "watch"]
+  # services: SCHEDULER_CONFIG's default topology spread deduces each pod's
+  # selector from the Services selecting it, through the informer cache —
+  # without list/watch the cache never syncs and provisioning and
+  # consolidation block on it forever.
   - apiGroups: [""]
-    resources: ["pods", "nodes", "persistentvolumes", "persistentvolumeclaims", "replicationcontrollers", "namespaces"]
+    resources: ["pods", "nodes", "persistentvolumes", "persistentvolumeclaims", "replicationcontrollers", "namespaces", "services"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses", "csinodes", "volumeattachments"]
     verbs: ["get", "watch", "list"]
+  # Dynamic resource allocation, read only once IGNORE_DRA_REQUESTS=false
+  # (through controller.env): a rule naming an API group the cluster does not
+  # serve is inert.
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["deviceclasses", "resourceclaims", "resourceslices"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
     verbs: ["list", "watch"]
