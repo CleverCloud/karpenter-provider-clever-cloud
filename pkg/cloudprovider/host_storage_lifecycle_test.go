@@ -110,7 +110,7 @@ func TestHostStorageLostReferenceDoesNotFreezeCoreProvisioning(t *testing.T) {
 			if err := kubeClient.List(ctx, claims); err != nil || len(claims.Items) != 1 {
 				t.Fatalf("provisioner bypassed the sync gate: claims=%d error=%v", len(claims.Items), err)
 			}
-			controller := lifecycle.NewController(clock.RealClock{}, kubeClient, cp, noopRecorder{}, nodepoolhealth.NewState(), nil)
+			controller := lifecycle.NewController(clock.RealClock{}, kubeClient, cp, noopRecorder{}, cluster, nodepoolhealth.NewState(), nil)
 			if _, err := controller.Reconcile(ctx, claim); err != nil {
 				t.Fatalf("core must handle the known capacity failure without retrying it: %v", err)
 			}

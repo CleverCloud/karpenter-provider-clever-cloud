@@ -47,6 +47,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
@@ -145,7 +146,7 @@ func TestGetReleasesTheNodeOfATerminatingNodeGroup(t *testing.T) {
 	}
 
 	clk := clock.RealClock{}
-	controller := termination.NewController(clk, kubeClient, cp, terminator.NewTerminator(clk, kubeClient, terminator.NewQueue(kubeClient, noopRecorder{}), noopRecorder{}), noopRecorder{})
+	controller := termination.NewController(clk, kubeClient, cp, terminator.NewTerminator(clk, kubeClient, terminator.NewQueue(clk, kubeClient, noopRecorder{}), noopRecorder{}), noopRecorder{})
 	if _, err := controller.Reconcile(ctx, node); err != nil {
 		t.Fatalf("core node termination: %v", err)
 	}
@@ -177,8 +178,8 @@ func TestBlockedDeletionWaitsAndResumesWhenThePlatformRecovers(t *testing.T) {
 			clk := clock.RealClock{}
 			itp := instancetype.NewProvider("par", nil, nil)
 			cp := cloudprovider.New(kubeClient, kubeClient, itp, nodegroup.NewProvider(kubeClient, noopRecorder{}, itp, clk))
-			nodeController := termination.NewController(clk, kubeClient, cp, terminator.NewTerminator(clk, kubeClient, terminator.NewQueue(kubeClient, noopRecorder{}), noopRecorder{}), noopRecorder{})
-			claimController := lifecycle.NewController(clk, kubeClient, cp, noopRecorder{}, nil, nil)
+			nodeController := termination.NewController(clk, kubeClient, cp, terminator.NewTerminator(clk, kubeClient, terminator.NewQueue(clk, kubeClient, noopRecorder{}), noopRecorder{}), noopRecorder{})
+			claimController := lifecycle.NewController(clk, kubeClient, cp, noopRecorder{}, state.NewCluster(clk, kubeClient, cp), nil, nil)
 			for range 3 {
 				err := kubeClient.Get(ctx, client.ObjectKeyFromObject(node), node)
 				if err == nil {
