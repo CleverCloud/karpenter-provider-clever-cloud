@@ -44,7 +44,7 @@ test-envtest: ## Run controller integration tests against a real kube-apiserver 
 	@# command's env prefix is silently discarded by sh, and the suite would
 	@# skip itself on the resulting empty KUBEBUILDER_ASSETS — a green no-op.
 	assets="$$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) -p path)" && \
-		KUBEBUILDER_ASSETS="$$assets" go test -count=1 ./test/envtest/... ./test/chart/...
+		KUBEBUILDER_ASSETS="$$assets" CHART_TEST_REQUIRE_HELM=1 go test -count=1 ./test/envtest/... ./test/chart/...
 
 .PHONY: test-chart
 test-chart: ## Assert the rendered chart's controller placement (requires helm)

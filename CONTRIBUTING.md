@@ -110,7 +110,16 @@ pushed to it):
 3. Build and fix API breakages, then run the full [local validation chain](#local-validation-chain).
 4. Skim the karpenter-core release notes for behavior changes in provisioning, disruption, or the
    CloudProvider contract; call them out in the commit body.
-5. Remind users in the release notes that the `karpenter-crd` chart must be upgraded before the
+5. Diff the RBAC of the upstream example chart between the two versions
+   (`kwok/charts/templates/clusterrole.yaml` and `role.yaml` in the module cache) and carry every rule
+   core now needs into [charts/karpenter/templates/](charts/karpenter/templates/). karpenter-core reads
+   through the manager's informer cache: a forbidden list or watch does not fail, it blocks the reader
+   until the cache syncs, which it never does — and envtest and `make e2e` run with admin
+   credentials. `test/chart/rbac_api_test.go` runs the binary (with each opt-in it lists) and core's
+   Services reader under the rendered RBAC; add a case for every new opt-in reader. The upstream
+   chart is no complete list either: it grants nothing for the `resource.k8s.io` objects core reads
+   with `IGNORE_DRA_REQUESTS=false`.
+6. Remind users in the release notes that the `karpenter-crd` chart must be upgraded before the
    controller chart (see [installation.md](docs/getting-started/installation.md)).
 
 ## Docs are code
