@@ -138,8 +138,11 @@ settings:
   batchMaxDuration: 10s
   batchIdleDuration: 1s
   featureGates:
-    # -- Enable Karpenter's node auto-repair (acts on the provider's
-    # RepairPolicies: NodeReady False/Unknown tolerated 10m).
+    # -- Enable Karpenter's node auto-repair: a node whose Ready condition has
+    # been False or Unknown for 10m is replaced, replacement first, paced by the
+    # NodePool's disruption budgets (reason Unhealthy, which a budget without
+    # reasons covers too) and, when its pods need a new node, only while the
+    # organisation quota leaves room for it. See the README's "Node repair".
     nodeRepair: false
   # -- Per-flavor overrides overlaid on top of the built-in catalogue (the
   # 2XS…XL seed). Leave empty to use the built-in catalogue unchanged. Each

@@ -150,8 +150,13 @@ from its [values](charts/karpenter/README.md) and the pod's Downward API:
 | `DISABLE_LEADER_ELECTION` | `Boolean`  | `false`            | no       | Useful for single-replica dev setups                         |
 | `BATCH_MAX_DURATION`      | `Duration` | `10s`              | no       | Maximum pod batching window before provisioning              |
 | `BATCH_IDLE_DURATION`     | `Duration` | `1s`               | no       | Idle pod batching window before provisioning                 |
-| `FEATURE_GATES`           | `String`   | `NodeRepair=false` | no       | Karpenter feature gates                                      |
+| `FEATURE_GATES`           | `String`   | `NodeRepair=false` | no       | Karpenter feature gates; the chart sets `NodeRepair` from `settings.featureGates.nodeRepair` (see [Node repair](#node-repair)) |
 | `FLAVORS_CONFIG_PATH`     | `String`   | _(unset)_          | no       | Path to a YAML list of per-flavor overrides; set by the chart when `settings.flavors` is non-empty |
+
+karpenter-core reads further variables, which `controller.env` passes through. Leave its `SCHEDULER_CONFIG` unset:
+it must mirror the PodTopologySpread `defaultConstraints` of the cluster's own kube-scheduler, which Clever Cloud
+manages and documents none for, and a value the real scheduler does not apply makes Karpenter launch nodes for a
+spreading that never happens.
 
 ### Flavor catalogue
 
@@ -454,6 +459,48 @@ such a rule limited nothing. Its replicas beyond the first keep running where th
 older nodes are gone (or labelled by hand) a replica that has to be rescheduled stays Pending, and
 Karpenter cannot launch a node for it. Key such a rule on `kubernetes.io/hostname` to keep one replica
 per node.
+
+### Node repair
+
+Node repair is off by default (`settings.featureGates.nodeRepair`). Enabled, it replaces a node whose
+`Ready` condition has been `False` (the kubelet reports NotReady) or `Unknown` (the kubelet went silent:
+VM gone or partitioned) for 10 minutes. karpenter-core runs it as a voluntary disruption method:
+
+- **Budgets pace it**, under the reason `Unhealthy`. A budget without `reasons` covers repair too, so a
+  `nodes: "0"` budget (business hours, a planned upgrade) pauses it; list the other reasons
+  (`Underutilized`, `Empty`, `Drifted`) on such a budget to keep repairing through it. A node that
+  registered but never initialized is repaired whatever the budgets. A NodePool with more unhealthy
+  nodes at once than 20% of its nodes rounded up (one in a pool of up to 5 nodes, two from 6 to 10) is
+  not repaired at all, and a `NodeRepairBlocked` event says so: that points at the platform, not at
+  the nodes.
+- **The replacement comes first**: the broken node is deleted once its replacement is initialized,
+  forcefully (its pods are deleted, not evicted, and nothing waits on a drain). A node whose pods were
+  all evicted already is deleted without a replacement, unless one of them is a StatefulSet replica:
+  its controller waits for the old pod to go before recreating it, so it still needs room.
+- **It needs quota headroom when its pods need a new node.** The organisation quota counts the broken
+  node's VM until it is deleted, so at an exhausted quota the replacement launch is refused and such a
+  node is not repaired until capacity frees up; each attempt counts one quota rejection, about once a
+  minute.
+- **It pauses while karpenter-core's cluster state is not synced** (`karpenter_cluster_state_synced`
+  at 0), like provisioning and the other disruption methods.
+- **It needs a Ready NodePool.** With none Ready — its CleverNodeClass being deleted (the provider holds
+  that deletion until the class's nodes are gone), invalid, or not reconciled yet — repair cannot plan
+  where the broken node's pods would go, and the error ends karpenter-core's whole disruption pass: the
+  node is not repaired, and empty or underutilized nodes are not removed either (see
+  [the runbook](docs/observability.md#node-repair)).
+- `karpenter.sh/do-not-repair: "true"` on a Node exempts it. `karpenter.sh/do-not-disrupt` and
+  PodDisruptionBudgets do not hold repair back.
+
+`LEGACY_NODE_REPAIR=true` (through `controller.env`) runs the standalone controller of earlier releases
+instead, which karpenter-core plans to deprecate: it deletes the broken node first, and ignores
+budgets, `karpenter.sh/do-not-repair` and the cluster state sync.
+
+CKE heals some failures itself: when a worker's kubelet stopped in the live validation, the platform
+started a replacement VM in the node's NodeGroup within seconds (Karpenter cannot use it: the provider
+ID belongs to the old node, so it stays unregistered), drained the old node and deleted it after
+about 5 minutes, which ended the NodeClaim and its NodeGroup, both VMs included, before the
+10-minute toleration (see [E2E-RESULTS](docs/E2E-RESULTS.md)). Node repair is the backstop for what
+the platform leaves alone.
 
 ## Observability
 

@@ -1,6 +1,9 @@
-# This example throttles voluntary disruptions (consolidation, drift,
-# expiration): at most one node at a time, and none at all during business
-# hours (Mon-Fri 8h-18h UTC). Karpenter still replaces nodes that fail.
+# This example throttles voluntary disruptions (consolidation, drift, and node
+# repair when settings.featureGates.nodeRepair enables it): at most one node at
+# a time, and none at all during business hours (Mon-Fri 8h-18h UTC).
+# Expiration does not wait on budgets. To keep repairing failed nodes during
+# business hours, add `reasons: [Underutilized, Empty, Drifted]` to the
+# business-hours budget.
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
