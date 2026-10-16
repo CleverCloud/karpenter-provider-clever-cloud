@@ -653,3 +653,94 @@ and server-side-apply transitions through a real API server, including
 upgrades from a deployment without `NODE_NAME`. The live run uses an
 out-of-cluster binary; it does not deploy the chart's controller pod or
 resize physical disks. Control-plane disk equivalence remains unmeasured.
+
+# karpenter-core 1.15 upgrade validation (2026-10-16)
+
+Live validation of the karpenter-core 1.14.1 → 1.15.0 bump on a fresh CKE
+cluster (`kubernetes_01M51XVYXJ0GKWQHWF0HSJZFP8`, Paris, Kubernetes v1.36.3,
+worker-only topology, kernel `7.2.11-clevercloud-vm-dirty`, containerd 2.4.1,
+Cilium) with an **unmanaged** 1× XS NodeGroup as baseline capacity. Its node
+reported 7553640Ki of memory (catalogue: 7553664Ki) and the measured
+102624184Ki disk: the built-in catalogue still matches this node image.
+
+## In-place upgrade from v0.14.0, under the chart's own RBAC
+
+1. The published v0.14.0 charts (`karpenter-crd`, then `karpenter`) were
+   installed in the cluster. A CleverNodeClass carrying one label, a NodePool
+   without capacity-type requirement and three pods of 1 CPU / 3Gi gave one
+   S node, Ready 45 s after the workload was applied.
+2. The `karpenter-crd` chart of the branch was upgraded in (`Unhealthy`
+   appears in the budget reasons), then the controller chart of the branch
+   with `replicas=0`, so its RBAC applied while no in-cluster controller ran.
+   The controller built from the branch ran out-of-cluster **impersonating
+   `system:serviceaccount:karpenter:karpenter`**, bound to nothing but the
+   chart's ClusterRole and Roles, leader election on.
+3. Every core and provider controller started (39), no request was refused,
+   `karpenter_cluster_state_synced` read 1, and the v0.14.0 node kept its
+   NodeClaim: same `clevernodeclass-hash` and `nodepool-hash` stamps
+   (version `v3` for both), never `Drifted`.
+4. Scaled to six pods, the new controller launched a second S node: claim
+   created, NodeGroup acknowledged 1.4 s later, node registered at 28 s and
+   initialized at 36 s. Scaled back to two pods, an `Empty` command deleted
+   the emptied node 54 s after the scale-down, NodeGroup included; an
+   `Underutilized` replacement of the remaining S by a cheaper XS started
+   next. The restart of step 5 abandoned it half-way (the orchestration
+   queue lives in the controller's memory): its XS came up, and the S stayed.
+5. Restarted with `FEATURE_GATES=NodeRepair=true` and a `SCHEDULER_CONFIG`
+   (hostname spread, `ScheduleAnyway`), the controller started (the repair
+   policies compile) but **froze**: the chart's ClusterRole did not grant
+   `services`, the Services informer logged `forbidden` in a loop, and a
+   goroutine dump showed both the provisioner and a consolidation simulation
+   waiting in `WaitForCacheSync` under
+   `DefaultTopologySpreadInjector.services`. A Pending pod stayed Pending.
+   With `services` added to the ClusterRole (as the chart now ships it), the
+   next start placed it on a new 2XS within 45 s of taking the lease, with no
+   refused request.
+6. Rolled back to the in-cluster v0.14.0 image over the 1.15 CRDs and RBAC,
+   the old controller deleted all three nodes (the v0.14.0 S, the abandoned
+   replacement's XS and the 2XS of step 5) within 98 s of the workload's
+   deletion, logging no error.
+
+## `make e2e`
+
+| Scenario | Result | Notes |
+|---|---|---|
+| Provision | PASS (81 s) | both pods Running in 75 s: the main pool's 8-CPU limit lets one claim through per scheduling pass, the second follows 10 s later |
+| ConsolidationScaleToZero | PASS (65 s) | pool consolidated to zero in 1 min 5 s |
+| Drift | PASS (145 s) | replacement registered 1 min 20 s after the NodeClass patch |
+| GarbageCollection | PASS (372 s) | ownerless decoy refused in 3 min 10 s; the owner-reference cascade reaped the force-deleted claim's group in 5 s |
+| QuotaFastFail | PASS (126 s) | rejection surfaced in 10 s, 4/4 pods Pending, each told why (below), no leaked NodeGroup |
+
+Whole suite: 915 s on the final tree; the same suite passed (830 s) on the
+bare bump before the repair, RBAC and test changes. The quota scenario now
+also asserts karpenter-core's new pod event. Observed messages:
+
+```
+NodeClaim e2e-386b78-quota-9qwkx nominated for this pod failed to launch: insufficient capacity, clever cloud quota exceeded for flavor XL
+NodeClaim e2e-386b78-quota-gw4z6 nominated for this pod failed to launch: insufficient capacity, resolving instance type, no available clever cloud flavor satisfies the nodeclaim requirements and resource requests (1 flavor(s) that would satisfy them are currently unavailable after a quota rejection or an upstream refusal)
+```
+
+Every gate of the local validation chain passed under Go 1.26.9 (vet,
+build, unit and race tests, envtest, chart lint and tests, generated files,
+lint, govulncheck).
+
+## A worker whose kubelet stops: the platform heals it first
+
+With the final tree running as the chart's ServiceAccount,
+`FEATURE_GATES=NodeRepair=true`, a NodePool of two 2XS nodes with one pod
+each (required anti-affinity), the kubelet of one worker was stopped
+(`kubectl debug node/… --profile=sysadmin -- chroot /host systemctl stop
+kubelet`). Times from the node turning `Unknown`:
+
+| t | What happened |
+|---|---|
+| 0 | `Ready=Unknown` (`NodeStatusUnknown`); core matches the repair policy |
+| +11 s | **CKE starts a replacement VM in the same NodeGroup**: `<group>-node1` joins with the group's labels and the `karpenter.sh/unregistered` taint while `nodeCount` stays 1. The providerid controller refuses it a provider ID (its sibling holds it), so it never registers and no pod can use it |
+| +36 s | CKE cordons the old node (`spec.unschedulable`, label `clever-cloud.com/draining: "true"`) and evicts its pod through the Eviction API, well before the 300 s taint-based eviction |
+| +1 min 24 s | the evicted pod, recreated and Pending (the replacement VM is unregistered), runs on a new 2XS Karpenter launched for it |
+| +5 min 36 s | CKE deletes the old Node object: core's termination deletes the NodeClaim, drains, and the provider deletes the NodeGroup |
+| +7 min 9 s | the replacement VM is gone with its NodeGroup: nothing leaked |
+
+Karpenter's own repair, due at +10 min, never had to act. On CKE, node repair
+is the backstop for failures the platform does not heal; the platform's
+replacement VM costs one idle node for a few minutes.
