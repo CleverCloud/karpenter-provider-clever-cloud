@@ -46,6 +46,14 @@ What it pins down:
 - **The nodegroupstatus watches**: a quota rejection published after the
   launch fails the NodeClaim through the NodeClaim watch, and a Registered
   claim next to an identical refusal is never touched.
+- **The chart's RBAC** (`test/chart`): the rendered ClusterRole and Roles are
+  bound to a user named after the ServiceAccount. The real controller binary
+  must start every controller under them, leader election included, with
+  node repair off, on and in legacy mode and with DRA requests honoured; and
+  karpenter-core's `SCHEDULER_CONFIG` reader must deduce selectors from
+  Services, ReplicaSets, StatefulSets and ReplicationControllers through a
+  cache authenticated as that user. A forbidden cached read blocks instead
+  of failing, and every other stage runs with admin credentials.
 
 The NodeGroup CRD is owned by Clever Cloud and installed by the platform;
 this repository never ships it. The suite installs a verbatim capture of it
