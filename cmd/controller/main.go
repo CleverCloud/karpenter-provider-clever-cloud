@@ -21,11 +21,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/samber/lo"
 	"sigs.k8s.io/karpenter/pkg/utils/env"
 
 	coremetrics "sigs.k8s.io/karpenter/pkg/cloudprovider/metrics"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/overlay"
 	corecontrollers "sigs.k8s.io/karpenter/pkg/controllers"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator"
 
@@ -68,7 +70,14 @@ func main() {
 	// calls (karpenter_cloudprovider_* series), then the NodeOverlay layer.
 	metricsCloudProvider := coremetrics.Decorate(cleverCloudProvider)
 	decoratedCloudProvider := overlay.Decorate(metricsCloudProvider, op.GetClient(), op.InstanceTypeStore)
-	clusterState := state.NewCluster(op.Clock, op.GetClient(), decoratedCloudProvider)
+	// Node repair (the NodeRepair feature gate) runs inside core's disruption
+	// controller, which matches the provider's RepairPolicies through cluster
+	// state: with the gate on, core panics at startup on a cluster built
+	// without the matcher. The matcher is nil while the gate is off or
+	// LEGACY_NODE_REPAIR runs the standalone controller of earlier releases
+	// instead; an invalid policy set fails startup too.
+	repairPolicyMatcher := lo.Must(health.NewRepairPolicyMatcher(ctx, decoratedCloudProvider))
+	clusterState := state.NewCluster(op.Clock, op.GetClient(), decoratedCloudProvider, state.WithRepairPolicyMatcher(repairPolicyMatcher))
 
 	op.
 		WithControllers(ctx, corecontrollers.NewControllers(
@@ -81,6 +90,7 @@ func main() {
 			metricsCloudProvider,
 			clusterState,
 			op.InstanceTypeStore,
+			op.PredictionStore,
 		)...).
 		WithControllers(ctx, controllers.NewControllers(
 			op.GetClient(),

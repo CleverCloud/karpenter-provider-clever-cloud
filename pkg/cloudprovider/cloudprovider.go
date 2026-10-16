@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -323,19 +324,38 @@ func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCla
 	return "", nil
 }
 
+// RepairPolicies replaces a node whose NodeReady condition has been False
+// (kubelet reporting NotReady) or Unknown (kubelet silent: VM gone or
+// partitioned) for 10 minutes. karpenter-core repairs through its disruption
+// controller: the replacement is launched first, then the node is deleted.
+// The zero TerminationGracePeriod keeps the termination forceful, as before
+// core 1.15: the kubelet of such a node cannot be relied on to evict, and a
+// nil bound would inherit the NodePool's (unbounded by default) and make core
+// refuse to repair any node hosting a PDB-blocked or do-not-disrupt pod.
+// Ready=False is the set's single default fallback; ".*" makes the Unknown
+// policy match every reason, the empty one included.
 func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 	return []cloudprovider.RepairPolicy{
 		{
-			ConditionType:      corev1.NodeReady,
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 10 * time.Minute,
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionFalse,
+			TolerationDuration:     10 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      corev1.NodeReady,
-			ConditionStatus:    corev1.ConditionUnknown,
-			TolerationDuration: 10 * time.Minute,
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionUnknown,
+			ReasonRegex:            ".*",
+			TolerationDuration:     10 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 	}
+}
+
+func (c *CloudProvider) Reboot(context.Context, *karpv1.NodeClaim, string) error {
+	return cloudprovider.NewNodeRebootNotImplementedError()
 }
 
 func (c *CloudProvider) Name() string {

@@ -37,19 +37,19 @@ var (
 		crmetrics.Registry, prometheus.GaugeOpts{
 			Namespace: namespace, Subsystem: "instancetype", Name: "host_ephemeral_storage_ready",
 			Help: "1 when the controller node has supplied a valid ephemeral storage reference. At 0, new workers guarantee no ephemeral storage; absent when NODE_NAME is unset.",
-		}, nil,
+		}, nil, opmetrics.Alpha,
 	)
 	HostEphemeralStorageCapacity = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry, prometheus.GaugeOpts{
 			Namespace: namespace, Subsystem: "instancetype", Name: "host_ephemeral_storage_capacity_bytes",
 			Help: "Last valid controller-node ephemeral storage capacity used for new workers, in bytes. Consult host_ephemeral_storage_ready before using this snapshot.",
-		}, nil,
+		}, nil, opmetrics.Alpha,
 	)
 	HostEphemeralStorageAllocatable = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry, prometheus.GaugeOpts{
 			Namespace: namespace, Subsystem: "instancetype", Name: "host_ephemeral_storage_allocatable_bytes",
 			Help: "Last valid controller-node ephemeral storage allocatable used for new workers, in bytes. Consult host_ephemeral_storage_ready before using this snapshot.",
-		}, nil,
+		}, nil, opmetrics.Alpha,
 	)
 
 	// NodeGroupAcceptanceTimeouts counts Creates that hit the acceptance-poll
@@ -67,7 +67,7 @@ var (
 			Name:      "acceptance_timeouts_total",
 			Help:      "NodeGroup creations the node-group operator neither acknowledged nor refused within the poll window, which proceeded optimistically. Healthy launches are acknowledged within seconds; growth usually means the operator is down or wedged.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 
 	// NodeGroupQuotaRejections counts fresh upstream quota rejections (not
@@ -82,7 +82,7 @@ var (
 			Name:      "quota_rejections_total",
 			Help:      "NodeGroup creations rejected by the organisation quota. Rejections are normal operation near the quota ceiling.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 
 	// NodeGroupVanished counts NodeGroups that disappeared after creation
@@ -97,7 +97,7 @@ var (
 			Name:      "vanished_total",
 			Help:      "NodeGroups that disappeared after creation while their NodeClaim was still unregistered. Each tick is a fast-failed launch.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 
 	// NodeGroupRejections is the number of NodeGroup creations the upstream
@@ -119,7 +119,7 @@ var (
 			Name:      "rejections_total",
 			Help:      "NodeGroup creations refused by the node-group operator for a non-quota reason, or refused at admission for their flavor. The refused flavor is held out of provisioning briefly.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 
 	// NodeGroupSyncOverdue is the number of launched NodeGroups the node-group
@@ -136,7 +136,7 @@ var (
 			Name:      "sync_overdue",
 			Help:      "Launched NodeGroups the node-group operator has not synced 5 minutes after their creation while their NodeClaim is still unregistered. Non-zero means launches are stuck upstream.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 
 	// NodeGroupDeletionOverdue counts managed NodeGroups still present at
@@ -150,7 +150,7 @@ var (
 			Name:      "deletion_overdue",
 			Help:      "Managed NodeGroups still present at least 5 minutes after deletion was requested, from the last successful garbage-collection list. This does not confirm VM deletion.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 
 	// NodeGroupExternalResizes is the number of managed NodeGroups whose
@@ -167,7 +167,7 @@ var (
 			Name:      "external_resizes",
 			Help:      "Managed NodeGroups whose nodeCount is not 1. Non-zero means something outside karpenter resizes its groups.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 
 	// GCReapedNodeGroups counts orphaned NodeGroups deleted by the
@@ -181,7 +181,7 @@ var (
 			Name:      "reaped_nodegroups_total",
 			Help:      "Orphaned NodeGroups deleted by the garbage-collection safety net.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 
 	// GCRefusedNodeGroups is the number of NodeGroups the last GC sweep
@@ -196,7 +196,7 @@ var (
 			Name:      "refused_nodegroups",
 			Help:      "NodeGroups the last garbage-collection sweep refused to reap (managed label without a verified, dead NodeClaim owner). Non-zero needs operator attention.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 
 	// FlavorsConfigInvalid is 1 while the FLAVORS_CONFIG_PATH file failed to
@@ -212,7 +212,7 @@ var (
 			Name:      "flavors_config_invalid",
 			Help:      "1 while the flavors overrides file failed to load and the controller runs without the configured overrides.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 
 	// UnknownFlavorLookups counts instance-type lookups for a flavor absent
@@ -226,7 +226,7 @@ var (
 			Name:      "unknown_flavor_lookups_total",
 			Help:      "Instance-type lookups for a flavor absent from the served catalogue.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 
 	// ObservedCapacityRejections counts node capacity reports the
@@ -244,7 +244,7 @@ var (
 			Name:      "observed_capacity_rejections_total",
 			Help:      "Node capacity reports refused by the instance-type catalogue: a node claiming a managed NodeGroup it is not a node of, a flavor label contradicting that NodeGroup, or figures a VM of that flavor cannot report. The catalogue keeps its previous value.",
 		},
-		nil,
+		nil, opmetrics.Alpha,
 	)
 )
 
