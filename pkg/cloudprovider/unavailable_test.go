@@ -175,6 +175,14 @@ func requireAvailability(t *testing.T, cp *cloudprovider.CloudProvider, want map
 		if got := len(it.Offerings.Available()) > 0; got != want[it.Name] {
 			t.Errorf("flavor %s available = %v, want %v", it.Name, got, want[it.Name])
 		}
+		// Since 1.15, karpenter-core prices and orders offerings by
+		// Launchable() rather than Available; the two only differ for
+		// reserved offerings, which this catalogue never serves.
+		for _, offering := range it.Offerings {
+			if offering.Launchable() != offering.Available {
+				t.Errorf("flavor %s: offering Launchable() = %v, Available = %v", it.Name, offering.Launchable(), offering.Available)
+			}
+		}
 	}
 }
 

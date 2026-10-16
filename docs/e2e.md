@@ -190,12 +190,14 @@ kubectl --context <kubeconfig-context> -n karpenter scale deployment/karpenter -
    the sweep itself lives in the unit tests). The workload then self-heals
    onto a replacement node.
 5. **Quota fast-fail** — an XL-only pool drives provisioning into the org
-   quota: `nodegroup_quota_rejections_total` moves, pods stay `Pending`, and
-   once the workload is gone **nothing leaks** — the historical failure mode
-   of the beta quota engine.
+   quota: `nodegroup_quota_rejections_total` moves, pods stay `Pending` and
+   carry karpenter-core's `InsufficientCapacityError` Warning naming the quota
+   (`kubectl describe pod` explains the wait), and once the workload is gone
+   **nothing leaks** — the historical failure mode of the beta quota engine.
 
-A full green run takes about 12 minutes: 10 for the scenarios (599 s
-measured on 2026-09-30) and the 2-minute cleanup re-check. It transiently
+A full green run takes about 15 minutes: 13 for the scenarios (789 s
+measured on 2026-10-16, 599 s on 2026-09-30) and the 2-minute cleanup
+re-check. It transiently
 creates a handful of small VMs plus one or two XL (the quota scenario);
 everything is destroyed before the suite exits.
 

@@ -29,6 +29,13 @@ import (
 // the controller-runtime registry, or 0 when the family has no samples yet.
 func Value(t testing.TB, name string) float64 {
 	t.Helper()
+	return ValueWith(t, name, nil)
+}
+
+// ValueWith is Value restricted to the series whose labels include every
+// given name/value pair.
+func ValueWith(t testing.TB, name string, labels map[string]string) float64 {
+	t.Helper()
 	families, err := crmetrics.Registry.Gather()
 	if err != nil {
 		t.Fatalf("gathering metrics: %v", err)
@@ -39,6 +46,15 @@ func Value(t testing.TB, name string) float64 {
 			continue
 		}
 		for _, m := range family.GetMetric() {
+			matched := 0
+			for _, pair := range m.GetLabel() {
+				if want, ok := labels[pair.GetName()]; ok && want == pair.GetValue() {
+					matched++
+				}
+			}
+			if matched != len(labels) {
+				continue
+			}
 			switch {
 			case m.GetCounter() != nil:
 				total += m.GetCounter().GetValue()
