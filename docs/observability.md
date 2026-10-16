@@ -18,7 +18,7 @@ All provider series are prefixed `karpenter_clevercloud_`.
 | `nodegroup_vanished_total` | counter | A NodeGroup disappeared after creation while its NodeClaim was still unregistered — usually the quota engine reclaiming an accepted group. Each tick is a launch fast-failed instead of burning the 15-minute registration TTL. Two paths count it. The acceptance poll fails the launch at once, and its flavor is then [unavailable](#unavailable-flavors) for 1 minute and every other flavor at least as large for 2 minutes, as after a quota rejection; but the poll only runs until the operator's decision, about 1 s after the group's creation, and a group it sees terminating counts as vanished too. A group that vanishes after the operator acknowledged it is caught by the GC sweep instead, which deletes the NodeClaim 2 to 4 minutes after its creation (the sweep runs every 2 minutes and skips claims younger than 2 minutes) and makes no flavor unavailable. | Occasional ticks near the quota ceiling are the documented upstream race. Sustained growth means the platform keeps reclaiming accepted groups — check quota headroom and the node-group operator. |
 | `nodegroup_sync_overdue` | gauge | Launched NodeGroups the node-group operator has not synced (no `Ready=True`) 5 minutes after their creation while their NodeClaim is still unregistered. Healthy launches sync in under a minute (node Ready at 26–60 s, see [E2E-RESULTS](E2E-RESULTS.md)). | **Non-zero means launches are stuck upstream**: they will not register, and karpenter-core deletes each NodeClaim at its 15-minute registration timeout, then re-plans. The `NodeGroupSyncOverdue` event on the NodeClaim names the group and what the operator last wrote. In `kubectl get nodegroup <name> -o yaml`: no `status` means the operator never picked the group up; a `ReconcileInProgress` (`Creating`) that never ends means the operator is still building, or failing to build, the machine; a `ReconcileFailed` with reason `UpstreamError` means the operator keeps retrying failed Clever Cloud API calls (a `NodeGroupTransientFailure` event says so too). None of this can be fixed from the cluster: report the NodeGroup names (and their `status.upstreamId` when set) to Clever Cloud support. Nothing needs deleting by hand. |
 | `nodegroup_deletion_overdue` | gauge | Managed NodeGroups still present at least 5 minutes after their `deletionTimestamp`, from the last successful GC list. Checked every 2 minutes (normally detected 5–7 minutes after the DELETE), independently of NodeClaim existence or status and of stale `Ready=True`. | Read the `NodeGroupDeletionOverdue` Warning on the **NodeGroup**, then inspect its current finalizers and `status.upstreamId`. The event records observed age, last reported phase/true conditions and remaining finalizers; inspect the controllers responsible for them. If `clever-nodegroup-operator` remains, also check CKE state and contact Clever Cloud support if its wait persists. Finalizer presence does not establish the cause. Preserve finalizers until their cleanup responsibilities are understood. The count clears when Kubernetes no longer lists the group as managed; that **does not confirm VM destruction**. See [blocked cluster operations](#blocked-cluster-operations). |
-| `nodegroup_external_resizes` | gauge | Managed NodeGroups whose `nodeCount` is not 1 — something outside karpenter resizes them (the platform's alert-driven scaler via an inherited `autoscalingEnabled`, a human, anything with `nodegroups/scale` RBAC). | **Non-zero breaks the 1 NodeClaim = 1 NodeGroup invariant**: the extra nodes are never registered — they get no provider ID and keep the `karpenter.sh/unregistered` taint — so karpenter neither manages nor prices them. Find the resizer; ensure the cluster's `autoscalingEnabled` feature is off (the two autoscalers must never run together), then set `nodeCount` back to 1. **Also check karpenter-core's `karpenter_cluster_state_synced`**: a node carrying `karpenter.sh/nodepool` without a `spec.providerID` keeps it at 0 after every controller restart — provisioning and disruption stop cluster-wide and `cluster is waiting on sync for extended duration` is logged every 10 s. NodeGroups created by the current version never put that label on their nodes; for older groups, whose immutable `spec.labels` still carry it, the providerid controller removes it from the extra node it refuses to stamp (logged once per node). The controller never touches nodes of unmanaged groups, and that includes an older group recreated upstream without its `karpenter.clever-cloud.com/managed` label but with its old `spec.labels`: its single node carries the label with no provider ID and freezes the sync the same way. If `karpenter_cluster_state_synced` stays at 0 anyway, list the culprits with `kubectl get nodes -l karpenter.sh/nodepool -o custom-columns=NAME:.metadata.name,PROVIDERID:.spec.providerID` and remove the label from any node with an empty provider ID, or revert the resize. |
+| `nodegroup_external_resizes` | gauge | Managed NodeGroups whose `nodeCount` is not 1 — something outside karpenter resizes them (the platform's alert-driven scaler via an inherited `autoscalingEnabled`, a human, anything with `nodegroups/scale` RBAC). | **Non-zero breaks the 1 NodeClaim = 1 NodeGroup invariant**: the extra nodes are never registered — they get no provider ID and keep the `karpenter.sh/unregistered` taint — so karpenter neither manages nor prices them. Find the resizer; ensure the cluster's `autoscalingEnabled` feature is off (the two autoscalers must never run together), then set `nodeCount` back to 1. **Also check karpenter-core's `karpenter_cluster_state_synced`**: a node carrying `karpenter.sh/nodepool` without a `spec.providerID` keeps it at 0 after every controller restart — provisioning and disruption (node repair included) stop cluster-wide and `cluster is waiting on sync for extended duration` is logged every 10 s. NodeGroups created by the current version never put that label on their nodes; for older groups, whose immutable `spec.labels` still carry it, the providerid controller removes it from the extra node it refuses to stamp (logged once per node). The controller never touches nodes of unmanaged groups, and that includes an older group recreated upstream without its `karpenter.clever-cloud.com/managed` label but with its old `spec.labels`: its single node carries the label with no provider ID and freezes the sync the same way. If `karpenter_cluster_state_synced` stays at 0 anyway, list the culprits with `kubectl get nodes -l karpenter.sh/nodepool -o custom-columns=NAME:.metadata.name,PROVIDERID:.spec.providerID` and remove the label from any node with an empty provider ID, or revert the resize. |
 | `gc_reaped_nodegroups_total` | counter | The GC safety net deleted an orphaned NodeGroup (its NodeClaim was force-deleted outside the normal flow). | Occasional ticks are the safety net working. Frequent ticks mean something force-deletes NodeClaims — find it. |
 | `gc_refused_nodegroups` | gauge | NodeGroups the last GC sweep refused to reap: managed label present, but no verified dead NodeClaim owner. | **Non-zero needs attention** — each one is a VM billing hourly. A copied manifest: remove the `karpenter.clever-cloud.com/managed` label. A deliberately orphaned group: delete it manually. Details in the `GarbageCollectionRefused` event on the NodeGroup. |
 | `instancetype_host_ephemeral_storage_ready` | gauge | 1 after a valid disk observation from `NODE_NAME`; 0 before initialization or while the node is absent, terminating or reports invalid disk quantities. Exists only when `NODE_NAME` is set. | At 0, the scheduling catalogue guarantees no local disk capacity. Workloads with zero total `ephemeral-storage` requests can still provision; positive requests, including applicable DaemonSets, and NodePools with explicit ephemeral-storage limits wait. Inspect the named Node and controller errors; see [controller-node disk reference](#controller-node-disk-reference). |
@@ -54,7 +54,7 @@ karpenter_clevercloud_nodegroup_sync_overdue > 0
 karpenter_clevercloud_nodegroup_deletion_overdue > 0
 
 # karpenter-core's cluster state has not synced for 15 minutes: provisioning and
-# disruption are paused. Launches in flight hold it unsynced legitimately: each
+# disruption, node repair included, are paused. Launches in flight hold it unsynced legitimately: each
 # NodeClaim until its NodeGroup is created and acknowledged by the node-group
 # operator, and creations are serialized at about 1-2 s each, so a burst of N
 # NodeClaims keeps this rising for about N x 2 s with no fault. A down operator
@@ -255,9 +255,49 @@ cluster; the generic `UpstreamError` is not sufficient.
 For a planned CKE upgrade, operators can temporarily add a `nodes: "0"`
 budget without `reasons`, `schedule` or `duration` under
 `spec.disruption.budgets` on affected NodePools to defer voluntary
-consolidation and drift. Restore the previous budgets after
-the upgrade. This does not pause provisioning, expiration, node repair,
-manual deletion or disruptions already underway.
+consolidation and drift, and node repair when `settings.featureGates.nodeRepair`
+enables it: since karpenter-core 1.15 the same budgets pace repair (reason
+`Unhealthy`), so nodes the upgrade leaves NotReady for a while are not
+replaced meanwhile, except one that registered but never initialized. Restore
+the previous budgets after the upgrade. This does not pause provisioning,
+expiration, manual deletion or disruptions already underway.
+
+## Node repair
+
+With `settings.featureGates.nodeRepair` on, karpenter-core runs node repair
+as the first method of its disruption pass (see the README's
+[Node repair](../README.md#node-repair)). Repair plans where a broken node's
+pods would go before replacing it, and a planning error ends the whole pass:
+
+- **No NodePool Ready.** While no NodePool is Ready — its CleverNodeClass is
+  being deleted (the provider keeps a deleted class until its nodes are gone),
+  fails validation, or has not been reconciled yet — a node eligible for
+  repair makes every disruption pass fail. The controller logs `Reconciler
+  error` for `controller=disruption` with `disrupting, computing disruption
+  decision, creating scheduler, no nodepools found`, and
+  `controller_runtime_reconcile_errors_total{controller="disruption"}` grows.
+  Nothing is repaired, and empty or underutilized nodes are not removed
+  either, cluster-wide. Restore a Ready NodePool (fix the class, or finish
+  removing the NodePool and its nodes), or take the broken node out of repair:
+  annotate it `karpenter.sh/do-not-repair: "true"`, or delete its NodeClaim.
+  `LEGACY_NODE_REPAIR=true` (through `controller.env`) avoids it altogether,
+  but its controller deletes first and ignores budgets (the planned-upgrade
+  zero budget included), `karpenter.sh/do-not-repair` and the cluster state
+  sync.
+- **CKE heals first.** The platform replaces a worker whose kubelet stopped
+  on its own: it starts a new VM in the node's NodeGroup within seconds,
+  drains the old node and deletes it a few minutes later (measured in
+  [E2E-RESULTS](E2E-RESULTS.md)). Meanwhile the providerid controller logs
+  `refusing to stamp a provider id` for the new VM, which stays unregistered
+  (its sibling holds the provider ID) and is not counted by
+  `nodegroup_external_resizes` (`nodeCount` stays 1). Nothing needs doing:
+  the old node's deletion ends its NodeClaim, and the NodeGroup's deletion
+  takes both VMs.
+- **No capacity for the replacement.** At an exhausted organisation quota a
+  broken node whose pods need a new node gets a `DisruptionBlocked` event and
+  waits, ticking `nodegroup_quota_rejections_total` about once a minute; its
+  VM keeps counting against the quota until it is deleted. Delete its
+  NodeClaim to free the quota first.
 
 ## Flavor removal semantics
 
@@ -388,7 +428,7 @@ NodePool `NodeRegistrationHealthy` status condition.
 
 | Event reason | On | Type | Meaning |
 |---|---|---|---|
-| `NodeGroupQuotaExceeded` | NodeClaim | Warning | The org quota freshly rejected this claim's NodeGroup; names the flavor, carries the quota detail when the operator gives one (live, it gives none), and says which flavors are unavailable and for how long. Backoff fast-fails emit no provider event — karpenter-core already publishes an `InsufficientCapacityError` event per attempt. When the rejection came after the acceptance poll, the message says so: the nodegroupstatus controller deleted the launched NodeClaim so karpenter re-plans. |
+| `NodeGroupQuotaExceeded` | NodeClaim | Warning | The org quota freshly rejected this claim's NodeGroup; names the flavor, carries the quota detail when the operator gives one (live, it gives none), and says which flavors are unavailable and for how long. Backoff fast-fails emit no provider event — karpenter-core already publishes an `InsufficientCapacityError` event per attempt on the NodeClaim and, since 1.15, on its pending pods (at most once every 2 minutes per pod). When the rejection came after the acceptance poll, the message says so: the nodegroupstatus controller deleted the launched NodeClaim so karpenter re-plans. |
 | `NodeGroupRejected` | NodeClaim | Warning | The node-group operator refused the NodeGroup for a non-quota reason; carries the operator's reason and message, and names the flavor held out of provisioning. When the refusal came after the acceptance poll, the message says so: the nodegroupstatus controller deleted the launched NodeClaim so karpenter re-plans. When the API server refused the create at admission because the NodeGroup CRD's enum does not carry the flavor, the message says so too, carries the API server's message, and points at the `settings.flavors` override that added the flavor; no NodeGroup was created. |
 | `NodeGroupTransientFailure` | NodeClaim | Normal / Warning | The node-group operator reported a failure it retries on its own (`ReconcileFailed` with reason `UpstreamError`: a Clever Cloud API call failed) at some point during the acceptance poll; carries its reason and message, and what then ended the poll. It says the poll saw the failure, not that it is still current or was resolved: the operator can keep it set next to `Ready`. Not a refusal: nothing is deleted or held out for it. **Normal** when the group was `Ready` by the end of the poll: its machine is up. That includes a group the poll found `Ready` with the failure already set next to it (a claim adopting its group after a restart, for instance). **Warning** otherwise: the operator acknowledged the group (`ReconcileInProgress`) while retrying, so the launch proceeded with the machine still being built and the nodegroupstatus controller follows it; or the poll window closed before any acknowledgement, so the launch proceeded optimistically with the registration TTL as the backstop (a `NodeGroupAcceptanceTimeout` event accompanies it); or the launch then failed — the group vanished, or was refused afterwards, whose own event accompanies it and can be tied back to the incident through this one. Controller shutdowns mid-poll are excluded: the claim's next attempt polls the group again. Also published, as a Warning, by the nodegroupstatus controller when a launched group reports such a failure after the poll; it shares the poll's dedupe key, so it does not repeat within minutes what the poll has just said. |
 | `NodeGroupAcceptanceTimeout` | NodeClaim | Warning | The operator neither acknowledged nor refused the NodeGroup within the 15 s poll window (no status at all, or only a transient failure); the launch proceeded optimistically. A healthy launch never publishes it: the operator acknowledges a group about 1 s after its creation. Controller shutdowns mid-poll are excluded. |
@@ -399,6 +439,18 @@ NodePool `NodeRegistrationHealthy` status condition.
 | `GarbageCollected` | NodeGroup | Normal | The GC safety net deleted this orphaned group. |
 | `GarbageCollectionRefused` | NodeGroup | Warning | The GC found this group orphan-like but refused to reap it (no verified dead owner); republished hourly while the condition persists so it survives etcd's event TTL. |
 | `LabelsIgnored` | CleverNodeClass | Warning | `spec.labels` carries keys that v0.12.0 admitted and the current rule rejects: a subdomained `kubernetes.io/` key such as `app.kubernetes.io/part-of`, or a `karpenter.sh` key. No node launched now gets them (a subdomained `kubernetes.io/` key never reached any node; a `karpenter.sh` key reached the nodes v0.12.0 built, which keep it). The NodeClass stays Ready and keeps provisioning, and its `LabelsIgnored` status condition, which does not gate readiness, names them for as long as they remain. The event is published whenever the controller reconciles the NodeClass (at start, on every change, and every minute while the condition's reason is `HashMigrationPending`), at most once an hour per key set and reason. Its message and the condition's say whether removing the keys drifts nodes. The controller re-stamps the NodeGroups v0.12.0 built (which hashed the keys) with hash version v3 (which leaves them out) before it reports the keys; reason `LegacyLabelKeys` means no NodeGroup of the NodeClass still carries an older stamp. `HashMigrationPending` counts the NodeGroups that still do: their NodeClaim is already drifted (it keeps its stamp until it is replaced), the NodeClass changed since they were built (they drift anyway), or a read or write failed (retried; the error is in the controller's logs). It gives no count when the NodeGroups could not be listed. **Action**: remove the keys once the reason is `LegacyLabelKeys`: no node drifts for it. Removing them while it is `HashMigrationPending`, or before the upgraded controller has reconciled the NodeClass (before the upgrade, in the same change as the upgrade, or while v0.12.0 still runs), drifts the NodeGroups still carrying an older stamp, and Karpenter replaces their nodes. Until the keys are removed, the CRD refuses any edit of `spec.labels` that keeps them. |
+
+karpenter-core also tells the pods (since 1.15): the pending pods nominated
+for a NodeClaim whose launch failed with an `InsufficientCapacityError` — a
+quota rejection or a flavor refusal within the acceptance poll, a vanished
+group, no flavor available — get an `InsufficientCapacityError` Warning
+carrying the provider's error, at most once every 2 minutes per pod and
+rate-limited cluster-wide (5 a second, bursts of 10), so `kubectl describe
+pod` explains why it is Pending (for example `NodeClaim … nominated for this pod failed to launch:
+insufficient capacity, clever cloud quota exceeded for flavor XL`). A refusal
+published after the acceptance poll, or a group vanishing after its
+acknowledgement, fails the claim outside its launch and reaches the pods only
+through the next plan's attempt.
 
 Refusal logs are deduplicated to one line per NodeGroup per controller
 lifetime — the gauge, not the log volume, is the persistent signal. The

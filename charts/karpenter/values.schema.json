@@ -43,7 +43,7 @@
           "properties": {
             "nodeRepair": {
               "type": "boolean",
-              "description": "Enable Karpenter's NodeRepair feature gate."
+              "description": "Enable Karpenter's NodeRepair feature gate: replace a node NotReady for 10 minutes, paced by disruption budgets (reason Unhealthy)."
             }
           }
         },
