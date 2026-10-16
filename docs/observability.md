@@ -358,8 +358,9 @@ built on these figures must be rescaled, not reused.
 
 The provider is wrapped in karpenter-core's metrics decorator, so the standard
 `karpenter_cloudprovider_duration_seconds` and
-`karpenter_cloudprovider_errors_total` series (labeled by `method` and typed
-`error`, e.g. `InsufficientCapacityError`) cover Create/Delete/Get/List
+`karpenter_cloudprovider_errors_total` series (labeled by `method`, by typed
+`error`, e.g. `InsufficientCapacityError`, and by the NodeClaim's `nodepool`
+on Create and Delete errors, empty for Get and List) cover Create/Delete/Get/List
 latency and failure rates. `Create` duration includes the acceptance poll by
 design: about 1–2 s, since the poll ends on the node-group operator's first
 status write (its decision), not when the VM is up. It stretches to the full
@@ -371,8 +372,9 @@ through that queue, not before: a launch whose flavor a launch ahead just had
 refused or quota-rejected falls to the next flavor, or fails as an
 `InsufficientCapacityError`, and a launch from a NodeClass deleted meanwhile
 fails as a `NodeClassNotReadyError`. A launch whose NodeClaim was deleted while
-it waited creates nothing and fails with an untyped error (the `error=""`
-series, plus a reconciler error log from karpenter-core), after which core
+it waited creates nothing and fails with an untyped error (the
+`error="unknown"` series, `error=""` before karpenter-core 1.15, plus a
+reconciler error log from karpenter-core), after which core
 finalizes the claim: a few of them are expected when a NodePool is deleted or
 scaled down during a burst of launches, and nothing needs doing.
 

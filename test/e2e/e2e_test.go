@@ -551,6 +551,31 @@ func testQuotaFastFail(t *testing.T, ctx context.Context, f *framework) {
 	})
 	t.Logf("quota scenario: %d/%d pods Pending after rejection", pending, total)
 
+	// karpenter-core (since 1.15) also tells the pods: every pod nominated for
+	// a NodeClaim whose launch failed with an InsufficientCapacityError gets a
+	// Warning carrying the provider's error, so `kubectl describe pod` explains
+	// the Pending state without the controller's logs. Both shapes a quota
+	// rejection reaches a launch in name the quota: the rejection itself, and
+	// the "no available flavor" of a claim planned while its flavor is backed
+	// off.
+	var eventMessage string
+	f.eventually(ctx, 2*time.Minute, "a quota pod told why it is Pending", func(ctx context.Context) (bool, string) {
+		events := &corev1.EventList{}
+		if err := f.client.List(ctx, events, client.InNamespace(f.namespace),
+			client.MatchingFields{"involvedObject.kind": "Pod", "reason": "InsufficientCapacityError"}); err != nil {
+			return false, fmt.Sprintf("listing pod events: %v", err)
+		}
+		for _, e := range events.Items {
+			if strings.HasPrefix(e.InvolvedObject.Name, "quota-inflate-") &&
+				strings.Contains(e.Message, "failed to launch: insufficient capacity") && strings.Contains(e.Message, "quota") {
+				eventMessage = e.Message
+				return true, ""
+			}
+		}
+		return false, fmt.Sprintf("%d InsufficientCapacityError pod event(s), none naming the quota", len(events.Items))
+	})
+	t.Logf("quota scenario: pod event %q", eventMessage)
+
 	// The whole point of the fast-fail path: once the pressure is gone, no
 	// NodeGroup may survive the rejection churn.
 	if err := f.client.Delete(ctx, f.deployment("quota-inflate", 0, "1", "1Gi", true)); err != nil {
