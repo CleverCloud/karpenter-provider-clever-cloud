@@ -1,6 +1,6 @@
 module github.com/CleverCloud/karpenter-provider-clever-cloud
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/awslabs/operatorpkg v0.0.0-20261002163259-5e8ed3699dea
@@ -14,7 +14,7 @@ require (
 	k8s.io/client-go v0.37.1
 	k8s.io/utils v0.0.0-20260626114624-be93311217bd
 	sigs.k8s.io/controller-runtime v0.25.2
-	sigs.k8s.io/karpenter v1.15.0
+	sigs.k8s.io/karpenter v1.15.1
 	sigs.k8s.io/yaml v1.6.0
 )
 
