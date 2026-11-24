@@ -96,6 +96,7 @@ func main() {
 			op.GetClient(),
 			op.Manager.GetAPIReader(),
 			op.EventRecorder,
+			op.Clock,
 			nodeGroupProvider,
 			instanceTypeProvider,
 			env.WithDefaultString("NODE_NAME", ""),

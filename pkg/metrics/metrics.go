@@ -170,6 +170,26 @@ var (
 		nil, opmetrics.Alpha,
 	)
 
+	// NodeReplacements counts NodeClaims whose registration the
+	// nodereplacement controller reopened because the node karpenter-core had
+	// registered for them was replaced by the platform (a Kubernetes upgrade
+	// of the cluster, the repair of a NotReady worker) or is gone. A tick is a
+	// NodeGroup kept across a replacement that used to delete it, unless the
+	// node went with nothing to take its place (Warning NodeReplaced): that
+	// NodeClaim is deleted by core's registration timeout. A Kubernetes
+	// upgrade ticks once per karpenter node; growth outside one is the
+	// platform replacing workers on its own.
+	NodeReplacements = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "nodeclaim",
+			Name:      "node_replacements_total",
+			Help:      "NodeClaims whose registration was reopened because the platform replaced their node in place (cluster upgrade, node repair) or the node is gone with no replacement.",
+		},
+		nil, opmetrics.Alpha,
+	)
+
 	// GCReapedNodeGroups counts orphaned NodeGroups deleted by the
 	// garbage-collection safety net (not deletions through the normal
 	// NodeClaim termination flow).

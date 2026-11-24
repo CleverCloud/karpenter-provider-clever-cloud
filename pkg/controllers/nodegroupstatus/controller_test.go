@@ -41,6 +41,7 @@ import (
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/v1alpha1"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodegroupstatus"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodereplacement"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics/metricstest"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
@@ -726,5 +727,40 @@ func TestReconcileRetriesAFailedClaimDelete(t *testing.T) {
 	}
 	if metricstest.Value(t, quotaRejections) != quotaBefore || env.recorder.count() != 0 {
 		t.Error("expected nothing recorded before the launch is actually failed")
+	}
+}
+
+// TestReconcileLeavesAReopenedRegistrationAlone: the nodereplacement
+// controller sets a NodeClaim back to unregistered when the platform replaced
+// its node. That claim is Launched and not Registered, like a launch, but its
+// group synced long ago: followed as one, it would be overdue at once (the
+// sync is dated from the group's creation), and deleted on whatever refusal
+// the operator reports while the platform replaces the node.
+func TestReconcileLeavesAReopenedRegistrationAlone(t *testing.T) {
+	reopened := func(name string) *karpv1.NodeClaim {
+		nodeClaim := launchedClaim(name)
+		// Core's registration has run once since: it overwrites the reason on
+		// Registered and leaves Initialized until the claim registers.
+		nodeClaim.StatusConditions().SetUnknownWithReason(karpv1.ConditionTypeRegistered, "NodeNotFound", "Node not registered with cluster")
+		nodeClaim.StatusConditions().SetUnknownWithReason(karpv1.ConditionTypeInitialized, nodereplacement.ReasonNodeReplaced, "node claim-node0 is no longer the registered node")
+		return nodeClaim
+	}
+	env := newTestEnv(t,
+		reopened("claim-refused"), launchedGroup("claim-refused", 24*time.Hour, quotaStatus()),
+		reopened("claim-unsynced"), launchedGroup("claim-unsynced", 24*time.Hour, creatingStatus()),
+	)
+	for _, name := range []string{"claim-refused", "claim-unsynced"} {
+		if result := env.reconcile(t, name); result != (reconcile.Result{}) {
+			t.Errorf("%s: result = %+v, want nothing scheduled for a claim that is not a launch", name, result)
+		}
+		if !env.nodeClaimExists(t, name) {
+			t.Errorf("%s: the nodeclaim of a node the platform replaced was deleted as a failed launch", name)
+		}
+	}
+	if n := env.recorder.count(); n != 0 {
+		t.Errorf("published %d events for nodeclaims that are not launches", n)
+	}
+	if got := metricstest.Value(t, syncOverdue); got != 0 {
+		t.Errorf("nodegroup_sync_overdue = %v, want 0", got)
 	}
 }

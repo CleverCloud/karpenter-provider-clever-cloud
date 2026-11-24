@@ -20,6 +20,7 @@ package controllers
 
 import (
 	"github.com/awslabs/operatorpkg/controller"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/karpenter/pkg/events"
 
@@ -28,17 +29,20 @@ import (
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/instancetypecapacity"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodeclass"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodegroupstatus"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodereplacement"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/providerid"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
 
 // NewControllers wires the Clever Cloud controllers. uncached reads straight
-// from the API server (the GC and the nodegroup status watch confirm
-// destructive decisions with it).
-func NewControllers(kubeClient client.Client, uncached client.Reader, recorder events.Recorder, nodeGroupProvider *nodegroup.Provider, instanceTypeProvider *instancetype.Provider, nodeName string) []controller.Controller {
+// from the API server (the GC, the nodegroup status watch and the node
+// replacement confirm their writes with it). clk times how long the node
+// replacement leaves a node released.
+func NewControllers(kubeClient client.Client, uncached client.Reader, recorder events.Recorder, clk clock.Clock, nodeGroupProvider *nodegroup.Provider, instanceTypeProvider *instancetype.Provider, nodeName string) []controller.Controller {
 	controllers := []controller.Controller{
 		providerid.NewController(kubeClient, uncached),
+		nodereplacement.NewController(kubeClient, uncached, recorder, clk),
 		garbagecollection.NewController(kubeClient, uncached, nodeGroupProvider, recorder),
 		nodegroupstatus.NewController(kubeClient, uncached, nodeGroupProvider, recorder),
 		nodeclass.NewController(kubeClient, recorder),

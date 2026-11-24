@@ -77,6 +77,7 @@ import (
 
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis"
 	ngv1 "github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/apis/nodegroup/v1"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodereplacement"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/metrics"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
 )
@@ -280,6 +281,14 @@ func (c *Controller) firstLog(key string) bool {
 // the claim it is named after. The claim must be this provider's, not
 // terminating, Launched and not Registered, and its provider ID must name the
 // group.
+//
+// A NodeClaim whose registration the nodereplacement controller reopened is
+// Launched and not Registered too, but it is no launch: its group synced long
+// ago and its node was replaced by the platform. Following it would date the
+// sync from the group's creation (overdue at once) and fail a "launch" on
+// whatever the operator reports during the replacement. Core leaves the
+// reason nodereplacement wrote on Initialized until the claim is Registered
+// again, which is what tells the two apart.
 func launchedNodeClaim(ctx context.Context, reader client.Reader, ng *ngv1.NodeGroup) (*karpv1.NodeClaim, error) {
 	if !nodegroup.IsManaged(ng) || !ng.DeletionTimestamp.IsZero() || !slices.Contains(nodegroup.NodeClaimOwners(ng), ng.Name) {
 		return nil, nil
@@ -292,6 +301,9 @@ func launchedNodeClaim(ctx context.Context, reader client.Reader, ng *ngv1.NodeG
 		!nodeClaim.StatusConditions().Get(karpv1.ConditionTypeLaunched).IsTrue() ||
 		nodeClaim.StatusConditions().Get(karpv1.ConditionTypeRegistered).IsTrue() ||
 		nodeClaim.Status.ProviderID != nodegroup.ProviderID(ng.Name) {
+		return nil, nil
+	}
+	if cond := nodeClaim.StatusConditions().Get(karpv1.ConditionTypeInitialized); cond != nil && cond.Reason == nodereplacement.ReasonNodeReplaced {
 		return nil, nil
 	}
 	return nodeClaim, nil

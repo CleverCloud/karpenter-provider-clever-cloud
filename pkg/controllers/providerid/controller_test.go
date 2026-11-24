@@ -409,3 +409,78 @@ func TestReconcileStampsAStrippedNodeOnceItsSiblingIsGone(t *testing.T) {
 		t.Errorf("expected the stripped survivor to be stamped once the id is free, got %q", got)
 	}
 }
+
+// TestDeletionOfTheHolderWakesTheNodeItBlocked covers the platform replacing
+// the node of a group: node1 joined while node0 held the provider ID, so it
+// was refused, and nothing reconciles it again when node0 is deleted unless
+// that deletion does. Live, node1 waited 3 min 35 s for its next update,
+// unregistered taint on, while the pods evicted from node0 stayed Pending.
+func TestDeletionOfTheHolderWakesTheNodeItBlocked(t *testing.T) {
+	groupLabels := map[string]string{v1alpha1.NodeGroupNodeLabelKey: "pool-abc"}
+	node0 := node("pool-abc-node0", groupLabels, "clevercloud://pool-abc")
+	node1 := node("pool-abc-node1", groupLabels, "")
+	other := node("pool-xyz-node0", map[string]string{v1alpha1.NodeGroupNodeLabelKey: "pool-xyz"}, "")
+	kubeClient := newClient(managedNodeGroup("pool-abc"), managedNodeGroup("pool-xyz"), node0, node1, other)
+	ctx := context.Background()
+
+	if err := reconcileNode(t, kubeClient, "pool-abc-node1"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := getProviderID(t, kubeClient, "pool-abc-node1"); got != "" {
+		t.Fatalf("node1 was stamped %q while node0 holds the provider id", got)
+	}
+
+	if !providerid.FreesProviderID(node0) {
+		t.Fatal("the deletion of the node holding the provider id is filtered out: its replacement is never stamped")
+	}
+	if err := kubeClient.Delete(ctx, node0); err != nil {
+		t.Fatal(err)
+	}
+	requests := providerid.NewController(kubeClient, kubeClient).UnstampedSiblings(ctx, node0)
+	if len(requests) != 1 || requests[0].Name != "pool-abc-node1" {
+		t.Fatalf("the deletion of node0 enqueues %v, want exactly its unstamped sibling pool-abc-node1", requests)
+	}
+	if err := reconcileNode(t, kubeClient, requests[0].Name); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := getProviderID(t, kubeClient, "pool-abc-node1"); got != "clevercloud://pool-abc" {
+		t.Errorf("node1 carries provider id %q after node0 is gone, want clevercloud://pool-abc", got)
+	}
+}
+
+// TestDeletionWakesTheGroupTheProviderIDNamed: the deleted node's provider ID
+// says which group's ID it frees. Its clever-cloud.com/nodegroup label does
+// not: a kubelet can rewrite it, and the replacement of a node that did
+// would wait for its next update with the unregistered taint on.
+func TestDeletionWakesTheGroupTheProviderIDNamed(t *testing.T) {
+	relabelled := node("pool-abc-node0", map[string]string{v1alpha1.NodeGroupNodeLabelKey: "pool-xyz"}, "clevercloud://pool-abc")
+	unlabelled := node("pool-abc-node0", nil, "clevercloud://pool-abc")
+	node1 := node("pool-abc-node1", map[string]string{v1alpha1.NodeGroupNodeLabelKey: "pool-abc"}, "")
+	other := node("pool-xyz-node0", map[string]string{v1alpha1.NodeGroupNodeLabelKey: "pool-xyz"}, "")
+	kubeClient := newClient(managedNodeGroup("pool-abc"), managedNodeGroup("pool-xyz"), node1, other)
+	for name, deleted := range map[string]*corev1.Node{"relabelled": relabelled, "unlabelled": unlabelled} {
+		if !providerid.FreesProviderID(deleted) {
+			t.Errorf("%s: the deletion of a node carrying a group's provider id is filtered out", name)
+		}
+		requests := providerid.NewController(kubeClient, kubeClient).UnstampedSiblings(context.Background(), deleted)
+		if len(requests) != 1 || requests[0].Name != "pool-abc-node1" {
+			t.Errorf("%s: the deletion enqueues %v, want the unstamped node of the group its provider id named", name, requests)
+		}
+	}
+}
+
+// TestDeletionsThatFreeNoProviderIDAreFilteredOut keeps the deletion watch to
+// what it is for: a node without a provider ID, or carrying another
+// provider's, frees nothing another node could take.
+func TestDeletionsThatFreeNoProviderIDAreFilteredOut(t *testing.T) {
+	groupLabels := map[string]string{v1alpha1.NodeGroupNodeLabelKey: "pool-abc"}
+	for name, deleted := range map[string]*corev1.Node{
+		"unstamped node of a group":           node("pool-abc-node1", groupLabels, ""),
+		"node outside any group":              node("control-plane-0", nil, "other://control-plane-0"),
+		"node of a group on another provider": node("pool-abc-node2", groupLabels, "other://pool-abc"),
+	} {
+		if providerid.FreesProviderID(deleted) {
+			t.Errorf("%s: its deletion is treated as freeing a provider id", name)
+		}
+	}
+}

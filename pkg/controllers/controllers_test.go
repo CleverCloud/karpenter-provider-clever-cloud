@@ -40,14 +40,15 @@ func (noopRecorder) Publish(...events.Event) {}
 // from this list still compiles and passes its own package's tests while its
 // duty silently stops: the GC's safety net against orphaned VMs, the
 // providerID stamp core matches nodes by, the NodeGroup status watch, the
-// NodeClass finalizer, the observed-capacity feedback.
+// NodeClass finalizer, the observed-capacity feedback, the adoption of a node
+// the platform replaced.
 func TestNewControllersWiresEveryProviderController(t *testing.T) {
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).Build()
 	instanceTypeProvider := instancetype.NewProvider("par", nil, nil)
 	nodeGroupProvider := nodegroup.NewProvider(kubeClient, noopRecorder{}, instanceTypeProvider, clock.RealClock{})
 
 	got := map[string]int{}
-	for _, c := range controllers.NewControllers(kubeClient, kubeClient, noopRecorder{}, nodeGroupProvider, instanceTypeProvider, "controller-host") {
+	for _, c := range controllers.NewControllers(kubeClient, kubeClient, noopRecorder{}, clock.RealClock{}, nodeGroupProvider, instanceTypeProvider, "controller-host") {
 		got[fmt.Sprintf("%T", c)]++
 	}
 	want := map[string]int{
@@ -56,6 +57,7 @@ func TestNewControllersWiresEveryProviderController(t *testing.T) {
 		"*instancetypecapacity.Controller": 1,
 		"*nodeclass.Controller":            1,
 		"*nodegroupstatus.Controller":      1,
+		"*nodereplacement.Controller":      1,
 		"*providerid.Controller":           1,
 	}
 	if !maps.Equal(got, want) {
@@ -70,7 +72,7 @@ func TestNewControllersWithoutReferenceKeepsStaticDisk(t *testing.T) {
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).Build()
 	provider := instancetype.NewProvider("par", nil, nil)
 	groups := nodegroup.NewProvider(kubeClient, noopRecorder{}, provider, clock.RealClock{})
-	registered := controllers.NewControllers(kubeClient, kubeClient, noopRecorder{}, groups, provider, "")
+	registered := controllers.NewControllers(kubeClient, kubeClient, noopRecorder{}, clock.RealClock{}, groups, provider, "")
 	for _, c := range registered {
 		if fmt.Sprintf("%T", c) == "*ephemeralstorage.Controller" {
 			t.Fatal("static mode registered a reference controller")
