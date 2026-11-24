@@ -28,9 +28,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	controllerruntime "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -52,10 +54,12 @@ type Controller struct {
 	// nodes read through that lag would both be told the ID is free.
 	uncached client.Reader
 	// warnedResized dedups the refusal log per node: the reconcile fires on
-	// every update of a node that still has no provider ID, and an extra node
-	// of a resized NodeGroup stays in that state for its whole life. Entries
-	// are dropped as soon as a node is stamped; what remains is bounded by the
-	// number of external resizes, which are anomalies, not routine.
+	// every update of a node that still has no provider ID. That is the
+	// replacement node of every platform replacement, until the node it
+	// replaces is gone (about 30 s), and the extra node of a resized
+	// NodeGroup for its whole life. Entries are dropped as soon as a node is
+	// stamped; what remains is bounded by the number of external resizes,
+	// which are anomalies, not routine.
 	warnedResized sync.Map
 	// warnedStripped dedups the log of stripNodePoolLabel the same way, in
 	// case the platform re-applies the group's labels to the node.
@@ -124,9 +128,16 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			continue
 		}
 		if _, warned := c.warnedResized.LoadOrStore(node.Name, struct{}{}); !warned {
+			// A second node in a group still sized for one is the platform
+			// replacing the first (cluster upgrade, node repair): this node
+			// takes the ID over when the other is gone, see the deletion watch
+			// in Register and the nodereplacement controller.
+			cause := "something outside karpenter resized the group; this node stays unregistered and is reported by the garbage collector"
+			if ng.Spec.NodeCount == 1 {
+				cause = "the platform is replacing the node of this group; this node takes the id over once the other node is gone"
+			}
 			log.FromContext(ctx).WithValues("Node", node.Name, "NodeGroup", nodeGroupName, "owner", siblings.Items[i].Name).Info(
-				"refusing to stamp a provider id: another node of this nodegroup already carries it, so the id would not be unique " +
-					"(something outside karpenter resized the group; this node stays unregistered and is reported by the garbage collector)")
+				"refusing to stamp a provider id: another node of this nodegroup already carries it, so the id would not be unique (" + cause + ")")
 		}
 		return reconcile.Result{}, c.stripNodePoolLabel(ctx, node, nodeGroupName)
 	}
@@ -155,10 +166,10 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 // Only ever called for the refused node of a managed group: the node holding
 // the provider ID got the label from core's registration sync and keeps it,
 // and nodes of unmanaged groups are not ours to touch. If the refused node
-// later takes the ID over (its sibling gone) while the NodeClaim is still
-// unregistered, the registration sync puts the label back; once the claim has
-// registered, its node's deletion goes through core's termination finalizer,
-// which deletes the claim and the whole group with it.
+// later takes the ID over (its sibling gone), the registration sync puts the
+// label back: at once while the NodeClaim is still unregistered, and after the
+// nodereplacement controller reopened the registration when the sibling was
+// the NodeClaim's registered node, replaced by the platform.
 func (c *Controller) stripNodePoolLabel(ctx context.Context, node *corev1.Node, nodeGroupName string) error {
 	if _, ok := node.Labels[karpv1.NodePoolLabelKey]; !ok {
 		return nil
@@ -181,19 +192,73 @@ func (c *Controller) stripNodePoolLabel(ctx context.Context, node *corev1.Node, 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
-		For(&corev1.Node{}).
+		For(&corev1.Node{}, builder.WithPredicates(predicate.Funcs{
+			CreateFunc:  func(e event.CreateEvent) bool { return needsProviderID(e.Object) },
+			UpdateFunc:  func(e event.UpdateEvent) bool { return needsProviderID(e.ObjectNew) },
+			DeleteFunc:  func(event.DeleteEvent) bool { return false },
+			GenericFunc: func(e event.GenericEvent) bool { return needsProviderID(e.Object) },
+		})).
+		// The deletion of the node carrying a group's provider ID frees that
+		// ID for the node this controller refused: the replacement the
+		// platform added next to it (cluster upgrade, node repair). Nothing
+		// else wakes that node up, and waiting for its next update left it
+		// unstamped for 3 min 35 s on a live upgrade, with the unregistered
+		// taint keeping every evicted pod off it.
+		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(c.unstampedSiblings), builder.WithPredicates(predicate.Funcs{
+			CreateFunc:  func(event.CreateEvent) bool { return false },
+			UpdateFunc:  func(event.UpdateEvent) bool { return false },
+			DeleteFunc:  func(e event.DeleteEvent) bool { return freesProviderID(e.Object) },
+			GenericFunc: func(event.GenericEvent) bool { return false },
+		})).
 		// Serialised on purpose. The uniqueness check reads the API server and
 		// then patches; concurrent reconciles could interleave those two steps
 		// and stamp the same provider id on two nodes. One at a time makes the
 		// read-then-write safe, and this controller only ever fires on nodes
 		// that still lack a provider id, so throughput is not a concern.
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		WithEventFilter(predicate.Funcs{
-			CreateFunc: func(e event.CreateEvent) bool { return needsProviderID(e.Object) },
-			UpdateFunc: func(e event.UpdateEvent) bool { return needsProviderID(e.ObjectNew) },
-			DeleteFunc: func(event.DeleteEvent) bool { return false },
-		}).
 		Complete(c)
+}
+
+// unstampedSiblings maps a deleted node to the nodes that still lack a
+// provider ID in the NodeGroup its provider ID named. Read from the cache:
+// the nodes it names are only reconciled, and Reconcile confirms everything
+// uncached.
+func (c *Controller) unstampedSiblings(ctx context.Context, obj client.Object) []reconcile.Request {
+	nodeGroupName, ok := freedNodeGroup(obj)
+	if !ok {
+		return nil
+	}
+	siblings := &corev1.NodeList{}
+	if err := c.kubeClient.List(ctx, siblings, client.MatchingLabels{v1alpha1.NodeGroupNodeLabelKey: nodeGroupName}); err != nil {
+		log.FromContext(ctx).WithValues("NodeGroup", nodeGroupName).Error(err, "listing the nodes left in the nodegroup of a deleted node")
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range siblings.Items {
+		if siblings.Items[i].Name != obj.GetName() && siblings.Items[i].Spec.ProviderID == "" {
+			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Name: siblings.Items[i].Name}})
+		}
+	}
+	return requests
+}
+
+// freesProviderID reports whether a deleted node carried the provider ID of a
+// NodeGroup, which another node of that group can now take.
+func freesProviderID(obj client.Object) bool {
+	_, ok := freedNodeGroup(obj)
+	return ok
+}
+
+// freedNodeGroup returns the NodeGroup whose provider ID a deleted node
+// carried. Read from the provider ID, which is immutable once set, not from
+// the clever-cloud.com/nodegroup label, which the node's kubelet can rewrite.
+func freedNodeGroup(obj client.Object) (string, bool) {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return "", false
+	}
+	name, err := nodegroup.ParseProviderID(node.Spec.ProviderID)
+	return name, err == nil
 }
 
 func needsProviderID(obj client.Object) bool {

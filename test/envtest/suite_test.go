@@ -61,6 +61,7 @@ import (
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/ephemeralstorage"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodeclass"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodegroupstatus"
+	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/nodereplacement"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/controllers/providerid"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/instancetype"
 	"github.com/CleverCloud/karpenter-provider-clever-cloud/pkg/providers/nodegroup"
@@ -158,6 +159,10 @@ func TestMain(m *testing.M) {
 	nodeGroupProvider := nodegroup.NewProvider(mgr.GetClient(), discardRecorder{}, instancetype.NewProvider("par", nil, nil), clock.RealClock{})
 	if err := nodegroupstatus.NewController(mgr.GetClient(), mgr.GetAPIReader(), nodeGroupProvider, discardRecorder{}).Register(ctx, mgr); err != nil {
 		fmt.Printf("registering nodegroup status controller: %v\n", err)
+		os.Exit(1)
+	}
+	if err := nodereplacement.NewController(mgr.GetClient(), mgr.GetAPIReader(), discardRecorder{}, clock.RealClock{}).Register(ctx, mgr); err != nil {
+		fmt.Printf("registering node replacement controller: %v\n", err)
 		os.Exit(1)
 	}
 	hostStorageProvider = instancetype.NewProvider("par", nil, nil)

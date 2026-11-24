@@ -56,6 +56,12 @@ const (
 	// and replaces the whole fleet.
 	NodeClassHashVersionAnnotationKey = apis.Group + "/clevernodeclass-hash-version"
 
+	// NodeReplacementAnnotationKey marks a registered Node the nodereplacement
+	// controller released from karpenter-core's termination finalizer while
+	// the platform replaces it. Its value records whether the
+	// karpenter.sh/do-not-disrupt annotation next to it is the controller's.
+	NodeReplacementAnnotationKey = apis.Group + "/node-replacement"
+
 	// TerminationFinalizer protects CleverNodeClasses that still back NodeClaims.
 	TerminationFinalizer = apis.Group + "/termination"
 )
