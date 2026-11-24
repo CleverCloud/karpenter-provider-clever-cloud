@@ -116,6 +116,13 @@ func launchNodeClaim(t *testing.T, cp *cloudprovider.CloudProvider, kubeClient c
 // no provider ID.
 func joinNode(t *testing.T, kubeClient client.Client, ng *ngv1.NodeGroup, index string) *corev1.Node {
 	t.Helper()
+	return joinNodeAt(t, kubeClient, ng, index, time.Now())
+}
+
+// joinNodeAt is joinNode for a node that joined at a given time: the fake API
+// server dates nothing itself.
+func joinNodeAt(t *testing.T, kubeClient client.Client, ng *ngv1.NodeGroup, index string, joined time.Time) *corev1.Node {
+	t.Helper()
 	name := ng.Name + "-node" + index
 	labels := map[string]string{
 		v1alpha1.NodeGroupNodeLabelKey: ng.Name,
@@ -126,7 +133,7 @@ func joinNode(t *testing.T, kubeClient client.Client, ng *ngv1.NodeGroup, index 
 	for k, v := range ng.Spec.Labels {
 		labels[k] = v
 	}
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels, CreationTimestamp: metav1.NewTime(joined)}}
 	for _, taint := range ng.Spec.Taints {
 		node.Spec.Taints = append(node.Spec.Taints, corev1.Taint{Key: taint.Key, Value: taint.Value, Effect: taint.Effect})
 	}
