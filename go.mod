@@ -1,6 +1,6 @@
 module github.com/CleverCloud/karpenter-provider-clever-cloud
 
-go 1.26.9
+go 1.26.11
 
 require (
 	github.com/awslabs/operatorpkg v0.0.0-20261002163259-5e8ed3699dea
