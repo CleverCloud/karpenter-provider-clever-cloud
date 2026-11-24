@@ -35,8 +35,8 @@ a default the new release changes silently never takes effect.
 ### From the published charts
 
 Each release publishes the [karpenter-crd](charts/karpenter-crd/README.md) and [karpenter](charts/karpenter/README.md)
-charts to ghcr.io as OCI artifacts, versioned on the release tag without the `v` prefix (release `v0.14.0` → chart
-version `0.14.0`). Install the CRDs first, then the controller — no image settings are needed, the chart pulls the
+charts to ghcr.io as OCI artifacts, versioned on the release tag without the `v` prefix (release `v0.15.0` → chart
+version `0.15.0`). Install the CRDs first, then the controller — no image settings are needed, the chart pulls the
 matching published image by default:
 
 ```
@@ -98,8 +98,8 @@ disk sizing, use `make run RUN_NODE_NAME=<reference-node>`.
 To build the docker image and push it to your registry, you can use the following commands:
 
 ```
-$ make image IMAGE=<your-registry>/karpenter-clevercloud TAG=v0.14.0
-$ docker push <your-registry>/karpenter-clevercloud:v0.14.0
+$ make image IMAGE=<your-registry>/karpenter-clevercloud TAG=v0.15.0
+$ docker push <your-registry>/karpenter-clevercloud:v0.15.0
 ```
 
 #### From the helm charts
@@ -116,7 +116,7 @@ $ helm upgrade --install karpenter-crd charts/karpenter-crd \
 $ helm upgrade --install karpenter charts/karpenter \
     --namespace karpenter --create-namespace \
     --set image.repository=<your-registry>/karpenter-clevercloud \
-    --set image.tag=v0.14.0 \
+    --set image.tag=v0.15.0 \
     --wait
 ```
 
