@@ -744,3 +744,336 @@ kubelet`). Times from the node turning `Unknown`:
 Karpenter's own repair, due at +10 min, never had to act. On CKE, node repair
 is the backstop for failures the platform does not heal; the platform's
 replacement VM costs one idle node for a few minutes.
+
+---
+
+# In-place node replacement during a cluster upgrade (2026-11-24)
+
+What CKE does to the nodes of a cluster when its Kubernetes version is
+upgraded had never been measured: the [2026-10-13 investigation](#cluster-upgrade-blocks-platform-operations-2026-10-13)
+upgraded a cluster while its only managed node was being deleted. Six
+upgrades were run on `DEDICATED_COMPUTE` clusters in Paris: one with v0.14.0,
+three with the nodereplacement controller as first written, two with its
+release [bound to the platform's drain](#release-bound-to-the-platforms-drain).
+Each cluster had a fixed 1× XS group hosting the controller, a NodePool pinned
+to 2XS (every voluntary disruption off, `consolidateAfter: Never` and a
+`nodes: "0"` budget, unless said otherwise), and a Deployment with one replica
+per Karpenter node (required hostname anti-affinity) behind a
+PodDisruptionBudget. Watches on nodes, NodeClaims, NodeGroups, pods and
+events, the controller's logs and metrics, and the platform's own cluster
+state and activity log were captured throughout. Times are UTC.
+
+## What the platform does
+
+Identical on every upgrade, for the fixed group and the managed ones, one
+NodeGroup at a time, in the order the groups were created (the fixed group,
+the oldest, first):
+
+1. the control plane is upgraded (API server on the new version 31–36 s after
+   the request on the four upgrades where that was timed, unreachable for a
+   few seconds);
+2. a node on the new version joins the **same NodeGroup**, under the lowest
+   free index: `<group>-node1` next to `-node0`, and `-node0` again the next
+   time. `spec.nodeCount` and the group's generation do not change. It
+   carries the group's `spec.labels` and `spec.taints`, so
+   `karpenter.sh/unregistered` on a managed group;
+3. 16–22 s later the old node is cordoned and labelled
+   `clever-cloud.com/draining=true` in one write (field manager `unknown`),
+   and its pods are evicted through the Eviction API, PodDisruptionBudgets
+   honoured;
+4. 6–15 s after the cordon, when nothing blocks the drain, the old Node
+   object is deleted and its VM stopped. The platform does not wait for the
+   evicted pods to stop: pods that take 20 s were gone with their node 5 s
+   after their eviction.
+
+The repair of a NotReady worker follows the same steps, except the last: the
+old Node object is deleted 1.1–1.4 s after the cordon.
+
+NodeGroup creations are refused for the whole upgrade
+(`ReconcileFailed=True(UpstreamError)`, `CreationFailedUpstream`) and built
+once the cluster is `ACTIVE` again. Deletions wait on the platform's
+finalizer, as [measured on 2026-10-13](#cluster-upgrade-blocks-platform-operations-2026-10-13).
+
+## Before the fix: the upgrade fails
+
+`karpenter-test-upgrade-cluster-2` (`kubernetes_01M86NTPQK93SKWE2EZW5ZN99Q`),
+1.35.10 → 1.36.6, controller v0.14.0 as installed by the platform
+(karpenter-core 1.14.1), two Karpenter nodes, PodDisruptionBudget
+`minAvailable: 1` over two replicas.
+
+| Time | Observation |
+|---|---|
+| 13:09:11 | Upgrade requested. API server on 1.36.6 at 13:09:44. |
+| 13:10:13–13:11:37 | The controller loses its lease on the API server restart (two container restarts), is evicted with the fixed node at 13:11:13 and is leader again at 13:11:37. |
+| 13:11:44 | `upgrade-probe-d29bp-node1` (1.36.6) joins the first managed group. The providerid controller refuses it the provider ID `-node0` holds. |
+| 13:12:06–13:12:07 | `-node0` is cordoned and its pod evicted; the new pod is Pending: its only possible node carries `karpenter.sh/unregistered`. |
+| 13:12:08 | Karpenter creates a NodeClaim for it. Its NodeGroup gets `UpstreamError` and never starts. |
+| 13:12:17 | The platform deletes Node `-node0`. It carries core's termination finalizer: core deletes the NodeClaim (13:12:18) and the provider deletes the NodeGroup (13:12:23), which stays terminating on the platform's finalizer until the end. |
+| 13:12:40–13:12:57 | Second managed group: `-node1` joins, `-node0` is cordoned. Its pod cannot be evicted: the PodDisruptionBudget needs the Pending replica. |
+| 13:16:41 | `upgrade-probe-d29bp-node1` gets the provider ID at its next update, 3 min 35 s after `-node0` was gone, and its Node object is deleted in the same second — what core's NodeClaim finalizer does to every node carrying a terminating NodeClaim's provider ID. |
+| 13:27:08, 13:42:14, 13:57:14 | Registration timeout: the pending NodeClaim is deleted and a new one created, with the same `UpstreamError`. |
+| 13:42:57 | Platform activity: `UPGRADE DRAIN FAILED — drain blocked on 1 node(s): upgrade-probe-tbj8z-node0: eviction refused for upgrade-probe/…: Cannot evict pod as it would violate the pod's disruption budget.` 30 minutes after the cordon. |
+| 13:43:04 | Cluster `FAILED`. One replica Running on a cordoned 1.35 node, one Pending since 13:12:07, an idle 1.36 node behind the unregistered taint. |
+| 14:00 | Still `FAILED`, NodeGroup creations still refused. The cluster was deleted. |
+
+The drain, the NodeGroup creation and the end of the upgrade each waited on
+the next. Without the PodDisruptionBudget the upgrade would presumably have
+completed with every Karpenter node destroyed and the workloads Pending until
+`ACTIVE`; that was not run.
+
+## With the nodereplacement controller
+
+The three upgrades and the repair below ran the controller as first written:
+it released the registered node from core's termination finalizer as soon as
+its replacement joined. The release now waits for the platform's cordon and
+is bounded, see [the last section](#release-bound-to-the-platforms-drain);
+what the platform does, and what core does with the adopted node, are the
+same.
+
+`karpenter-fix-upgrade-1` (`kubernetes_01M86Z5A343KA6800XHJ00ZZRR`), created
+without the platform's autoscaling so that no other Karpenter runs. The
+controller was built from the working tree (`19c2f5f-dirty` plus the fix) and
+ran in-cluster under the chart's Deployment, RBAC and placement, in
+`kube-system`; with no image registry at hand its binary was mounted from
+ConfigMaps in place of the image's.
+
+**1.35.10 → 1.36.6**, the scenario that failed: two Karpenter nodes,
+`minAvailable: 1` over two replicas.
+
+| Time | Observation |
+|---|---|
+| 14:30:04 | Upgrade requested. API server on 1.36.6 at 14:30:35. |
+| 14:34:16–14:34:42 | Fixed group replaced. The controller is evicted at 14:34:33 and leader again at 14:34:47. |
+| 14:35:04 | `upgrade-probe-4dkmn-node1` joins. 14:35:05.289: `-node0` released from core's termination finalizer (`NodeReplacementStarted`). |
+| 14:35:23–14:35:24 | `-node0` cordoned, its pod evicted, the new pod Pending. |
+| 14:35:26 | Karpenter creates a NodeClaim for it (`upgrade-probe-krt58`): `UpstreamError`, as before. |
+| 14:35:34 | The platform deletes Node `-node0`: gone at once, the NodeClaim untouched. |
+| 14:35:34.812 | `-node1` stamped with the provider ID (deletion watch). |
+| 14:35:35.136 | Registration reopened (`NodeReplaced`). 14:35:35.375: core registers `-node1` — NodePool labels, unregistered taint lifted. The pod is bound in the same second and Running at 14:35:37; `Initialized` at 14:35:36.5. |
+| 14:35:58–14:36:32 | Second group, same sequence: release 14:35:59, eviction 14:36:19 (the PodDisruptionBudget allows it: the first replica runs), deletion 14:36:29, adoption 14:36:30, pod Running 14:36:32. |
+| 14:36:29 | `UPGRADE COMPLETED`, 6 min 25 s after the request; cluster `ACTIVE` at 14:36:34. |
+| 14:36:42–14:37:15 | The platform builds the NodeGroup queued at 14:35:26: a third, empty node registers and initializes on 1.36.6. |
+
+**1.36.6 → 1.37.2**, same cluster seven minutes later: three Karpenter nodes
+(the two adopted ones and the extra one), `minAvailable: 2` over three
+replicas, three more pods with no NodePool selector and no
+PodDisruptionBudget, the NodePool at its CPU limit.
+
+| Time | Observation |
+|---|---|
+| 14:40:54 | Upgrade requested. API server on 1.37.2 at 14:41:27. |
+| 14:42:15–14:42:58 | Fixed group replaced (`default-node1` → `default-node0`). Controller evicted at 14:42:53, leader at 14:43:14.7. |
+| 14:43:20–14:43:52 | `upgrade-probe-4dkmn`: `-node0` joins, `-node1` released at 14:43:20.8, cordoned 14:43:38, deleted 14:43:49, registration reopened 14:43:50.0, pod Running 14:43:52. |
+| 14:44:14–14:44:46 | `upgrade-probe-kxvhr`, same. |
+| 14:45:07–14:45:42 | `upgrade-probe-krt58`: `-node1` joins next to `-node0`, same. |
+| 14:45:38 | `UPGRADE COMPLETED`, 4 min 44 s after the request; cluster `ACTIVE` at 14:45:40. |
+
+**1.36.6 → 1.37.2 on a fresh cluster, final tree**
+(`karpenter-fix-upgrade-2`, `kubernetes_01M870XP017B7CMN367RYPXXHA`): the
+two upgrades above ran the fix as first written; this one ran the final
+tree, which adds only a guard for two nodes on one provider ID. The NodePool
+is close to the one the platform seeds — `WhenEmptyOrUnderutilized`,
+`consolidateAfter: 1m`, default budgets, room for one node more than the
+three it runs — with `minAvailable: 2` over three replicas (hostname
+anti-affinity, node affinity on the instance type rather than on the
+NodePool) and two pods without a PodDisruptionBudget.
+
+| Time | Observation |
+|---|---|
+| 15:00:26 | Upgrade requested. API server on 1.37.2 at 15:01:02. Fixed group replaced; controller leader at 15:02:52.9. |
+| 15:03:04–15:03:39 | `general-2fzsc`: `-node1` joins, `-node0` released at 15:03:05.1, cordoned and drained at 15:03:27, deleted at 15:03:38, registration reopened at 15:03:39.1, replica bound at 15:03:39. |
+| 15:03:31 | Karpenter creates NodeClaim `general-tvrck` for the replica Pending since 15:03:28: `UpstreamError`. |
+| 15:04:02–15:04:35 | `general-8mx92`, same. 15:04:59–15:05:33: `general-hqsk9`, same. |
+| 15:05:31 | `UPGRADE COMPLETED`, 5 min 05 s after the request. |
+| 15:05:33–15:06:06 | The platform builds the queued NodeGroup: `general-tvrck-node0` registers at 15:05:56 and initializes at 15:06:06, empty. |
+| 15:07:06–15:07:33 | `Consolidatable` one minute later; `disrupting node(s) Empty … delete` at 15:07:22; node, NodeClaim and NodeGroup gone at 15:07:33, the VM on the platform's side at 15:08:13. |
+
+Across the three upgrades:
+
+| | Before | After |
+|---|---|---|
+| NodeClaims and NodeGroups of the nodes present before the upgrade | deleted | **kept**: same names, UIDs, creation times, `upstreamId`, generation |
+| Their nodes | destroyed, replacement included | replaced: new name, UID, `systemUUID`, kubelet on the new version; provider ID, NodePool labels, `karpenter.sh/registered` and `/initialized`, termination finalizer in place |
+| Replica bound to its node (anti-affinity) | Pending for the rest of the upgrade | Pending 11–13 s (8 replacements), from its eviction to the deletion of the old node |
+| Pods free to run elsewhere | — | rescheduled in 0–1 s on the other nodes |
+| Upgrade | `FAILED` after 33 min 53 s | completed in 6 min 25 s, 4 min 44 s and 5 min 05 s |
+| `nodeclaim_node_replacements_total` | — | 2, 3 and 3: one per node replaced |
+
+The controller was leader 16 s, 5 s and 11 s before the first Karpenter
+node's replacement joined, and 46 s, 34 s and 45 s before the platform
+deleted the first old node — the release only has to land before that
+deletion. On the failed upgrade the same margin was 40 s.
+
+The second upgrade created no NodeClaim for the Pending replicas: the
+NodePool was at its limit (`all available instance types exceed limits for
+nodepool`). The first and the third show what happens otherwise: one
+NodeClaim, nominated for the Pending pod of each node in turn, and one empty
+node once the cluster is `ACTIVE` — which stayed on the first cluster, whose
+NodePool never consolidates, and was removed 1 min 27 s after it initialized
+on the third.
+
+## A worker whose kubelet stops
+
+First cluster on 1.37.2, three Karpenter nodes, the NodePool's limit raised by
+one node. The kubelet of `upgrade-probe-kxvhr-node0` was stopped (`kubectl
+debug node/… --profile=sysadmin -- chroot /host systemctl stop kubelet`).
+The platform replaces the node in place, as in an upgrade, but no longer
+waits before deleting it: on [2026-10-16](#a-worker-whose-kubelet-stops-the-platform-heals-it-first)
+the old Node was deleted 5 min 36 s after it turned `Unknown`, here 11 s —
+and 1.35 s after the platform cordoned it.
+
+| Time | Observation |
+|---|---|
+| 14:47:21 | Kubelet stopped. |
+| 14:48:02 | `-node1` joins the group; 14:48:02.862: `-node0` released from core's termination finalizer. |
+| 14:48:10 | `-node0` turns `Unknown` (`NodeStatusUnknown`). |
+| 14:48:20–14:48:21 | The platform cordons it (`clever-cloud.com/draining: "true"`), evicts its pods and deletes the Node object: gone at once. |
+| 14:48:22.142 | Registration reopened (`NodeReplaced`); 14:48:22.449: `-node1` stamped; 14:48:24.258: core registers it. |
+| 14:48:24–14:48:26 | The replica evicted from `-node0` is bound to `-node1` and Running. No NodeClaim was created for it: karpenter-core counted the pod on the reopened NodeClaim. |
+
+The NodeClaim and its NodeGroup were kept, where the earlier run ended with
+both deleted, the replacement VM with them, and a new node launched for the
+pod. The pods the dead kubelet could not stop stayed `Terminating` on the
+deleted node for 54–55 s, until Kubernetes' pod garbage collector removed
+them.
+
+## Termination of adopted nodes
+
+On the first cluster the namespace, then the NodePool were deleted with the
+three NodeClaims registered on nodes that had each been adopted at least once
+(`-node0`, `-node1`, `-node1`). Core drained the nodes and the provider
+deleted the NodeGroups: no NodeClaim, managed NodeGroup or Karpenter node was
+left 15 s after the NodePool's deletion, and the fixed node was untouched.
+On the second cluster the three NodeClaims were deleted directly, with the
+same result within 20 s. Both clusters were then deleted.
+
+Across these four runs the provider's controllers logged no error. The
+`ERROR` lines are karpenter-core's: the lease lost on each API server
+restart, `could not schedule pod` at the NodePool's limit, and
+`state.nodeclaim` reconcile errors for the NodeClaims of the NodePool deleted
+under them.
+
+## Release bound to the platform's drain
+
+Two reviews of the controller as first written showed what releasing a node
+as soon as its replacement joins costs. A released node is one
+karpenter-core no longer drains, and that release had no end:
+
+- on a cluster whose upgrade failed behind a PodDisruptionBudget, both nodes
+  of the group stayed, the old one cordoned and released. Deleting its
+  NodeClaim removed the Node object within 5 s and killed the pod the budget
+  protected, where the NodeClaim of a node that still had its finalizer
+  blocked on the budget (reviewer's cluster, same day);
+- a Node object created by hand in a group released the registered node 1.3 s
+  later, for as long as the object existed;
+- core's emptiness deletes the NodeClaim of a cordoned node whose evicted
+  pods are still stopping, with `consolidateAfter: 0s` (reproduced over the
+  fake client, now `TestCoreEmptinessLeavesANodeThePlatformDrainsAlone`);
+- a replacement that inherits `karpenter.sh/registered` from its group's
+  labels, which a group created by v0.12.0 can carry, was taken for a
+  registered node when it was stamped before the adoption, and kept its
+  unregistered taint for good (reproduced over the fake client too, now
+  `TestAReplacementBornWithTheRegisteredLabelIsAdopted`).
+
+The release now takes a registered node the platform has cordoned, or one
+that is not Ready, next to a node that joined its group less than 35 minutes
+ago. It annotates the node `karpenter.sh/do-not-disrupt` and is undone as
+soon as one of those conditions no longer holds. The adoption goes by the
+node name recorded on the NodeClaim and the unregistered taint. Two clusters
+were run with a build of that change, in-cluster under the chart as before.
+
+### An upgrade, a repair, a stray node
+
+`karpenter-fix2-a` (`kubernetes_01M87FD0388HMG7GK1HGK6YC8B`), 1.36.6 → 1.37.2:
+three Karpenter nodes, a NodePool on karpenter-core's defaults
+(`WhenEmptyOrUnderutilized`, `consolidateAfter: 0s`, default budgets),
+`minAvailable: 2` over three replicas whose containers take 20 s to stop
+(`terminationGracePeriodSeconds: 30`).
+
+| Time | Observation |
+|---|---|
+| 19:14:56 | Upgrade requested. |
+| 19:16:42–19:17:10 | Fixed group replaced (`default-node0` → `default-node1`): cordoned at 19:16:59, deleted at 19:17:10. The controller is leader again at 19:17:07.2. |
+| 19:17:32.7 | `general-d5cdf-node1` joins. `-node0`, schedulable and Ready, keeps core's termination finalizer. |
+| 19:17:50.776 | The platform cordons `-node0`. 19:17:51.09: released and annotated (`NodeReplacementStarted`), 0.3 s after the cordon. Its replica is evicted at 19:17:51.5 and the new one is Pending. |
+| 19:17:53 | Karpenter creates NodeClaim `general-7mmkr` for it: `NodeGroupTransientFailure` (`UpstreamError`) and `NodeGroupAcceptanceTimeout` at 19:18:09, as on every upgrade. |
+| 19:17:57.013 | The platform deletes Node `-node0`, 6.2 s after the cordon. The evicted pod, 5 s into the 20 s it takes to stop, goes with it. |
+| 19:17:57.4–19:17:57.9 | Registration reopened (`NodeReplaced`) at .39, `-node1` stamped at .55, registered by core at .83, replica bound at .91, 6 to 7 s after it was created, and Running at 19:17:59.5. |
+| 19:18:21–19:18:44 | `general-4f82f`: `-node1` joins at 19:18:21.4, `-node0` cordoned at 19:18:37.319, released at 19:18:37.85, deleted at 19:18:43.242, `-node1` registered at 19:18:44.05, replica bound at 19:18:44.3. |
+| 19:19:07–19:19:31 | `general-89nz5`: join 19:19:07.3, cordon 19:19:24.000, release 19:19:24.31, deletion 19:19:29.956, registration 19:19:31.05, replica bound at 19:19:31.3. |
+| 19:19:29.9 | `UPGRADE COMPLETED`, 4 min 33 s after the request; cluster `ACTIVE` at 19:19:37. |
+| 19:20:02–19:20:36 | The platform builds the queued NodeGroup: `general-7mmkr-node0` registers at 19:20:04; `disrupting node(s) Empty … delete` at 19:20:35.7, the only disruption command of the run. |
+
+The three NodeClaims kept their names and UIDs. The release landed 0.3 to
+0.5 s after each cordon and 5.4 to 5.9 s before the deletion of the node.
+Core's disruption controller looked at a released node while it was being
+drained and left it: `DisruptionBlocked` on `general-4f82f-node0` at
+19:18:40, `Disruption is blocked through the "karpenter.sh/do-not-disrupt"
+annotation`. The platform deleted each drained node 6 s after cordoning it,
+sooner than the 15 s core's emptiness takes to validate a candidate, so this
+run does not show what core would have done without the annotation: the unit
+test above does.
+
+Then the kubelet of `general-d5cdf-node1` was stopped, as on the first
+cluster:
+
+| Time | Observation |
+|---|---|
+| 19:21:05 | Kubelet stopped. 19:21:49.6: the node turns `Unknown`. |
+| 19:21:52.6 | `general-d5cdf-node0` joins the group (lowest free index). 19:21:53.21: `-node1`, not Ready next to its replacement, is released. Core reports `DisruptionBlocked` on it through the annotation at 19:21:56. |
+| 19:22:09.856 | The platform cordons `-node1`, and deletes it at 19:22:10.923, **1.07 s later**. |
+| 19:22:11.2–19:22:13.6 | `-node0` stamped at .24, registration reopened at .77, registered at 19:22:12.37, initialized at 19:22:13.56. The replica is bound at 19:22:12.8 and Running at 19:22:15.2. |
+
+The NodeClaim kept its UID. A release that waited for the cordon would have
+had one second on a repair, against six on an upgrade: this is why a node
+that is not Ready is released as soon as its replacement is there.
+
+A Node object was then created by hand in the group of `general-4f82f`
+(`general-4f82f-node9`, the group's label, no kubelet). The registered node,
+schedulable and Ready, kept its finalizer and got no annotation (observed
+for 15 s). Cordoned by hand at 19:23:33.276, it was released at 19:23:33.790;
+uncordoned at 19:23:37.6, it had its finalizer back and its annotations
+removed at 19:23:38.351.
+
+The namespace and the NodePool were deleted at 19:23:52 with the three
+NodeClaims on adopted nodes: no NodeClaim, managed NodeGroup or Karpenter
+node was left at 19:24:11.
+
+### A drain the platform gives up
+
+`karpenter-fix2-b` (`kubernetes_01M87FD03T7N1HGFMPP1C7W4ZR`), 1.36.6 → 1.37.2,
+same NodePool: two Karpenter nodes and `minAvailable: 2` over two replicas, a
+budget that allows no eviction.
+
+| Time | Observation |
+|---|---|
+| 19:15:09 | Upgrade requested. Fixed group replaced at 19:17:49–19:18:00; the controller is leader again at 19:18:02.6. |
+| 19:18:22 | `strict-4m5bb-node1` joins. |
+| 19:18:38.672 | The platform cordons `-node0`. 19:18:38.97: released and annotated. The eviction of its replica is refused by the budget, and stays refused. |
+| 19:29:24–19:30:29 | The controller is redeployed with the final build and is leader at 19:30:29.2: `-node0` stays released. Core reports `DisruptionBlocked` on it through the annotation at each of its passes (19:30:04 … 19:52:30). |
+| 19:48:38 | Platform activity: `UPGRADE DRAIN FAILED — drain blocked on 1 node(s): strict-4m5bb-node0: eviction refused for upgrade-probe/…: Cannot evict pod as it would violate the pod's disruption budget.` Cluster `FAILED` at 19:48:43. Both nodes stay in the group, `-node0` cordoned and labelled `clever-cloud.com/draining=true`. |
+| 19:53:22.35 | 35 minutes after `-node1` was created (19:18:22): core's termination finalizer is back on `-node0`, the annotations are gone, Warning `NodeReplacementStalled` on the NodeClaim. The window was counted across the controller's restart. |
+| 19:53:57.7 | NodeClaim `strict-4m5bb` deleted by hand. 19:53:58: core deletes Node `-node0`, which its finalizer holds, taints it `karpenter.sh/disrupted` and reports `FailedDraining: 1 pods are waiting to be evicted`. A minute later the pod is still Running, the node and the NodeGroup still there. |
+
+The two replicas ran throughout. The same deletion on the reviewer's cluster,
+with the release as first written, removed both Node objects within 5 s and
+killed the pod. During the 35 minutes the node was still out of core's
+hands, as it is during any drain by the platform: the event published at the
+release says to drain by hand before deleting the node or its NodeClaim.
+
+Both clusters were then deleted. On the two runs the provider's controllers
+logged no error; the `ERROR` lines are karpenter-core's (the lease lost on
+each API server restart, `state.nodeclaim` and eviction-queue reconcile
+errors for the NodeClaims of the NodePool deleted under them).
+
+## Not covered
+
+An upgrade during which the controller does not run between the cordon of a
+node and its deletion (the old behaviour is then expected, and is what
+`TestPlatformDeletionOfARegisteredNodeDeletesItsNodeClaim` pins); core's
+emptiness on a drained node whose pods outlive its 15-second validation (the
+platform deleted every drained node sooner; pinned over core's own code
+instead); a release ended by the platform uncordoning the node, other than
+by hand; other topologies; flavors other than 2XS and XS; NodePools with
+taints or startup taints; more than three Karpenter nodes; a `FAILED`
+cluster's recovery.
