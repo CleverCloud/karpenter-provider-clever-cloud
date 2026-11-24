@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 - 2026-11-24
+
+Kubernetes upgrades of a cluster keep its Karpenter nodes, and karpenter-core moves to 1.15. A CKE upgrade, like the platform's repair of a NotReady worker, replaces each node inside its NodeGroup: the provider now carries the NodeClaim and the NodeGroup over to the replacement node, where both used to be deleted with the old one, which left the evicted pods Pending until the upgrade ended and could fail it behind a PodDisruptionBudget. Node repair becomes a disruption method of karpenter-core, paced by NodePool budgets and still forceful, and the chart grants the reads core's opt-in settings make. ⚠️ Upgrade the `karpenter-crd` chart before the controller chart; before rolling back to v0.14.0, check that no node carries the `karpenter.clever-cloud.com/node-replacement` annotation. Built on karpenter-core 1.15.0 and Go 1.26.11, with the complete end-to-end suite validated on live CKE 1.37.2. The controller continues to use only the cluster's Kubernetes API.
 
 ### 🔄 Changed
 
@@ -21,6 +23,8 @@
 - **`docs`: cluster upgrades and node replacement** — the README gains a "Kubernetes upgrades of the cluster" section, the runbook a "Node replacement by the platform" section with what to expect, what not to delete while a node is released and the signals of a replacement that did not complete, and `docs/E2E-RESULTS.md` the failed upgrade, the validated ones, a drain blocked until the platform gave up and the platform's repair of a stopped kubelet. A `FAILED` cluster is now documented as refusing NodeGroup creations too.
 
 - **`docs`: node repair, budgets and the new upstream signals** — the README gains a "Node repair" section and a word on `SCHEDULER_CONFIG`; the runbook says that a zero budget now pauses repair too, that an unsynced cluster state stops it as well, which series untyped launch errors land in, and what the new pod event says; the `disruption-budgets` example no longer claims budgets pace expiration, which never waited on them.
+
+- **`docs(e2e)`: release validation** — `docs/E2E-RESULTS.md` records the complete suite run on the release tree against Kubernetes 1.37.2, next to the cluster upgrades and the karpenter-core 1.15 validation.
 
 ## 0.14.0 - 2026-10-14
 
