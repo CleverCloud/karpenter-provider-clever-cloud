@@ -460,6 +460,46 @@ older nodes are gone (or labelled by hand) a replica that has to be rescheduled 
 Karpenter cannot launch a node for it. Key such a rule on `kubernetes.io/hostname` to keep one replica
 per node.
 
+### Kubernetes upgrades of the cluster
+
+Clever Cloud upgrades a cluster's workers by replacing each node in place: a new node joins the same
+NodeGroup, the old one is cordoned, drained through the Eviction API (PodDisruptionBudgets are
+honoured) and deleted. Karpenter follows: the NodeClaim and its NodeGroup are kept, and the new node
+becomes the NodeClaim's node, with the NodePool's labels and taints, as soon as the old one is gone.
+
+- The pods of a node are Pending between their eviction and the deletion of that node, 6 to 13
+  seconds in the live validation; the platform does not wait for them to finish stopping. Give
+  workloads that must stay up more than one replica and a PodDisruptionBudget that tolerates one node
+  at a time: the platform waits for it, and gives the upgrade up (cluster `FAILED`) when a drain is
+  still blocked after 30 minutes.
+- **While the platform drains a node, Karpenter does not.** From the moment the platform cordons a
+  node until it deletes it, deleting that node, its NodeClaim or its NodePool removes the node at
+  once, PodDisruptionBudgets ignored: drain it yourself first (`kubectl drain`). That window is
+  6 to 15 seconds on a drain nothing blocks, and lasts as long as a PodDisruptionBudget blocks it.
+  Karpenter takes the node back 35 minutes after its replacement joined (event
+  `NodeReplacementStalled`), which is also what happens on a cluster its upgrade left `FAILED`.
+  Karpenter's own disruption (consolidation, drift) leaves the node alone meanwhile.
+- The platform refuses new NodeGroups until the upgrade ends, so Karpenter cannot add capacity during
+  it. A NodeClaim it creates for the pods waiting above is built once the upgrade ends: an extra,
+  empty node, which consolidation removes after `consolidateAfter`. A NodePool that never
+  consolidates (`consolidateAfter: Never`, a `nodes: "0"` budget) keeps it until its NodeClaim is
+  deleted.
+- A NodeClaim keeps its age across the upgrade: `expireAfter` counts from its original launch.
+- `startupTaints` reach a replacement node when Karpenter adopts it, 25 seconds or more after it
+  booted, where a launch applies them within a second of the node joining. An agent that removes
+  its taint once, when it starts, has already run by then: the taint stays and the NodeClaim is
+  never `Initialized`. An agent that removes its taint whenever it sees it is not affected.
+- The fixed NodeGroups are replaced the same way, so their nodes change name
+  (`fixed-workers-node0` becomes `fixed-workers-node1`, then `-node0` again). With
+  `settings.ephemeralStorageReference.mode: node`, update `nodeName` after the upgrade: until then
+  the reference is missing and launches that request local disk wait (see
+  [flavor catalogue](#flavor-catalogue)). Mode `host` follows the controller and needs nothing.
+
+Before an upgrade, check that the controller is running: it has to act between the moment the
+platform cordons a node and the moment it deletes it. The
+[runbook](docs/observability.md#node-replacement-by-the-platform) lists the events and the metric
+that trace each replacement, and what to do when one does not complete.
+
 ### Node repair
 
 Node repair is off by default (`settings.featureGates.nodeRepair`). Enabled, it replaces a node whose
@@ -496,11 +536,10 @@ instead, which karpenter-core plans to deprecate: it deletes the broken node fir
 budgets, `karpenter.sh/do-not-repair` and the cluster state sync.
 
 CKE heals some failures itself: when a worker's kubelet stopped in the live validation, the platform
-started a replacement VM in the node's NodeGroup within seconds (Karpenter cannot use it: the provider
-ID belongs to the old node, so it stays unregistered), drained the old node and deleted it after
-about 5 minutes, which ended the NodeClaim and its NodeGroup, both VMs included, before the
-10-minute toleration (see [E2E-RESULTS](docs/E2E-RESULTS.md)). Node repair is the backstop for what
-the platform leaves alone.
+started a replacement VM in the node's NodeGroup within seconds, drained the old node and deleted it,
+well before the 10-minute toleration, and the NodeClaim adopted the replacement as it does during a
+[cluster upgrade](#kubernetes-upgrades-of-the-cluster) (see [E2E-RESULTS](docs/E2E-RESULTS.md)). Node
+repair is the backstop for what the platform leaves alone.
 
 ## Observability
 

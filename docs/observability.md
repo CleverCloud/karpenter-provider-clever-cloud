@@ -19,6 +19,7 @@ All provider series are prefixed `karpenter_clevercloud_`.
 | `nodegroup_sync_overdue` | gauge | Launched NodeGroups the node-group operator has not synced (no `Ready=True`) 5 minutes after their creation while their NodeClaim is still unregistered. Healthy launches sync in under a minute (node Ready at 26–60 s, see [E2E-RESULTS](E2E-RESULTS.md)). | **Non-zero means launches are stuck upstream**: they will not register, and karpenter-core deletes each NodeClaim at its 15-minute registration timeout, then re-plans. The `NodeGroupSyncOverdue` event on the NodeClaim names the group and what the operator last wrote. In `kubectl get nodegroup <name> -o yaml`: no `status` means the operator never picked the group up; a `ReconcileInProgress` (`Creating`) that never ends means the operator is still building, or failing to build, the machine; a `ReconcileFailed` with reason `UpstreamError` means the operator keeps retrying failed Clever Cloud API calls (a `NodeGroupTransientFailure` event says so too). None of this can be fixed from the cluster: report the NodeGroup names (and their `status.upstreamId` when set) to Clever Cloud support. Nothing needs deleting by hand. |
 | `nodegroup_deletion_overdue` | gauge | Managed NodeGroups still present at least 5 minutes after their `deletionTimestamp`, from the last successful GC list. Checked every 2 minutes (normally detected 5–7 minutes after the DELETE), independently of NodeClaim existence or status and of stale `Ready=True`. | Read the `NodeGroupDeletionOverdue` Warning on the **NodeGroup**, then inspect its current finalizers and `status.upstreamId`. The event records observed age, last reported phase/true conditions and remaining finalizers; inspect the controllers responsible for them. If `clever-nodegroup-operator` remains, also check CKE state and contact Clever Cloud support if its wait persists. Finalizer presence does not establish the cause. Preserve finalizers until their cleanup responsibilities are understood. The count clears when Kubernetes no longer lists the group as managed; that **does not confirm VM destruction**. See [blocked cluster operations](#blocked-cluster-operations). |
 | `nodegroup_external_resizes` | gauge | Managed NodeGroups whose `nodeCount` is not 1 — something outside karpenter resizes them (the platform's alert-driven scaler via an inherited `autoscalingEnabled`, a human, anything with `nodegroups/scale` RBAC). | **Non-zero breaks the 1 NodeClaim = 1 NodeGroup invariant**: the extra nodes are never registered — they get no provider ID and keep the `karpenter.sh/unregistered` taint — so karpenter neither manages nor prices them. Find the resizer; ensure the cluster's `autoscalingEnabled` feature is off (the two autoscalers must never run together), then set `nodeCount` back to 1. **Also check karpenter-core's `karpenter_cluster_state_synced`**: a node carrying `karpenter.sh/nodepool` without a `spec.providerID` keeps it at 0 after every controller restart — provisioning and disruption (node repair included) stop cluster-wide and `cluster is waiting on sync for extended duration` is logged every 10 s. NodeGroups created by the current version never put that label on their nodes; for older groups, whose immutable `spec.labels` still carry it, the providerid controller removes it from the extra node it refuses to stamp (logged once per node). The controller never touches nodes of unmanaged groups, and that includes an older group recreated upstream without its `karpenter.clever-cloud.com/managed` label but with its old `spec.labels`: its single node carries the label with no provider ID and freezes the sync the same way. If `karpenter_cluster_state_synced` stays at 0 anyway, list the culprits with `kubectl get nodes -l karpenter.sh/nodepool -o custom-columns=NAME:.metadata.name,PROVIDERID:.spec.providerID` and remove the label from any node with an empty provider ID, or revert the resize. |
+| `nodeclaim_node_replacements_total` | counter | A NodeClaim's registration was reopened because the node karpenter-core had registered for it is no longer there: the platform replaced it in place ([node replacement](#node-replacement-by-the-platform): a Kubernetes upgrade of the cluster, the repair of a NotReady worker), or it is gone. A tick with a Normal `NodeReplaced` event is a NodeClaim and a NodeGroup kept across a replacement that used to delete them. | A Kubernetes upgrade ticks once per karpenter node, with a `NodeReplaced` event on each NodeClaim: expected. Ticks outside an upgrade are the platform replacing workers on its own — look at why those nodes went NotReady. A `NodeReplaced` **Warning** means the node went away with nothing to adopt: the NodeClaim is deleted by karpenter-core's registration timeout 15 minutes later unless a node joins its group. |
 | `gc_reaped_nodegroups_total` | counter | The GC safety net deleted an orphaned NodeGroup (its NodeClaim was force-deleted outside the normal flow). | Occasional ticks are the safety net working. Frequent ticks mean something force-deletes NodeClaims — find it. |
 | `gc_refused_nodegroups` | gauge | NodeGroups the last GC sweep refused to reap: managed label present, but no verified dead NodeClaim owner. | **Non-zero needs attention** — each one is a VM billing hourly. A copied manifest: remove the `karpenter.clever-cloud.com/managed` label. A deliberately orphaned group: delete it manually. Details in the `GarbageCollectionRefused` event on the NodeGroup. |
 | `instancetype_host_ephemeral_storage_ready` | gauge | 1 after a valid disk observation from `NODE_NAME`; 0 before initialization or while the node is absent, terminating or reports invalid disk quantities. Exists only when `NODE_NAME` is set. | At 0, the scheduling catalogue guarantees no local disk capacity. Workloads with zero total `ephemeral-storage` requests can still provision; positive requests, including applicable DaemonSets, and NodePools with explicit ephemeral-storage limits wait. Inspect the named Node and controller errors; see [controller-node disk reference](#controller-node-disk-reference). |
@@ -202,7 +203,12 @@ CKE cluster state. Kubernetes can accept a creation or DELETE while CKE
 cannot apply it upstream. This was reproduced during a cluster upgrade
 (`UPDATING`); operations resumed after the cluster returned to `ACTIVE`
 ([live investigation](E2E-RESULTS.md#cluster-upgrade-blocks-platform-operations-2026-10-13)).
-A permanently `FAILED` cluster was not reproduced.
+A `FAILED` cluster refuses them too: on an upgrade the platform gave up
+after a drain blocked for 30 minutes, NodeGroup creations were still
+answered `UpstreamError` 17 minutes into `FAILED`, when the cluster was
+deleted
+([live investigation](E2E-RESULTS.md#in-place-node-replacement-during-a-cluster-upgrade-2026-11-24)).
+How a `FAILED` cluster recovers was not measured.
 
 For creation, `UpstreamError` stays a transient error. If the operator has
 not acknowledged the group after 15 seconds, the provider returns
@@ -262,6 +268,133 @@ replaced meanwhile, except one that registered but never initialized. Restore
 the previous budgets after the upgrade. This does not pause provisioning,
 expiration, manual deletion or disruptions already underway.
 
+## Node replacement by the platform
+
+Clever Cloud replaces the node of a NodeGroup in place: it adds a node to the
+group under the lowest free index (`<nodegroup>-node1` next to `-node0`, then
+`-node0` again the next time; the group's `nodeCount` stays 1), cordons the
+old node and labels it `clever-cloud.com/draining=true`, evicts its pods
+through the Eviction API, then deletes the old Node object and its VM. A
+Kubernetes upgrade of the cluster does that to every node, one NodeGroup at a
+time, and the platform's repair of a NotReady worker does it to one.
+PodDisruptionBudgets are honoured: a drain still blocked after 30 minutes
+fails the upgrade (cluster `FAILED`) and leaves both nodes in the group.
+
+The provider keeps the NodeClaim and its NodeGroup across the replacement
+([live validation](E2E-RESULTS.md#in-place-node-replacement-during-a-cluster-upgrade-2026-11-24)):
+
+1. When the platform cordons the registered node next to its replacement (or
+   when that node is NotReady, which is what the platform repairs), the
+   registered node is released from karpenter's termination finalizer and
+   annotated `karpenter.sh/do-not-disrupt` (`NodeReplacementStarted` on the
+   NodeClaim). The platform drains it; karpenter does not, and its
+   consolidation leaves the node alone. Live, the release landed 0.5–0.8 s
+   after the cordon, and the platform deleted the node 6–15 s after it.
+2. When the platform deletes the old node, the replacement takes the provider
+   ID over and the NodeClaim's registration is reopened (`NodeReplaced`,
+   `nodeclaim_node_replacements_total`). karpenter-core registers the
+   replacement as it registers a launch: NodePool labels and taints, the
+   `karpenter.sh/unregistered` taint lifted, the NodeClaim pointing at the new
+   node. Live, this took one second after the old node's deletion.
+
+The NodeClaim keeps its name, UID and creation time, so `expireAfter` keeps
+counting from the original launch; the node's name, UID and kubelet version
+change. `kubectl get nodeclaim <name> -o jsonpath='{.status.conditions}'`
+shows `Registered` and `Initialized` at `Unknown` (reason `NodeReplaced`) for
+the second in between. Each adoption is a registration for karpenter-core:
+`karpenter_nodes_created_total` and the NodePool's registration health tick
+again, and the NodeClaim's conditions go True → Unknown → True.
+
+### A released node is not drained by karpenter
+
+Between the release and the deletion of the node, karpenter-core has no hand
+on it: **deleting the node, its NodeClaim or its NodePool removes the Node
+object at once**, without evicting anything, PodDisruptionBudgets and
+`karpenter.sh/do-not-disrupt` pods included; the NodeGroup and its VMs follow.
+An `expireAfter` reached then does the same. On a drain nothing blocks that is
+a matter of seconds. It is not when a PodDisruptionBudget blocks the drain:
+the node stays cordoned and released until the platform gives up.
+
+- Find the released nodes: they carry the
+  `karpenter.clever-cloud.com/node-replacement` annotation
+  (`kubectl get nodes -o json | jq -r '.items[] | select(.metadata.annotations["karpenter.clever-cloud.com/node-replacement"]) | .metadata.name'`).
+- Before deleting one, its NodeClaim or its NodePool, drain it yourself:
+  `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`.
+- The release ends by itself. The finalizer is back, and the annotations
+  gone, as soon as the node is uncordoned and Ready, its replacement goes
+  away or the group is resized, and in any case **35 minutes after the
+  replacement joined** (`NodeReplacementStalled`): past the platform's
+  30-minute drain timeout nobody is draining the node any more. From then on
+  karpenter drains it as any other node. If the platform resumes and deletes
+  it after all, the NodeClaim and its NodeGroup go with it and karpenter
+  provisions again — the behaviour of every release up to v0.14.0.
+- **Before rolling back to a release without this controller** (v0.14.0 or
+  earlier), check that no node is released: nothing would put the finalizer
+  back.
+
+### What to expect during an upgrade
+
+- **The pods of a node stay Pending between their eviction and the deletion
+  of that node**, 6–13 seconds live: the replacement cannot take the
+  provider ID while the old node exists, so it keeps the
+  `karpenter.sh/unregistered` taint until then. A PodDisruptionBudget that
+  tolerates one node's worth of evictions at a time lets the upgrade proceed;
+  one that tolerates none (a single replica with `minAvailable: 1`) blocks
+  the drain and fails the upgrade after 30 minutes, as on any cluster.
+- **karpenter can create a NodeClaim for those Pending pods**, which the
+  platform cannot build while the cluster is `UPDATING`
+  (`NodeGroupTransientFailure` and `NodeGroupAcceptanceTimeout` on it, see
+  [blocked cluster operations](#blocked-cluster-operations)). The pods run on
+  the replacement node meanwhile. The platform builds the queued NodeGroup
+  when the upgrade ends: one extra, empty node, which consolidation removes
+  after `consolidateAfter` when the NodePool's policy and budgets allow it.
+  Live, one such NodeClaim covered the whole upgrade: the Pending pods of the
+  next nodes were counted on it. None is created when the NodePool is at its
+  limit. A NodePool with `consolidateAfter: Never` or a `nodes: "0"` budget
+  keeps that node until you delete its NodeClaim.
+- **The controller has to be running while a node is replaced.** The release
+  must land between the cordon of the old node and its deletion, 6 seconds
+  at the shortest on an upgrade. The platform replaces the node the
+  controller runs on first, and the controller was leader again before the
+  replacement of the first karpenter node joined in every measured upgrade
+  (5 seconds before, at the closest), so some 25 seconds before that cordon.
+  A controller stopped after the release changes nothing: the adoption
+  happens when it is back. When the release is missed, karpenter-core's
+  termination deletes the NodeClaim and the NodeGroup with the old node,
+  replacement included, and karpenter launches new nodes once the platform
+  accepts creations again: what every release up to v0.14.0 did, and what
+  failed the measured upgrade — see the last row below.
+- **`startupTaints` are applied to a replacement when it is adopted**, 25
+  seconds or more after it booted (the NodeGroup carries the
+  `karpenter.sh/unregistered` taint alone), where a launch applies them within
+  a second of the node joining. An agent that removes its taint once, when it
+  starts, has run by then: the taint stays, the NodeClaim is never
+  `Initialized` (reason `StartupTaintsExist`) and pods that do not tolerate
+  the taint stay off the node. Remove the taint by hand, or make the agent
+  remove it whenever it sees it.
+- **A named disk reference is lost.** The fixed NodeGroups are replaced too,
+  so a node named in `settings.ephemeralStorageReference` (mode `node`) comes
+  back under another name: `instancetype_host_ephemeral_storage_ready` drops to 0 and
+  launches that request local disk wait until `nodeName` is updated. Mode
+  `host` follows the controller.
+
+### Signals that something went wrong
+
+| What you see | Meaning and action |
+|---|---|
+| `NodeReplacementStarted` without a `NodeReplaced` after it, both nodes still there | The platform is still draining the old node (it is cordoned). The cluster's activity log (`clever k8s activity`) says why: a PodDisruptionBudget that refuses the eviction (`drain blocked on 1 node(s): … Cannot evict pod as it would violate the pod's disruption budget`), or a platform-side failure of the upgrade. Relax the budget or scale the workload up **before the 30 minutes run out**. Do not delete the node or its NodeClaim to get things moving: it is [released](#a-released-node-is-not-drained-by-karpenter), so that kills its pods. |
+| `NodeReplacementStalled` | The above lasted 35 minutes, typically on a cluster its upgrade left `FAILED`. The node is karpenter's again: deleting its NodeClaim now drains it, which the same PodDisruptionBudget blocks. The replacement node stays in the group, unregistered, until the platform finishes or the NodeGroup is deleted. |
+| A node of a karpenter NodeGroup that keeps the `karpenter.sh/unregistered` taint with no other node in its group | Its NodeClaim is gone or was never reopened. `kubectl get nodeclaim <nodegroup> -o jsonpath='{.status.conditions}'`: if it exists and is `Registered`, either the controller is not running or cannot patch NodeClaim status, or karpenter-core's repair has a command in flight for it (`DisruptionReason` `Unhealthy`): the NodeClaim is then about to be deleted, and is adopted if core gives the repair up. |
+| `NodeReplaced` as a Warning | The registered node is gone and nothing replaced it. karpenter-core's registration timeout deletes the NodeClaim after 15 minutes and re-provisions for the pods; delete the NodeClaim yourself to shorten that. |
+| A replaced node's NodeClaim stays `Initialized=Unknown` (`StartupTaintsExist`) | A startup taint was applied after its agent ran, see above. |
+| NodeClaims deleted during an upgrade, NodeGroups in `nodegroup_deletion_overdue` | The release was missed: the controller was not running, or not leader, between the cordon of a node and its deletion. The evicted pods are Pending until the upgrade ends, since the platform refuses creations meanwhile, and a PodDisruptionBudget that needs one of them blocks the drain of the next node — the upgrade then fails after 30 minutes. Get the controller running, and relax that budget or scale the workload up on the nodes that are left before the 30 minutes run out. |
+
+A group resized from outside karpenter (`nodeCount` above 1,
+`nodegroup_external_resizes`) is not a replacement: both nodes stay, and the
+registered one keeps its finalizer. Neither is a second node next to a
+registered node that is schedulable and Ready, nor a node that has been in
+the group for more than 35 minutes.
+
 ## Node repair
 
 With `settings.featureGates.nodeRepair` on, karpenter-core runs node repair
@@ -286,13 +419,14 @@ pods would go before replacing it, and a planning error ends the whole pass:
   sync.
 - **CKE heals first.** The platform replaces a worker whose kubelet stopped
   on its own: it starts a new VM in the node's NodeGroup within seconds,
-  drains the old node and deletes it a few minutes later (measured in
+  drains the old node and deletes it (11 seconds after the node turned
+  `Unknown` in the last measurement, several minutes in an earlier one, see
   [E2E-RESULTS](E2E-RESULTS.md)). Meanwhile the providerid controller logs
   `refusing to stamp a provider id` for the new VM, which stays unregistered
   (its sibling holds the provider ID) and is not counted by
   `nodegroup_external_resizes` (`nodeCount` stays 1). Nothing needs doing:
-  the old node's deletion ends its NodeClaim, and the NodeGroup's deletion
-  takes both VMs.
+  when the old node is deleted, its NodeClaim adopts the new VM
+  ([node replacement](#node-replacement-by-the-platform)).
 - **No capacity for the replacement.** At an exhausted organisation quota a
   broken node whose pods need a new node gets a `DisruptionBlocked` event and
   waits, ticking `nodegroup_quota_rejections_total` about once a minute; its
@@ -436,6 +570,9 @@ NodePool `NodeRegistrationHealthy` status condition.
 | `NodeGroupSyncOverdue` | NodeClaim | Warning | The launched NodeGroup is still not synced 5 minutes after its creation and the claim has not registered; carries what the operator last wrote (phase and true conditions), or says the operator never picked the group up. Nothing is deleted: karpenter-core's registration timeout retires the claim at 15 minutes. Counted by `nodegroup_sync_overdue`. |
 | `NodeGroupDeletionOverdue` | NodeGroup | Warning | The managed NodeGroup is still visible at least 5 minutes after its DELETE. Records observed age, last reported phase/true conditions and remaining finalizers. Advises inspecting the finalizer owners, with a CKE-state/support hint when the known platform finalizer remains; does not diagnose `UPDATING`/`FAILED` or confirm VM deletion. An hourly event is a snapshot, not live status: its message points to the current object. Published by the 2-minute GC sweep, including for missing or registered NodeClaims and stale `Ready=True`; deduped per object UID and republished hourly. No finalizer or retry behavior changes. |
 | `NodeGroupExternallyResized` | NodeGroup | Warning | The group's nodeCount is not 1; republished hourly while the condition persists. |
+| `NodeReplacementStarted` | NodeClaim | Normal | The platform is replacing the registered node of the NodeClaim's NodeGroup (cluster upgrade, node repair): a second node joined the group while its nodeCount is 1, and the registered node is cordoned or NotReady. Names both nodes. The registered node was released from karpenter's termination finalizer, so that its deletion by the platform does not delete the NodeClaim, and annotated `karpenter.sh/do-not-disrupt`. Until the platform deletes it, [karpenter does not drain it](#a-released-node-is-not-drained-by-karpenter). See [node replacement](#node-replacement-by-the-platform). |
+| `NodeReplacementStalled` | NodeClaim | Warning | 35 minutes after the replacement joined, the registered node is still there, cordoned or NotReady: the platform gave the drain up (a PodDisruptionBudget, a `FAILED` upgrade). karpenter's termination finalizer is back on the node and the annotations are gone: karpenter drains it again. |
+| `NodeReplaced` | NodeClaim | Normal / Warning | The node karpenter-core had registered for this NodeClaim is no longer there and the registration was reopened. Normal: names the node that replaces it, which karpenter-core registers within seconds. Warning: the group has no other node; karpenter adopts one if the platform adds it, and its registration timeout deletes the NodeClaim after 15 minutes otherwise. |
 | `GarbageCollected` | NodeGroup | Normal | The GC safety net deleted this orphaned group. |
 | `GarbageCollectionRefused` | NodeGroup | Warning | The GC found this group orphan-like but refused to reap it (no verified dead owner); republished hourly while the condition persists so it survives etcd's event TTL. |
 | `LabelsIgnored` | CleverNodeClass | Warning | `spec.labels` carries keys that v0.12.0 admitted and the current rule rejects: a subdomained `kubernetes.io/` key such as `app.kubernetes.io/part-of`, or a `karpenter.sh` key. No node launched now gets them (a subdomained `kubernetes.io/` key never reached any node; a `karpenter.sh` key reached the nodes v0.12.0 built, which keep it). The NodeClass stays Ready and keeps provisioning, and its `LabelsIgnored` status condition, which does not gate readiness, names them for as long as they remain. The event is published whenever the controller reconciles the NodeClass (at start, on every change, and every minute while the condition's reason is `HashMigrationPending`), at most once an hour per key set and reason. Its message and the condition's say whether removing the keys drifts nodes. The controller re-stamps the NodeGroups v0.12.0 built (which hashed the keys) with hash version v3 (which leaves them out) before it reports the keys; reason `LegacyLabelKeys` means no NodeGroup of the NodeClass still carries an older stamp. `HashMigrationPending` counts the NodeGroups that still do: their NodeClaim is already drifted (it keeps its stamp until it is replaced), the NodeClass changed since they were built (they drift anyway), or a read or write failed (retried; the error is in the controller's logs). It gives no count when the NodeGroups could not be listed. **Action**: remove the keys once the reason is `LegacyLabelKeys`: no node drifts for it. Removing them while it is `HashMigrationPending`, or before the upgraded controller has reconciled the NodeClass (before the upgrade, in the same change as the upgrade, or while v0.12.0 still runs), drifts the NodeGroups still carrying an older stamp, and Karpenter replaces their nodes. Until the keys are removed, the CRD refuses any edit of `spec.labels` that keeps them. |
