@@ -1077,3 +1077,33 @@ instead); a release ended by the platform uncordoning the node, other than
 by hand; other topologies; flavors other than 2XS and XS; NodePools with
 taints or startup taints; more than three Karpenter nodes; a `FAILED`
 cluster's recovery.
+
+---
+
+# Release validation of v0.15.0 (2026-11-24)
+
+The complete suite was run once more on the tree that became v0.15.0: the
+node replacement change with the Go 1.26.11 bump (`f7ad312`), the controller
+out of cluster as `make e2e` runs it, against a fresh `DEDICATED_COMPUTE`
+cluster on Kubernetes 1.37.2 (kernel 7.3.6) with a fixed 1× XS group.
+
+| Scenario | Result | Notes |
+|---|---|---|
+| Provision | PASS (71 s) | both pods, each requesting 50Gi of ephemeral storage, Running in 1 min 5 s; node memory +0.10% from the catalogue, disk equal to it |
+| ConsolidationScaleToZero | PASS (70 s) | pool consolidated to zero in 1 min 10 s |
+| Drift | PASS (126 s) | replacement registered 1 min 35 s after the NodeClass patch |
+| GarbageCollection | PASS (312 s) | ownerless decoy refused in 3 min 35 s; the owner-reference cascade reaped the force-deleted claim's group in 5 s |
+| QuotaFastFail | PASS (96 s) | rejection surfaced in 5 s, 4/4 pods Pending, each told why, no leaked NodeGroup |
+
+Whole suite: 801 s. The nodereplacement controller ran throughout and wrote
+nothing: no node was released and no registration reopened while
+karpenter-core provisioned, consolidated, drifted and terminated nodes. The
+controller's five `ERROR` lines are karpenter-core's, from the quota scenario
+(`failed launching nodeclaim`, `could not schedule pod`) and a pod evicted
+from a node whose NodeClaim was force-deleted.
+
+Every gate of the local validation chain passed under Go 1.26.11 (vet, build,
+unit and race tests, envtest, chart lint and tests, generated files, lint,
+govulncheck with no reachable vulnerability). The cluster was deleted
+afterwards.
+
